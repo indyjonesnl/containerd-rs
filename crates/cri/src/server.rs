@@ -795,36 +795,16 @@ impl RuntimeService for RuntimeSvc {
             .put(Kind::Container, self.ns(), &id, &rec)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Supervise the container out-of-band: `runc run` blocks until exit; we
-        // capture its output to the log and record the exit code. (This is the
-        // direct-runc analog of the shim's task supervision.)
+        // Supervise the container with LIVE stdio: spawn `runc run` with piped
+        // stdout/stderr, stream each chunk to the CRI log file *and* a broadcast
+        // bus (for Attach / log-follow), then record the exit code.
         let ctx = self.ctx.clone();
         let ns = self.ns().to_string();
         let cid = id.clone();
         let bundle_dir = bundle.dir().to_path_buf();
+        let live = self.ctx.streaming.live_channel(&id);
         tokio::spawn(async move {
-            let rr = runc_root.clone();
-            let bd = bundle_dir.clone();
-            let run_id = cid.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                runtime::runc::run(runtime::runc::DEFAULT_BIN, &rr, &bd, &run_id)
-            })
-            .await;
-            let (code, log) = match result {
-                Ok(Ok(output)) => (
-                    output.status.code().unwrap_or(-1),
-                    cri_log_format(&output.stdout, &output.stderr),
-                ),
-                Ok(Err(e)) => (
-                    -1,
-                    cri_log_format(b"", format!("runc error: {e}").as_bytes()),
-                ),
-                Err(e) => (
-                    -1,
-                    cri_log_format(b"", format!("supervision error: {e}").as_bytes()),
-                ),
-            };
-            let _ = std::fs::write(&log_path, &log);
+            let code = supervise_container(&runc_root, &bundle_dir, &cid, &log_path, live).await;
             if let Ok(Some(mut r)) = ctx
                 .metadata
                 .get::<ContainerRecord>(Kind::Container, &ns, &cid)
@@ -834,6 +814,7 @@ impl RuntimeService for RuntimeSvc {
                 r.finished_at = Some(unix_nanos() as u64);
                 let _ = ctx.metadata.put(Kind::Container, &ns, &cid, &r);
             }
+            ctx.streaming.close_live(&cid);
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
 
@@ -933,6 +914,25 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(v1::ListContainerStatsResponse { stats }))
     }
 
+    async fn attach(
+        &self,
+        request: Request<v1::AttachRequest>,
+    ) -> Result<Response<v1::AttachResponse>, Status> {
+        let req = request.into_inner();
+        self.get_container(&req.container_id)?.ok_or_else(|| {
+            Status::not_found(format!("container {} not found", req.container_id))
+        })?;
+        let token = self
+            .ctx
+            .streaming
+            .register_attach(crate::streaming::AttachSession {
+                container_id: req.container_id,
+            });
+        Ok(Response::new(v1::AttachResponse {
+            url: format!("{}/attach/{}", self.ctx.stream_base_url, token),
+        }))
+    }
+
     async fn port_forward(
         &self,
         request: Request<v1::PortForwardRequest>,
@@ -986,7 +986,6 @@ impl RuntimeService for RuntimeSvc {
 
     unary_unimpl! {
         update_container_resources => UpdateContainerResourcesRequest / UpdateContainerResourcesResponse,
-        attach => AttachRequest / AttachResponse,
         pod_sandbox_stats => PodSandboxStatsRequest / PodSandboxStatsResponse,
         list_pod_sandbox_stats => ListPodSandboxStatsRequest / ListPodSandboxStatsResponse,
         update_runtime_config => UpdateRuntimeConfigRequest / UpdateRuntimeConfigResponse,
@@ -1192,25 +1191,105 @@ fn unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// Format captured stdout/stderr into the CRI log format that the kubelet and
-/// `crictl logs` parse: `<RFC3339Nano> <stream> <F|P> <line>` per line.
-fn cri_log_format(stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
+/// Format one stream's chunk into CRI log lines: `<RFC3339Nano> <stream> F <line>`.
+fn cri_log_line(stream: &str, data: &[u8]) -> Vec<u8> {
     let ts = humantime::format_rfc3339_nanos(std::time::SystemTime::now()).to_string();
     let mut out = Vec::new();
-    for (stream, data) in [("stdout", stdout), ("stderr", stderr)] {
-        for line in data.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            out.extend_from_slice(ts.as_bytes());
-            out.push(b' ');
-            out.extend_from_slice(stream.as_bytes());
-            out.extend_from_slice(b" F ");
-            out.extend_from_slice(line);
-            out.push(b'\n');
+    for line in data.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
         }
+        out.extend_from_slice(ts.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(stream.as_bytes());
+        out.extend_from_slice(b" F ");
+        out.extend_from_slice(line);
+        out.push(b'\n');
     }
     out
+}
+
+/// Pump one runc output stream to both the CRI log file and the live bus.
+async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    channel: u8,
+    stream_name: &'static str,
+    log: Arc<tokio::sync::Mutex<Option<tokio::fs::File>>>,
+    live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let chunk = &buf[..n];
+                let line = cri_log_line(stream_name, chunk);
+                if let Some(f) = log.lock().await.as_mut() {
+                    let _ = f.write_all(&line).await;
+                }
+                let _ = live.send((channel, chunk.to_vec()));
+            }
+        }
+    }
+}
+
+/// Run `runc run` with piped stdio, streaming output live; returns the exit code.
+async fn supervise_container(
+    runc_root: &Path,
+    bundle_dir: &Path,
+    cid: &str,
+    log_path: &Path,
+    live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
+) -> i32 {
+    let mut cmd = tokio::process::Command::new(runtime::runc::DEFAULT_BIN);
+    cmd.arg("--root")
+        .arg(runc_root)
+        .arg("run")
+        .arg("--bundle")
+        .arg(bundle_dir)
+        .arg(cid)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::write(
+                log_path,
+                cri_log_line("stderr", format!("runc spawn: {e}").as_bytes()),
+            );
+            return -1;
+        }
+    };
+    let log = Arc::new(tokio::sync::Mutex::new(
+        tokio::fs::File::create(log_path).await.ok(),
+    ));
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let mut tasks = Vec::new();
+    if let Some(so) = so {
+        tasks.push(tokio::spawn(pump_stream(
+            so,
+            1,
+            "stdout",
+            log.clone(),
+            live.clone(),
+        )));
+    }
+    if let Some(se) = se {
+        tasks.push(tokio::spawn(pump_stream(
+            se,
+            2,
+            "stderr",
+            log.clone(),
+            live.clone(),
+        )));
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+    child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
 }
 
 /// Resolve a container's log file path: absolute as-is, else under the bundle.
@@ -1387,12 +1466,8 @@ mod tests {
 
         // A still-unimplemented RPC returns the right gRPC code.
         let err = client
-            .attach(v1::AttachRequest {
-                container_id: "nope".into(),
-                stdin: false,
-                tty: false,
-                stdout: true,
-                stderr: true,
+            .pod_sandbox_stats(v1::PodSandboxStatsRequest {
+                pod_sandbox_id: "nope".into(),
             })
             .await
             .unwrap_err();
@@ -2037,6 +2112,53 @@ mod tests {
             received.contains("POD_NET_OK"),
             "pod container could not reach host localhost; got {received:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network + runc: attach to a running container's live stdout"]
+    async fn attach_streams_live_stdout() {
+        use futures_util::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, rt, cid) = running_busybox(
+            dir.path(),
+            vec!["/bin/sh".into()],
+            vec![
+                "-c".into(),
+                "while true; do echo TICK; sleep 1; done".into(),
+            ],
+        )
+        .await;
+        wait_execable(&rt, &cid).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::streaming::router(ctx.streaming.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let token = ctx
+            .streaming
+            .register_attach(crate::streaming::AttachSession { container_id: cid });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/attach/{token}"))
+            .await
+            .unwrap();
+        let mut saw = false;
+        for _ in 0..40 {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await {
+                Ok(Some(Ok(msg))) if msg.is_binary() => {
+                    let d = msg.into_data();
+                    if d.first() == Some(&1) && String::from_utf8_lossy(&d[1..]).contains("TICK") {
+                        saw = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw, "did not receive live stdout over attach");
     }
 
     #[tokio::test]

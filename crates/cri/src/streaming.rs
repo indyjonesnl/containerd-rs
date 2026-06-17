@@ -41,11 +41,24 @@ pub struct PortForwardSession {
     pub pod_sandbox_id: String,
 }
 
+/// A pending attach session, consumed when its URL is dialed.
+#[derive(Debug, Clone)]
+pub struct AttachSession {
+    pub container_id: String,
+}
+
+/// A live container-output frame: `(channel, bytes)` where channel 1=stdout,
+/// 2=stderr (matching the v4 streaming channels).
+pub type LiveFrame = (u8, Vec<u8>);
+
 /// One-time-token registry for streaming sessions, shared between the CRI
 /// service (which registers) and the HTTP server (which consumes).
 pub struct Sessions {
     exec: Mutex<HashMap<String, ExecSession>>,
     portforward: Mutex<HashMap<String, PortForwardSession>>,
+    attach: Mutex<HashMap<String, AttachSession>>,
+    /// Per-running-container live-output broadcast buses (for Attach / log follow).
+    live: Mutex<HashMap<String, tokio::sync::broadcast::Sender<LiveFrame>>>,
     runc_root: PathBuf,
     runc_bin: String,
     counter: AtomicU64,
@@ -56,10 +69,50 @@ impl Sessions {
         Self {
             exec: Mutex::new(HashMap::new()),
             portforward: Mutex::new(HashMap::new()),
+            attach: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
             runc_root,
             runc_bin: runtime::runc::DEFAULT_BIN.to_string(),
             counter: AtomicU64::new(0),
         }
+    }
+
+    /// Get (creating if needed) the live-output broadcast sender for a container.
+    pub fn live_channel(&self, container_id: &str) -> tokio::sync::broadcast::Sender<LiveFrame> {
+        self.live
+            .lock()
+            .unwrap()
+            .entry(container_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel(512).0)
+            .clone()
+    }
+
+    /// Subscribe to a container's live output, if it is currently running.
+    pub fn subscribe_live(
+        &self,
+        container_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<LiveFrame>> {
+        self.live
+            .lock()
+            .unwrap()
+            .get(container_id)
+            .map(|s| s.subscribe())
+    }
+
+    /// Drop a container's live bus (on exit); subscribers then see `Closed`.
+    pub fn close_live(&self, container_id: &str) {
+        self.live.lock().unwrap().remove(container_id);
+    }
+
+    /// Register an attach session, returning its one-time token.
+    pub fn register_attach(&self, session: AttachSession) -> String {
+        let token = self.token();
+        self.attach.lock().unwrap().insert(token.clone(), session);
+        token
+    }
+
+    fn take_attach(&self, token: &str) -> Option<AttachSession> {
+        self.attach.lock().unwrap().remove(token)
     }
 
     /// Register a port-forward session, returning its one-time token.
@@ -108,6 +161,7 @@ impl Sessions {
 pub fn router(sessions: Arc<Sessions>) -> Router {
     Router::new()
         .route("/exec/{token}", get(exec_ws))
+        .route("/attach/{token}", get(attach_ws))
         .route("/portforward/{token}", get(portforward_ws))
         .with_state(sessions)
 }
@@ -211,6 +265,56 @@ async fn handle_exec(mut socket: WebSocket, sessions: Arc<Sessions>, token: Stri
                 .await;
         }
     }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+async fn attach_ws(
+    State(sessions): State<Arc<Sessions>>,
+    AxPath(token): AxPath<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.protocols(["v4.channel.k8s.io", "channel.k8s.io"])
+        .on_upgrade(move |socket| handle_attach(socket, sessions, token))
+}
+
+/// Stream a running container's live stdout/stderr to the attach WebSocket,
+/// framed on the v4 channels, until the container exits (bus closes).
+async fn handle_attach(mut socket: WebSocket, sessions: Arc<Sessions>, token: String) {
+    let Some(session) = sessions.take_attach(&token) else {
+        return;
+    };
+    let Some(mut rx) = sessions.subscribe_live(&session.container_id) else {
+        let _ = socket
+            .send(Message::Binary(
+                frame(
+                    CH_ERROR,
+                    b"{\"status\":\"Failure\",\"message\":\"container not running\"}",
+                )
+                .into(),
+            ))
+            .await;
+        return;
+    };
+    loop {
+        match rx.recv().await {
+            Ok((channel, data)) => {
+                if socket
+                    .send(Message::Binary(frame(channel, &data).into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    let _ = socket
+        .send(Message::Binary(
+            frame(CH_ERROR, b"{\"status\":\"Success\"}").into(),
+        ))
+        .await;
     let _ = socket.send(Message::Close(None)).await;
 }
 
