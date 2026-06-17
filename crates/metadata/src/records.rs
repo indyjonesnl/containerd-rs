@@ -60,6 +60,15 @@ pub struct SandboxRecord {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub annotations: HashMap<String, String>,
+    /// CRI pod log directory; container `log_path` is relative to this.
+    #[serde(default)]
+    pub log_directory: String,
+    /// Whether the sandbox shares the host network namespace (NODE network mode).
+    /// Reported back in `PodSandboxStatus.linux.namespaces.options.network` so the
+    /// kubelet's `podSandboxChanged` namespace-mode comparison matches and it does
+    /// not recreate the sandbox every sync.
+    #[serde(default)]
+    pub host_network: bool,
 }
 
 /// Persisted container record.

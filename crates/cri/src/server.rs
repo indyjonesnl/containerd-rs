@@ -462,7 +462,31 @@ impl RuntimeService for RuntimeSvc {
             created_at: unix_nanos() as u64,
             labels: config.labels,
             annotations: config.annotations,
+            log_directory: config.log_directory,
+            host_network,
         };
+        // Demote any prior sandbox for the same pod (namespace/name/uid) to
+        // NotReady. `gen_id` salts with a timestamp, so each call mints a fresh
+        // id; without this the old Ready records linger and the kubelet sees
+        // `readySandboxCount > 1`, which also forces sandbox recreation.
+        if let Ok(existing) = self
+            .ctx
+            .metadata
+            .list::<SandboxRecord>(Kind::Sandbox, self.ns())
+        {
+            for mut other in existing {
+                if other.id != id
+                    && other.state == SandboxState::Ready
+                    && other.name == rec.name
+                    && other.k8s_namespace == rec.k8s_namespace
+                    && other.uid == rec.uid
+                {
+                    other.state = SandboxState::NotReady;
+                    let oid = other.id.clone();
+                    let _ = self.ctx.metadata.put(Kind::Sandbox, self.ns(), &oid, &other);
+                }
+            }
+        }
         self.ctx
             .metadata
             .put(Kind::Sandbox, self.ns(), &id, &rec)
@@ -492,7 +516,24 @@ impl RuntimeService for RuntimeSvc {
                 ip: ip.clone(),
                 additional_ips: Vec::new(),
             }),
-            linux: None,
+            // Report the network namespace mode so the kubelet's
+            // `podSandboxChanged` check (which compares this against the pod's
+            // desired mode) matches; otherwise it recreates the sandbox forever.
+            linux: Some(v1::LinuxPodSandboxStatus {
+                namespaces: Some(v1::Namespace {
+                    options: Some(v1::NamespaceOption {
+                        network: if rec.host_network {
+                            v1::NamespaceMode::Node as i32
+                        } else {
+                            v1::NamespaceMode::Pod as i32
+                        },
+                        pid: v1::NamespaceMode::Container as i32,
+                        ipc: v1::NamespaceMode::Pod as i32,
+                        target_id: String::new(),
+                        userns_options: None,
+                    }),
+                }),
+            }),
             labels: rec.labels,
             annotations: rec.annotations,
             runtime_handler: rec.runtime_handler,
@@ -676,7 +717,19 @@ impl RuntimeService for RuntimeSvc {
             image_id,
             state: ContainerState::Created,
             snapshot_key: String::new(),
-            log_path: config.log_path,
+            // CRI log_path is relative to the sandbox log_directory; resolve to
+            // an absolute path so kubelet/crictl find the log where they expect.
+            log_path: {
+                let lp = std::path::Path::new(&config.log_path);
+                if lp.is_absolute() || sandbox.log_directory.is_empty() {
+                    config.log_path.clone()
+                } else {
+                    std::path::Path::new(&sandbox.log_directory)
+                        .join(&config.log_path)
+                        .display()
+                        .to_string()
+                }
+            },
             created_at: unix_nanos() as u64,
             started_at: None,
             finished_at: None,
@@ -1361,7 +1414,12 @@ async fn supervise_container(
     for t in tasks {
         let _ = t.await;
     }
-    child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
+    let status = child.wait().await;
+    if let Ok(s) = &status {
+        use std::os::unix::process::ExitStatusExt;
+        tracing::info!(container = %cid, code = ?s.code(), signal = ?s.signal(), "runc run returned");
+    }
+    status.ok().and_then(|s| s.code()).unwrap_or(-1)
 }
 
 /// Resolve a container's log file path: absolute as-is, else under the bundle.
@@ -1636,6 +1694,8 @@ mod tests {
                         created_at: 0,
                         labels: Default::default(),
                         annotations: Default::default(),
+                        log_directory: String::new(),
+                        host_network: false,
                     },
                 )
                 .unwrap();
