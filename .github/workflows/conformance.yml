@@ -1,0 +1,62 @@
+name: conformance
+
+# Kubernetes Conformance proof: stand up a single-node kubeadm cluster on the
+# runner host using containerd-rs as the SOLE container runtime, then run the
+# official [Conformance] suite via hydrophone and publish the results.
+#
+# GATED AS MANUAL (workflow_dispatch) on purpose: this is the acceptance proof
+# and depends on the CRI runtime (tasks T015-T038) being implemented. Running it
+# before then would only burn limited CI minutes. Promote to `push` once
+# `make conformance` passes locally (see specs/001-rust-containerd/quickstart.md).
+on:
+  workflow_dispatch:
+    inputs:
+      conformance_image:
+        description: "Conformance image tag"
+        default: "registry.k8s.io/conformance:v1.36.1"
+        required: true
+
+jobs:
+  conformance:
+    # Standard ubuntu-latest has no nested KVM; kubeadm runs directly on the
+    # host so no virtualization is required.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release daemon
+        run: make release
+
+      - name: Bring up cluster on containerd-rs
+        run: make cluster-up
+        env:
+          CONFORMANCE_IMAGE: ${{ inputs.conformance_image }}
+
+      - name: Run Kubernetes Conformance
+        run: make conformance
+        env:
+          CONFORMANCE_IMAGE: ${{ inputs.conformance_image }}
+
+      - name: Upload conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: |
+            conformance-results/e2e.log
+            conformance-results/junit_01.xml
+          if-no-files-found: error
+
+      - name: Tear down
+        if: always()
+        run: make cluster-down

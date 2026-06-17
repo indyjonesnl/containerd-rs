@@ -1,0 +1,5 @@
+[toolchain]
+# MSRV floor (1.85) is enforced via `rust-version` in Cargo.toml; CI/dev use stable.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,17 @@
+# containerd-rs daemon config for local + CI conformance runs.
+# Pinned version set (T044): keep k8s minor, pause image, and conformance image
+# consistent — see ci/kubeadm-init.sh and ci/run-conformance.sh.
+
+root = "/var/lib/containerd-rs"
+state = "/run/containerd-rs"
+cri_socket = "/run/containerd-rs.sock"
+stream_server_address = "127.0.0.1:10010"
+
+[cri]
+sandbox_image = "registry.k8s.io/pause:3.10"
+default_runtime_name = "runc"
+runtime_type = "io.containerd.runc.v2"
+snapshotter = "overlayfs"
+# Kubernetes uses the systemd cgroup driver on systemd hosts.
+systemd_cgroup = true
+registry_config_path = "/etc/containerd-rs/certs.d"

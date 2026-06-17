@@ -1,0 +1,9 @@
+# Spec Kit working documents — not committed per project requirement
+/specs/
+/.specify/
+/.claude/
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.orig
