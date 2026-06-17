@@ -35,10 +35,17 @@ pub struct ExecSession {
     pub tty: bool,
 }
 
+/// A pending port-forward session, consumed when its URL is dialed.
+#[derive(Debug, Clone)]
+pub struct PortForwardSession {
+    pub pod_sandbox_id: String,
+}
+
 /// One-time-token registry for streaming sessions, shared between the CRI
 /// service (which registers) and the HTTP server (which consumes).
 pub struct Sessions {
     exec: Mutex<HashMap<String, ExecSession>>,
+    portforward: Mutex<HashMap<String, PortForwardSession>>,
     runc_root: PathBuf,
     runc_bin: String,
     counter: AtomicU64,
@@ -48,10 +55,25 @@ impl Sessions {
     pub fn new(runc_root: PathBuf) -> Self {
         Self {
             exec: Mutex::new(HashMap::new()),
+            portforward: Mutex::new(HashMap::new()),
             runc_root,
             runc_bin: runtime::runc::DEFAULT_BIN.to_string(),
             counter: AtomicU64::new(0),
         }
+    }
+
+    /// Register a port-forward session, returning its one-time token.
+    pub fn register_portforward(&self, session: PortForwardSession) -> String {
+        let token = self.token();
+        self.portforward
+            .lock()
+            .unwrap()
+            .insert(token.clone(), session);
+        token
+    }
+
+    fn take_portforward(&self, token: &str) -> Option<PortForwardSession> {
+        self.portforward.lock().unwrap().remove(token)
     }
 
     fn token(&self) -> String {
@@ -86,6 +108,7 @@ impl Sessions {
 pub fn router(sessions: Arc<Sessions>) -> Router {
     Router::new()
         .route("/exec/{token}", get(exec_ws))
+        .route("/portforward/{token}", get(portforward_ws))
         .with_state(sessions)
 }
 
@@ -189,6 +212,98 @@ async fn handle_exec(mut socket: WebSocket, sessions: Arc<Sessions>, token: Stri
         }
     }
     let _ = socket.send(Message::Close(None)).await;
+}
+
+async fn portforward_ws(
+    State(sessions): State<Arc<Sessions>>,
+    AxPath(token): AxPath<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.protocols(["v4.channel.k8s.io", "portforward.k8s.io"])
+        .on_upgrade(move |socket| handle_portforward(socket, sessions, token))
+}
+
+/// Proxy the Kubernetes port-forward WebSocket protocol to a localhost TCP
+/// connection. Channels come in pairs per forwarded port: data = `2*i`,
+/// error = `2*i + 1`; the first frame on each carries the port as 2 LE bytes.
+/// Because pods are host-network, the container's port is reachable at
+/// `127.0.0.1:<port>`.
+async fn handle_portforward(socket: WebSocket, sessions: Arc<Sessions>, token: String) {
+    use futures_util::{SinkExt, StreamExt};
+    use std::collections::HashMap as Map;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if sessions.take_portforward(&token).is_none() {
+        return;
+    }
+    let (sink, mut stream) = socket.split();
+    let sink = Arc::new(tokio::sync::Mutex::new(sink));
+    // data channel -> TCP write half
+    let mut writers: Map<u8, tokio::io::WriteHalf<tokio::net::TcpStream>> = Map::new();
+
+    while let Some(Ok(msg)) = stream.next().await {
+        let Message::Binary(data) = msg else { continue };
+        if data.is_empty() {
+            continue;
+        }
+        let channel = data[0];
+        let payload = &data[1..];
+
+        // Error channels (odd) only carry the initial port header; ignore.
+        if channel % 2 == 1 {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(e) = writers.entry(channel) {
+            // First data-channel frame: 2-byte LE port; open the TCP connection.
+            if payload.len() < 2 {
+                continue;
+            }
+            let port = u16::from_le_bytes([payload[0], payload[1]]);
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(tcp) => {
+                    let (mut rd, wr) = tokio::io::split(tcp);
+                    e.insert(wr);
+                    // Pump TCP -> WS (framed on the same data channel).
+                    let sink = sink.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match rd.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    let f = frame(channel, &buf[..n]);
+                                    if sink
+                                        .lock()
+                                        .await
+                                        .send(Message::Binary(f.into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    // Any data after the port header goes straight to TCP.
+                    if payload.len() > 2 {
+                        if let Some(w) = writers.get_mut(&channel) {
+                            let _ = w.write_all(&payload[2..]).await;
+                        }
+                    }
+                }
+                Err(e2) => {
+                    let f = frame(
+                        channel + 1,
+                        format!("{{\"status\":\"Failure\",\"message\":\"connect 127.0.0.1:{port}: {e2}\"}}").as_bytes(),
+                    );
+                    let _ = sink.lock().await.send(Message::Binary(f.into())).await;
+                }
+            }
+        } else if let Some(w) = writers.get_mut(&channel) {
+            let _ = w.write_all(payload).await;
+        }
+    }
 }
 
 #[cfg(test)]

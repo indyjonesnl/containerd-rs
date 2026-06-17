@@ -18,6 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true }
 humantime = "2"
+futures-util = "0.3"
 tracing.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -36,4 +37,3 @@ tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 oci-spec.workspace = true
 tokio-tungstenite = "0.24"
-futures-util = "0.3"

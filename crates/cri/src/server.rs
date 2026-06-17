@@ -933,6 +933,30 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(v1::ListContainerStatsResponse { stats }))
     }
 
+    async fn port_forward(
+        &self,
+        request: Request<v1::PortForwardRequest>,
+    ) -> Result<Response<v1::PortForwardResponse>, Status> {
+        let req = request.into_inner();
+        // Sandbox must exist; ports are carried over the stream by the client.
+        self.ctx
+            .metadata
+            .get::<SandboxRecord>(Kind::Sandbox, self.ns(), &req.pod_sandbox_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!("sandbox {} not found", req.pod_sandbox_id))
+            })?;
+        let token = self
+            .ctx
+            .streaming
+            .register_portforward(crate::streaming::PortForwardSession {
+                pod_sandbox_id: req.pod_sandbox_id,
+            });
+        Ok(Response::new(v1::PortForwardResponse {
+            url: format!("{}/portforward/{}", self.ctx.stream_base_url, token),
+        }))
+    }
+
     async fn runtime_config(
         &self,
         _request: Request<v1::RuntimeConfigRequest>,
@@ -963,7 +987,6 @@ impl RuntimeService for RuntimeSvc {
     unary_unimpl! {
         update_container_resources => UpdateContainerResourcesRequest / UpdateContainerResourcesResponse,
         attach => AttachRequest / AttachResponse,
-        port_forward => PortForwardRequest / PortForwardResponse,
         pod_sandbox_stats => PodSandboxStatsRequest / PodSandboxStatsResponse,
         list_pod_sandbox_stats => ListPodSandboxStatsRequest / ListPodSandboxStatsResponse,
         update_runtime_config => UpdateRuntimeConfigRequest / UpdateRuntimeConfigResponse,
@@ -1504,6 +1527,72 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(created.state, ContainerState::Created);
+    }
+
+    #[tokio::test]
+    async fn port_forward_proxies_to_localhost() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+
+        // A localhost TCP echo server stands in for a host-network pod's port.
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf).await {
+                    let _ = s.write_all(&buf[..n]).await; // echo back
+                }
+            }
+        });
+
+        // Streaming server.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::streaming::router(ctx.streaming.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let token = ctx
+            .streaming
+            .register_portforward(crate::streaming::PortForwardSession {
+                pod_sandbox_id: "p".into(),
+            });
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/portforward/{token}"))
+                .await
+                .unwrap();
+        use tokio_tungstenite::tungstenite::Message as TMsg;
+        let lo = (port & 0xff) as u8;
+        let hi = (port >> 8) as u8;
+        // Port headers on data (0) + error (1) channels, then payload on data.
+        ws.send(TMsg::Binary(vec![0, lo, hi])).await.unwrap();
+        ws.send(TMsg::Binary(vec![1, lo, hi])).await.unwrap();
+        ws.send(TMsg::Binary([&[0u8][..], b"PF_PING"].concat()))
+            .await
+            .unwrap();
+
+        let mut echoed = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await {
+                Ok(Some(Ok(TMsg::Binary(d)))) if d.first() == Some(&0) => {
+                    if String::from_utf8_lossy(&d[1..]).contains("PF_PING") {
+                        echoed = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            echoed,
+            "port-forward did not echo payload back over the data channel"
+        );
     }
 
     #[tokio::test]
