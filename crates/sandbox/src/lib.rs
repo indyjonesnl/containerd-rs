@@ -5,6 +5,7 @@
 //! sandbox controller are tasks T024–T025 in
 //! `specs/001-rust-containerd/tasks.md`.
 
+pub mod cni;
 pub mod net;
 
 /// Default pause image used to anchor a pod sandbox's namespaces.

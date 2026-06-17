@@ -8,7 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use oci_spec::runtime::{ProcessBuilder, RootBuilder, Spec, UserBuilder};
+use oci_spec::runtime::{
+    LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec, UserBuilder,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -48,6 +50,10 @@ pub struct ContainerRequest {
     /// When set, build a rootless spec mapping container uid/gid 0 to these host
     /// ids (a user namespace + uid/gid mappings + rootless-friendly mounts).
     pub rootless_host_ids: Option<(u32, u32)>,
+    /// Network namespace for the container:
+    /// * `None` / `Some("host")` -> no network namespace (share host/sandbox-host net)
+    /// * `Some(path)` -> join the pod's network namespace at `path` (CNI sandbox)
+    pub netns_path: Option<String>,
 }
 
 /// Resolve the final argv using Kubernetes/CRI override semantics.
@@ -134,7 +140,32 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     if let Some(h) = &req.hostname {
         spec.set_hostname(Some(h.clone()));
     }
+    set_network_namespace(&mut spec, req.netns_path.as_deref());
     Ok(spec)
+}
+
+/// Point the container's network namespace at the pod's (CNI), or drop it for
+/// host networking.
+fn set_network_namespace(spec: &mut Spec, netns_path: Option<&str>) {
+    let Some(mut linux) = spec.linux().clone() else {
+        return;
+    };
+    let mut namespaces = linux.namespaces().clone().unwrap_or_default();
+    namespaces.retain(|n| n.typ() != LinuxNamespaceType::Network);
+    match netns_path {
+        None | Some("host") => {} // no network namespace -> share host net
+        Some(path) => {
+            if let Ok(ns) = LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Network)
+                .path(PathBuf::from(path))
+                .build()
+            {
+                namespaces.push(ns);
+            }
+        }
+    }
+    linux.set_namespaces(Some(namespaces));
+    spec.set_linux(Some(linux));
 }
 
 /// Write a bundle to `bundle_dir`: create `rootfs/` and serialize `config.json`.

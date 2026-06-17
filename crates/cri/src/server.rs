@@ -41,6 +41,8 @@ pub struct Context {
     pub streaming: Arc<crate::streaming::Sessions>,
     /// Base URL the kubelet uses to reach the streaming server.
     pub stream_base_url: String,
+    /// CNI runtime for pod networking.
+    pub cni: sandbox::cni::Cni,
 }
 
 impl Context {
@@ -52,6 +54,8 @@ impl Context {
         snapshots_root: PathBuf,
         state_dir: PathBuf,
         stream_addr: &str,
+        cni_conf_dir: PathBuf,
+        cni_bin_dir: PathBuf,
     ) -> Self {
         let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("runc")));
         Self {
@@ -62,6 +66,7 @@ impl Context {
             namespace: core_types::Namespace::CRI.to_string(),
             streaming,
             stream_base_url: format!("http://{stream_addr}"),
+            cni: sandbox::cni::Cni::new(cni_conf_dir, cni_bin_dir),
         }
     }
 }
@@ -407,12 +412,41 @@ impl RuntimeService for RuntimeSvc {
         let meta = config.metadata.clone().unwrap_or_default();
         let id = self.gen_id(&format!("{}/{}/{}", meta.namespace, meta.name, meta.uid));
 
-        // Host-network sandbox: rootless containers share the host network
-        // namespace, so the pod IP is the host's primary address and intra-pod
-        // (and cross-pod) traffic works over localhost. Per-pod CNI netns needs
-        // root and is deferred (see sandbox::net).
-        let ip = sandbox::net::host_ip();
-        tracing::info!(sandbox = %id, %ip, "RunPodSandbox (host network)");
+        // Host network if the pod requests NODE network mode; otherwise try CNI.
+        let host_network = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|sc| sc.namespace_options.as_ref())
+            .map(|ns| ns.network == v1::NamespaceMode::Node as i32)
+            .unwrap_or(false);
+
+        // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
+        // plugin chain; if CNI is unavailable/fails we fall back to host network
+        // (rootless containers share the host net namespace).
+        let (netns_path, ip) = if host_network {
+            ("host".to_string(), sandbox::net::host_ip())
+        } else {
+            match self
+                .ctx
+                .cni
+                .create_netns(&id)
+                .and_then(|_| self.ctx.cni.setup(&id, &id))
+            {
+                Ok(ip) => {
+                    tracing::info!(sandbox = %id, %ip, "RunPodSandbox (CNI)");
+                    (self.ctx.cni.netns_path(&id).display().to_string(), ip)
+                }
+                Err(e) => {
+                    let _ = self.ctx.cni.teardown(&id, &id);
+                    tracing::warn!(sandbox = %id, error = %e, "CNI setup failed; falling back to host network");
+                    ("host".to_string(), sandbox::net::host_ip())
+                }
+            }
+        };
+        if netns_path == "host" {
+            tracing::info!(sandbox = %id, %ip, "RunPodSandbox (host network)");
+        }
         let rec = SandboxRecord {
             id: id.clone(),
             name: meta.name,
@@ -420,7 +454,7 @@ impl RuntimeService for RuntimeSvc {
             uid: meta.uid,
             attempt: meta.attempt,
             state: SandboxState::Ready,
-            netns_path: Some("host".to_string()),
+            netns_path: Some(netns_path),
             ip: Some(ip),
             runtime_handler: req.runtime_handler,
             pause_container_id: None,
@@ -532,6 +566,16 @@ impl RuntimeService for RuntimeSvc {
         request: Request<v1::RemovePodSandboxRequest>,
     ) -> Result<Response<v1::RemovePodSandboxResponse>, Status> {
         let id = request.into_inner().pod_sandbox_id;
+        // Tear down CNI networking for a real per-pod netns (no-op for host net).
+        if let Ok(Some(rec)) = self
+            .ctx
+            .metadata
+            .get::<SandboxRecord>(Kind::Sandbox, self.ns(), &id)
+        {
+            if rec.netns_path.as_deref().is_some_and(|p| p != "host") {
+                let _ = self.ctx.cni.teardown(&id, &id);
+            }
+        }
         self.ctx
             .metadata
             .delete(Kind::Sandbox, self.ns(), &id)
@@ -545,8 +589,8 @@ impl RuntimeService for RuntimeSvc {
     ) -> Result<Response<v1::CreateContainerResponse>, Status> {
         let req = request.into_inner();
         let sandbox_id = req.pod_sandbox_id;
-        // The sandbox must exist.
-        let _sandbox: SandboxRecord = self
+        // The sandbox must exist; the container joins its network namespace.
+        let sandbox: SandboxRecord = self
             .ctx
             .metadata
             .get(Kind::Sandbox, self.ns(), &sandbox_id)
@@ -599,6 +643,7 @@ impl RuntimeService for RuntimeSvc {
             terminal: config.tty,
             readonly_rootfs: false,
             rootless_host_ids: host_ids,
+            netns_path: sandbox.netns_path.clone(),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -1401,6 +1446,8 @@ mod tests {
             dir.join("snapshots"),
             dir.join("state"),
             "127.0.0.1:10010",
+            dir.join("cni/net.d"),
+            dir.join("cni/bin"),
         ))
     }
 

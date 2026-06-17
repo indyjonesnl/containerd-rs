@@ -38,6 +38,10 @@ pub struct CriConfig {
     pub systemd_cgroup: bool,
     /// Directory of per-registry `hosts.toml` files.
     pub registry_config_path: PathBuf,
+    /// CNI network-config directory (`*.conflist`).
+    pub cni_conf_dir: PathBuf,
+    /// CNI plugin binary directory.
+    pub cni_bin_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -61,6 +65,8 @@ impl Default for CriConfig {
             snapshotter: "overlayfs".to_string(),
             systemd_cgroup: false,
             registry_config_path: PathBuf::from("/etc/containerd-rs/certs.d"),
+            cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
+            cni_bin_dir: PathBuf::from("/opt/cni/bin"),
         }
     }
 }

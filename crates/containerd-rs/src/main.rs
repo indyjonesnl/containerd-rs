@@ -62,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.snapshots_dir(),
         cfg.state.clone(),
         &cfg.stream_server_address,
+        cfg.cri.cni_conf_dir.clone(),
+        cfg.cri.cni_bin_dir.clone(),
     ));
 
     // Restart recovery: re-discover persisted sandboxes/containers.
