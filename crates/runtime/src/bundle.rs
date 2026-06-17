@@ -9,8 +9,17 @@
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec, UserBuilder,
+    LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder, ProcessBuilder, RootBuilder, Spec,
+    UserBuilder,
 };
+
+/// A bind mount to inject into the container (from a CRI mount).
+#[derive(Debug, Clone)]
+pub struct MountSpec {
+    pub source: String,
+    pub destination: String,
+    pub readonly: bool,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -54,6 +63,8 @@ pub struct ContainerRequest {
     /// * `None` / `Some("host")` -> no network namespace (share host/sandbox-host net)
     /// * `Some(path)` -> join the pod's network namespace at `path` (CNI sandbox)
     pub netns_path: Option<String>,
+    /// Host-path bind mounts to inject (from the CRI container config).
+    pub mounts: Vec<MountSpec>,
 }
 
 /// Resolve the final argv using Kubernetes/CRI override semantics.
@@ -141,7 +152,33 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
         spec.set_hostname(Some(h.clone()));
     }
     set_network_namespace(&mut spec, req.netns_path.as_deref());
+    add_bind_mounts(&mut spec, &req.mounts);
     Ok(spec)
+}
+
+/// Append CRI host-path bind mounts to the spec.
+fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
+    if mounts.is_empty() {
+        return;
+    }
+    let mut all = spec.mounts().clone().unwrap_or_default();
+    for m in mounts {
+        let opts = vec![
+            "rbind".to_string(),
+            "rprivate".to_string(),
+            if m.readonly { "ro" } else { "rw" }.to_string(),
+        ];
+        if let Ok(mount) = MountBuilder::default()
+            .destination(PathBuf::from(&m.destination))
+            .typ("bind".to_string())
+            .source(PathBuf::from(&m.source))
+            .options(opts)
+            .build()
+        {
+            all.push(mount);
+        }
+    }
+    spec.set_mounts(Some(all));
 }
 
 /// Point the container's network namespace at the pod's (CNI), or drop it for

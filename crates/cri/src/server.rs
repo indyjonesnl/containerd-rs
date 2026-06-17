@@ -644,6 +644,15 @@ impl RuntimeService for RuntimeSvc {
             readonly_rootfs: false,
             rootless_host_ids: host_ids,
             netns_path: sandbox.netns_path.clone(),
+            mounts: config
+                .mounts
+                .iter()
+                .map(|m| runtime::bundle::MountSpec {
+                    source: m.host_path.clone(),
+                    destination: m.container_path.clone(),
+                    readonly: m.readonly,
+                })
+                .collect(),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -783,6 +792,15 @@ impl RuntimeService for RuntimeSvc {
         let id = request.into_inner().container_id;
         if let Some(mut rec) = self.get_container(&id)? {
             if rec.state != ContainerState::Exited {
+                // Actually kill the runc container (SIGTERM); the supervision
+                // task observes the exit. Without this the process lingers and
+                // a kubelet restart hits a port conflict -> CrashLoop.
+                let runc_root = self.ctx.state_dir.join("runc");
+                let id2 = id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    runtime::runc::kill(runtime::runc::DEFAULT_BIN, &runc_root, &id2, "SIGTERM")
+                })
+                .await;
                 rec.state = ContainerState::Exited;
                 rec.finished_at = Some(unix_nanos() as u64);
                 rec.exit_code = Some(0);
@@ -800,11 +818,17 @@ impl RuntimeService for RuntimeSvc {
         request: Request<v1::RemoveContainerRequest>,
     ) -> Result<Response<v1::RemoveContainerResponse>, Status> {
         let id = request.into_inner().container_id;
+        // Force-delete any leftover runc state, then drop record + bundle.
+        let runc_root = self.ctx.state_dir.join("runc");
+        let id2 = id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root, &id2)
+        })
+        .await;
         self.ctx
             .metadata
             .delete(Kind::Container, self.ns(), &id)
             .map_err(|e| Status::internal(e.to_string()))?;
-        // Drop the bundle directory.
         let _ = runtime::shim::Bundle::new(&self.ctx.state_dir, self.ns(), &id).remove();
         Ok(Response::new(v1::RemoveContainerResponse {}))
     }
@@ -1307,6 +1331,9 @@ async fn supervise_container(
             return -1;
         }
     };
+    if let Some(parent) = log_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
     let log = Arc::new(tokio::sync::Mutex::new(
         tokio::fs::File::create(log_path).await.ok(),
     ));

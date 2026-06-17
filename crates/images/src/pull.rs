@@ -125,9 +125,22 @@ pub async fn pull(
     let client = Client::new(config);
 
     tracing::info!(%reference, "pulling image");
-    let image: ImageData = client
+    let mut image: ImageData = client
         .pull(&parsed, &auth.to_registry_auth(), accepted_media_types())
         .await?;
+
+    // `oci-client` may return layers out of order (parallel fetch); the config's
+    // `diff_ids` are in manifest order, so re-sort layers to match the manifest
+    // before the positional `layers[i] <-> diff_ids[i]` alignment below.
+    if let Some(manifest) = &image.manifest {
+        let order: Vec<String> = manifest.layers.iter().map(|d| d.digest.clone()).collect();
+        image.layers.sort_by_key(|l| {
+            order
+                .iter()
+                .position(|d| d == &l.sha256_digest())
+                .unwrap_or(usize::MAX)
+        });
+    }
 
     // Store and identify the config blob; image_id == config digest.
     let config_bytes: &[u8] = image.config.data.as_ref();
