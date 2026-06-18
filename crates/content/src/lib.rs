@@ -9,9 +9,15 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use core_types::Digest;
 use sha2::{Digest as _, Sha256};
+
+/// Per-process counter making each ingest staging file unique, so concurrent
+/// writers for the same `ingest_ref` (and stale files from an interrupted/
+/// crashed write) never collide.
+static INGEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -87,9 +93,18 @@ impl Store {
     pub fn writer(&self, ingest_ref: &str) -> Result<Writer> {
         let staging_dir = self.root.join("ingest");
         fs::create_dir_all(&staging_dir)?;
-        // Use the digest of the ref as the staging filename, matching containerd's
-        // approach of keying ingests by a stable name.
-        let staging = staging_dir.join(Digest::sha256(ingest_ref.as_bytes()).hex());
+        // Stage under a per-writer-unique name (ref hash + process id + a counter)
+        // so concurrent ingests of the same ref don't clobber each other and a
+        // leftover staging file from an interrupted write can't block a retry. The
+        // committed blob is content-addressed, so the staging name is irrelevant
+        // after commit.
+        let seq = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let staging = staging_dir.join(format!(
+            "{}.{}.{}",
+            Digest::sha256(ingest_ref.as_bytes()).hex(),
+            std::process::id(),
+            seq
+        ));
         let file = fs::File::create(&staging)?;
         Ok(Writer {
             root: self.root.clone(),
@@ -306,5 +321,59 @@ mod tests {
             .write_blob("c", b"abc", &Digest::sha256(b"abc"))
             .unwrap();
         assert_eq!(store.total_size().unwrap(), 5);
+    }
+
+    // T047: an interrupted write (writer dropped without commit) must leave no
+    // committed blob and no staging junk, so the store stays clean + retryable.
+    #[test]
+    fn interrupted_write_leaves_no_blob_or_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        {
+            let mut w = store.writer("layer:0").unwrap();
+            w.write_all(b"half-written").unwrap();
+            // Dropped here without commit (simulates an interrupted pull).
+        }
+        assert_eq!(store.total_size().unwrap(), 0, "no blob committed");
+        let staged = fs::read_dir(dir.path().join("ingest")).unwrap().count();
+        assert_eq!(staged, 0, "staging file cleaned up on drop");
+    }
+
+    // T047: a fresh write after an interrupted one (same ref) commits cleanly.
+    #[test]
+    fn retry_after_interrupted_write_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        {
+            let mut w = store.writer("layer:0").unwrap();
+            w.write_all(b"partial").unwrap();
+        }
+        let data = b"the full layer";
+        let d = store
+            .write_blob("layer:0", data, &Digest::sha256(data))
+            .unwrap();
+        assert!(store.exists(&d));
+    }
+
+    // T046/T047: concurrent writers for the SAME ref must not clobber each other
+    // (unique staging) — all commit and the content-addressed blob is present.
+    #[test]
+    fn concurrent_writers_same_ref_all_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let data = b"shared-layer-bytes";
+        let expected = Digest::sha256(data);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = store.clone();
+                let e = expected.clone();
+                std::thread::spawn(move || s.write_blob("same-ref", data, &e).unwrap())
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), expected);
+        }
+        assert!(store.exists(&expected));
+        assert_eq!(store.read(&expected).unwrap(), data);
     }
 }

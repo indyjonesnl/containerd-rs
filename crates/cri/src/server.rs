@@ -43,6 +43,8 @@ pub struct Context {
     pub stream_base_url: String,
     /// CNI runtime for pod networking.
     pub cni: sandbox::cni::Cni,
+    /// Per-image-reference locks serializing concurrent duplicate pulls.
+    pub pull_locks: crate::locks::KeyedLocks,
 }
 
 impl Context {
@@ -67,6 +69,7 @@ impl Context {
             streaming,
             stream_base_url: format!("http://{stream_addr}"),
             cni: sandbox::cni::Cni::new(cni_conf_dir, cni_bin_dir),
+            pull_locks: crate::locks::KeyedLocks::default(),
         }
     }
 }
@@ -1278,6 +1281,11 @@ impl ImageService for ImageSvc {
             .map(|s| s.image)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Status::invalid_argument("image reference required"))?;
+
+        // Serialize concurrent duplicate pulls of the same reference so they
+        // don't race unpacking into the same chainID snapshot dir (the pull
+        // itself is idempotent: content is deduped, unpack skips populated dirs).
+        let _pull_guard = self.ctx.pull_locks.guard(&reference).await;
 
         let auth = match req.auth {
             Some(a) if !a.username.is_empty() => images::pull::Auth::Basic {
