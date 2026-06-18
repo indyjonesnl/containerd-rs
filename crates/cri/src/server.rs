@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use futures_core::Stream;
 use metadata::records::{
-    ContainerRecord, ContainerState, ImageRecord, SandboxRecord, SandboxState,
+    ContainerRecord, ContainerState, ImageRecord, MountRecord, SandboxRecord, SandboxState,
 };
 use metadata::Kind;
 use tonic::{Request, Response, Status};
@@ -889,6 +889,15 @@ impl RuntimeService for RuntimeSvc {
             reason: None,
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
+            mounts: container_req
+                .mounts
+                .iter()
+                .map(|m| MountRecord {
+                    host_path: m.source.clone(),
+                    container_path: m.destination.clone(),
+                    readonly: m.readonly,
+                })
+                .collect(),
         };
         self.ctx
             .metadata
@@ -928,7 +937,16 @@ impl RuntimeService for RuntimeSvc {
             message: String::new(),
             labels: rec.labels.clone(),
             annotations: rec.annotations.clone(),
-            mounts: Vec::new(),
+            mounts: rec
+                .mounts
+                .iter()
+                .map(|m| v1::Mount {
+                    host_path: m.host_path.clone(),
+                    container_path: m.container_path.clone(),
+                    readonly: m.readonly,
+                    ..Default::default()
+                })
+                .collect(),
             log_path: rec.log_path.clone(),
             resources: None,
             image_id: rec.image_id.clone(),
@@ -1848,6 +1866,7 @@ mod tests {
                 reason: None,
                 labels: Default::default(),
                 annotations: Default::default(),
+                mounts: Vec::new(),
             }
         }
 
@@ -2293,6 +2312,7 @@ mod tests {
                     reason: None,
                     labels: Default::default(),
                     annotations: Default::default(),
+                    mounts: Vec::new(),
                 },
             )
             .unwrap();

@@ -103,6 +103,19 @@ pub struct ContainerRecord {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub annotations: HashMap<String, String>,
+    /// Container bind mounts (host_path, container_path, readonly), echoed back in
+    /// `ContainerStatus.mounts`. The kubelet matches these to read a terminated
+    /// container's `terminationMessagePath` file from the host side.
+    #[serde(default)]
+    pub mounts: Vec<MountRecord>,
+}
+
+/// A container mount echoed in `ContainerStatus.mounts`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MountRecord {
+    pub host_path: String,
+    pub container_path: String,
+    pub readonly: bool,
 }
 
 /// Persisted image record.
