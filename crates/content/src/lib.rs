@@ -249,4 +249,62 @@ mod tests {
         let err = w.commit(999, &expected).unwrap_err();
         assert!(matches!(err, Error::SizeMismatch { .. }));
     }
+
+    #[test]
+    fn read_and_exists_of_absent_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let absent = Digest::sha256(b"never-written");
+        assert!(!store.exists(&absent));
+        assert!(
+            store.read(&absent).is_err(),
+            "reading an absent blob errors"
+        );
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let data = b"to-remove";
+        let d = store
+            .write_blob("ref", data, &Digest::sha256(data))
+            .unwrap();
+        assert!(store.remove(&d).unwrap(), "first remove reports it existed");
+        assert!(!store.exists(&d));
+        assert!(
+            !store.remove(&d).unwrap(),
+            "removing an already-gone blob succeeds and reports false"
+        );
+    }
+
+    #[test]
+    fn empty_blob_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let empty = Digest::sha256(b"");
+        let d = store.write_blob("ref", b"", &empty).unwrap();
+        assert_eq!(d, empty);
+        assert!(store.exists(&empty));
+        assert_eq!(store.read(&empty).unwrap(), b"");
+    }
+
+    #[test]
+    fn total_size_counts_committed_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.total_size().unwrap(), 0);
+        store
+            .write_blob("a", b"abc", &Digest::sha256(b"abc"))
+            .unwrap();
+        store
+            .write_blob("b", b"de", &Digest::sha256(b"de"))
+            .unwrap();
+        assert_eq!(store.total_size().unwrap(), 5);
+        // Dedup: re-committing identical content doesn't double-count.
+        store
+            .write_blob("c", b"abc", &Digest::sha256(b"abc"))
+            .unwrap();
+        assert_eq!(store.total_size().unwrap(), 5);
+    }
 }

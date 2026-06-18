@@ -105,15 +105,19 @@ pub fn apply_layer(
                 entry.unpack_in(target)?;
             }
             Whiteout::Remove(rel) => {
-                let victim = target.join(&rel);
-                remove_path(&victim);
+                // Guard against a malicious layer whose whiteout path escapes the
+                // rootfs (e.g. `../../.wh.x`) and would delete host files.
+                if let Some(victim) = safe_join(target, &rel) {
+                    remove_path(&victim);
+                }
             }
             Whiteout::Opaque(rel) => {
                 // Opaque dir: clear existing children in the upper dir.
-                let dir = target.join(&rel);
-                if dir.is_dir() {
-                    for child in std::fs::read_dir(&dir)?.flatten() {
-                        remove_path(&child.path());
+                if let Some(dir) = safe_join(target, &rel) {
+                    if dir.is_dir() {
+                        for child in std::fs::read_dir(&dir)?.flatten() {
+                            remove_path(&child.path());
+                        }
                     }
                 }
             }
@@ -128,6 +132,20 @@ fn remove_path(p: &Path) {
     } else {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// Join `rel` under `target`, returning `None` if `rel` would escape `target`
+/// (absolute, a root/prefix component, or any `..`). Whiteout paths come from
+/// untrusted image layers, so they must not delete outside the rootfs.
+fn safe_join(target: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    for c in rel.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(target.join(rel))
 }
 
 #[cfg(test)]
@@ -184,4 +202,85 @@ mod tests {
             Whiteout::Opaque(PathBuf::from("var/cache"))
         );
     }
+
+    #[test]
+    fn safe_join_blocks_escapes() {
+        let t = Path::new("/rootfs");
+        assert_eq!(
+            safe_join(t, Path::new("a/b")),
+            Some(PathBuf::from("/rootfs/a/b"))
+        );
+        assert!(safe_join(t, Path::new("../etc/passwd")).is_none());
+        assert!(safe_join(t, Path::new("a/../../etc")).is_none());
+        assert!(safe_join(t, Path::new("/etc/passwd")).is_none());
+    }
+
+    /// Build an uncompressed tar from (path, contents) pairs.
+    fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, name, &data[..]).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    #[test]
+    fn apply_layer_extracts_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = tar(&[("usr/bin/hello", b"hi")]);
+        apply_layer(
+            dir.path(),
+            Box::new(std::io::Cursor::new(blob)),
+            Compression::None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("usr/bin/hello")).unwrap(),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn apply_layer_whiteout_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("usr/bin")).unwrap();
+        std::fs::write(dir.path().join("usr/bin/old"), b"x").unwrap();
+        let blob = tar(&[("usr/bin/.wh.old", b"")]);
+        apply_layer(
+            dir.path(),
+            Box::new(std::io::Cursor::new(blob)),
+            Compression::None,
+        )
+        .unwrap();
+        assert!(
+            !dir.path().join("usr/bin/old").exists(),
+            "whiteout removed it"
+        );
+    }
+
+    #[test]
+    fn apply_layer_opaque_clears_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("var/cache")).unwrap();
+        std::fs::write(dir.path().join("var/cache/a"), b"a").unwrap();
+        std::fs::write(dir.path().join("var/cache/b"), b"b").unwrap();
+        let blob = tar(&[("var/cache/.wh..wh..opq", b"")]);
+        apply_layer(
+            dir.path(),
+            Box::new(std::io::Cursor::new(blob)),
+            Compression::None,
+        )
+        .unwrap();
+        assert!(!dir.path().join("var/cache/a").exists());
+        assert!(!dir.path().join("var/cache/b").exists());
+    }
+
+    // Note: an end-to-end "malicious whiteout" tar can't be built here because the
+    // `tar` crate refuses to write `..` into an archive. The escape guard is proven
+    // by `safe_join_blocks_escapes` above, and `apply_layer` routes every whiteout
+    // (Remove/Opaque) through `safe_join`.
 }

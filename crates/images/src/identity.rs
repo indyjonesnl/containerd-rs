@@ -147,6 +147,24 @@ mod tests {
     }
 
     #[test]
+    fn chain_ids_three_layers_recurse() {
+        let l0 = Digest::sha256(b"l0");
+        let l1 = Digest::sha256(b"l1");
+        let l2 = Digest::sha256(b"l2");
+        let chain = chain_ids(&[l0.clone(), l1.clone(), l2.clone()]);
+        assert_eq!(chain.len(), 3, "one chainID per diffID");
+        let c1 = Digest::sha256(format!("{l0} {l1}").as_bytes());
+        let c2 = Digest::sha256(format!("{c1} {l2}").as_bytes());
+        assert_eq!(chain[0], l0);
+        assert_eq!(chain[1], c1);
+        assert_eq!(
+            chain[2], c2,
+            "ChainID(n) = sha256(ChainID(n-1) + ' ' + diff[n])"
+        );
+        assert_eq!(chain_id(&[l0, l1, l2]), Some(c2));
+    }
+
+    #[test]
     fn platform_match_exact_and_variant() {
         let host = Platform {
             os: "linux".into(),
