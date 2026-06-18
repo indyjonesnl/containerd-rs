@@ -1514,18 +1514,32 @@ fn unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// Format one stream's chunk into CRI log lines: `<RFC3339Nano> <stream> F <line>`.
+/// Format one stream's chunk into CRI log lines: `<RFC3339Nano> <stream> <P|F> <line>`.
+/// A segment terminated by `\n` is tagged `F` (full); a trailing segment with no
+/// newline is tagged `P` (partial). This matters because the kubelet re-appends a
+/// newline only for `F` lines when reconstructing logs (e.g. the
+/// `terminationMessagePolicy: FallbackToLogsOnError` reader): mis-tagging an
+/// unterminated `DONE` as `F` yields `DONE\n` and fails the comparison.
 fn cri_log_line(stream: &str, data: &[u8]) -> Vec<u8> {
     let ts = humantime::format_rfc3339_nanos(std::time::SystemTime::now()).to_string();
     let mut out = Vec::new();
-    for line in data.split(|&b| b == b'\n') {
-        if line.is_empty() {
+    let mut start = 0;
+    while start < data.len() {
+        let (line, tag, next) = match data[start..].iter().position(|&b| b == b'\n') {
+            Some(pos) => (&data[start..start + pos], b"F", start + pos + 1),
+            None => (&data[start..], b"P", data.len()),
+        };
+        start = next;
+        // Skip truly-empty full lines (a lone `\n`); keep partials.
+        if line.is_empty() && tag == b"F" {
             continue;
         }
         out.extend_from_slice(ts.as_bytes());
         out.push(b' ');
         out.extend_from_slice(stream.as_bytes());
-        out.extend_from_slice(b" F ");
+        out.push(b' ');
+        out.extend_from_slice(tag);
+        out.push(b' ');
         out.extend_from_slice(line);
         out.push(b'\n');
     }
