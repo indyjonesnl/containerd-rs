@@ -7,3 +7,8 @@
 /target/
 **/*.rs.bk
 Cargo.lock.orig
+
+# Release staging + conformance output
+/dist/
+/out/
+/conformance-results/
