@@ -75,6 +75,11 @@ pub struct SandboxRecord {
     /// config was supplied.
     #[serde(default)]
     pub resolv_conf_path: Option<String>,
+    /// Namespaced sysctls from the pod's `securityContext.sysctls`
+    /// (`LinuxPodSandboxConfig.sysctls`). We run no pause container, so these are
+    /// applied to each container's OCI spec (`linux.sysctl`) at create time.
+    #[serde(default)]
+    pub sysctls: HashMap<String, String>,
 }
 
 /// Persisted container record.

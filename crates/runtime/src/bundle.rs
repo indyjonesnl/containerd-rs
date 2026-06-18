@@ -78,6 +78,10 @@ pub struct ContainerRequest {
     pub run_as_user: Option<u32>,
     /// CRI `security_context.run_as_group` — overrides the image `User` gid.
     pub run_as_group: Option<u32>,
+    /// Namespaced sysctls to set in the container's OCI spec (`linux.sysctl`).
+    /// Sourced from the pod's `LinuxPodSandboxConfig.sysctls` (we run no pause
+    /// container, so they are applied per-container).
+    pub sysctls: std::collections::HashMap<String, String>,
 }
 
 /// The full Linux capability set, granted to privileged containers.
@@ -266,7 +270,25 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     if req.privileged {
         apply_privileged(&mut spec);
     }
+    apply_sysctls(&mut spec, &req.sysctls);
     Ok(spec)
+}
+
+/// Set namespaced sysctls in the container's OCI `linux.sysctl`. runc writes
+/// these to `/proc/sys/...` inside the container's namespaces during init.
+fn apply_sysctls(spec: &mut Spec, sysctls: &std::collections::HashMap<String, String>) {
+    if sysctls.is_empty() {
+        return;
+    }
+    let Some(mut linux) = spec.linux().clone() else {
+        return;
+    };
+    let mut merged = linux.sysctl().clone().unwrap_or_default();
+    for (k, v) in sysctls {
+        merged.insert(k.clone(), v.clone());
+    }
+    linux.set_sysctl(Some(merged));
+    spec.set_linux(Some(linux));
 }
 
 /// Append CRI host-path bind mounts to the spec.

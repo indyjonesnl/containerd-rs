@@ -578,6 +578,11 @@ impl RuntimeService for RuntimeSvc {
             log_directory: config.log_directory,
             host_network,
             resolv_conf_path,
+            sysctls: config
+                .linux
+                .as_ref()
+                .map(|l| l.sysctls.clone())
+                .unwrap_or_default(),
         };
         // Demote any prior sandbox for the same pod (namespace/name/uid) to
         // NotReady. `gen_id` salts with a timestamp, so each call mints a fresh
@@ -810,7 +815,7 @@ impl RuntimeService for RuntimeSvc {
             working_dir: (!config.working_dir.is_empty()).then(|| config.working_dir.clone()),
             hostname: None,
             terminal: config.tty,
-            readonly_rootfs: false,
+            readonly_rootfs: sec_ctx.map(|sc| sc.readonly_rootfs).unwrap_or(false),
             rootless_host_ids: host_ids,
             netns_path: sandbox.netns_path.clone(),
             mounts: {
@@ -840,6 +845,7 @@ impl RuntimeService for RuntimeSvc {
             privileged,
             run_as_user,
             run_as_group,
+            sysctls: sandbox.sysctls.clone(),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -1000,6 +1006,7 @@ impl RuntimeService for RuntimeSvc {
                 rec.state = ContainerState::Exited;
                 rec.finished_at = Some(unix_nanos() as u64);
                 rec.exit_code = Some(0);
+                rec.reason = Some("Completed".to_string());
                 self.ctx
                     .metadata
                     .put(Kind::Container, self.ns(), &id, &rec)
@@ -1077,6 +1084,9 @@ impl RuntimeService for RuntimeSvc {
                 r.state = ContainerState::Exited;
                 r.exit_code = Some(code);
                 r.finished_at = Some(unix_nanos() as u64);
+                // CRI terminated-state reason: kubelet maps this to the pod's
+                // container `state.terminated.reason` ("Completed"/"Error").
+                r.reason = Some(if code == 0 { "Completed" } else { "Error" }.to_string());
                 let _ = ctx.metadata.put(Kind::Container, &ns, &cid, &r);
             }
             ctx.streaming.close_live(&cid);
@@ -1868,6 +1878,7 @@ mod tests {
                         log_directory: String::new(),
                         host_network: false,
                         resolv_conf_path: None,
+                        sysctls: Default::default(),
                     },
                 )
                 .unwrap();
