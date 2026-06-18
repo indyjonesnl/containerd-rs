@@ -78,6 +78,11 @@ pub struct ContainerRequest {
     pub run_as_user: Option<u32>,
     /// CRI `security_context.run_as_group` — overrides the image `User` gid.
     pub run_as_group: Option<u32>,
+    /// CRI `security_context.supplemental_groups` — extra GIDs for the container
+    /// process (OCI `process.user.additionalGids`). The kubelet folds the pod's
+    /// `fsGroup` into this set, so honoring it is what lets a non-root container
+    /// read fsGroup-owned volume files (e.g. group-readable projected secrets).
+    pub supplemental_groups: Vec<u32>,
     /// Namespaced sysctls to set in the container's OCI spec (`linux.sysctl`).
     /// Sourced from the pod's `LinuxPodSandboxConfig.sysctls` (we run no pause
     /// container, so they are applied per-container).
@@ -232,9 +237,13 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     let uid = req.run_as_user.unwrap_or(img_uid);
     let gid = req.run_as_group.unwrap_or(img_gid);
 
-    let user = UserBuilder::default()
-        .uid(uid)
-        .gid(gid)
+    let user_builder = UserBuilder::default().uid(uid).gid(gid);
+    let user_builder = if req.supplemental_groups.is_empty() {
+        user_builder
+    } else {
+        user_builder.additional_gids(req.supplemental_groups.clone())
+    };
+    let user = user_builder
         .build()
         .map_err(|e| Error::Builder(e.to_string()))?;
 

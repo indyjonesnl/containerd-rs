@@ -861,6 +861,9 @@ impl RuntimeService for RuntimeSvc {
             privileged,
             run_as_user,
             run_as_group,
+            supplemental_groups: sec_ctx
+                .map(|sc| sc.supplemental_groups.iter().map(|&g| g as u32).collect())
+                .unwrap_or_default(),
             sysctls: sandbox.sysctls.clone(),
         };
 
