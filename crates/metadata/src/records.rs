@@ -69,6 +69,12 @@ pub struct SandboxRecord {
     /// not recreate the sandbox every sync.
     #[serde(default)]
     pub host_network: bool,
+    /// Path to the generated `resolv.conf` for this sandbox (from the CRI
+    /// `DNSConfig`), bind-mounted at `/etc/resolv.conf` in each container so DNS
+    /// works (e.g. CoreDNS's `forward . /etc/resolv.conf`). `None` when no DNS
+    /// config was supplied.
+    #[serde(default)]
+    pub resolv_conf_path: Option<String>,
 }
 
 /// Persisted container record.

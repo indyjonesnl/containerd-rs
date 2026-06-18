@@ -9,7 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder, ProcessBuilder, RootBuilder, Spec,
+    Capability, LinuxCapabilitiesBuilder, LinuxDeviceCgroupBuilder, LinuxNamespaceBuilder,
+    LinuxNamespaceType, LinuxResourcesBuilder, MountBuilder, ProcessBuilder, RootBuilder, Spec,
     UserBuilder,
 };
 
@@ -65,6 +66,66 @@ pub struct ContainerRequest {
     pub netns_path: Option<String>,
     /// Host-path bind mounts to inject (from the CRI container config).
     pub mounts: Vec<MountSpec>,
+    /// Privileged mode (CRI `security_context.privileged`): grant the full
+    /// capability set, drop the masked/readonly `/proc` hardening, and allow all
+    /// devices. Required by host components like kube-proxy (which writes
+    /// `/proc/sys/net/netfilter/*` and programs iptables/nftables).
+    pub privileged: bool,
+}
+
+/// The full Linux capability set, granted to privileged containers.
+fn all_capabilities() -> std::collections::HashSet<Capability> {
+    use Capability::*;
+    [
+        AuditControl, AuditRead, AuditWrite, BlockSuspend, Bpf, CheckpointRestore, Chown,
+        DacOverride, DacReadSearch, Fowner, Fsetid, IpcLock, IpcOwner, Kill, Lease, LinuxImmutable,
+        MacAdmin, MacOverride, Mknod, NetAdmin, NetBindService, NetBroadcast, NetRaw, Perfmon,
+        Setfcap, Setgid, Setpcap, Setuid, SysAdmin, SysBoot, SysChroot, SysModule, SysNice,
+        SysPacct, SysPtrace, SysRawio, SysResource, SysTime, SysTtyConfig, Syslog, WakeAlarm,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Turn `spec` into a privileged container: full caps, no masked/readonly paths,
+/// allow-all device cgroup. Mirrors containerd's CRI privileged handling.
+fn apply_privileged(spec: &mut Spec) {
+    let caps = all_capabilities();
+    if let Ok(lc) = LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .permitted(caps.clone())
+        .inheritable(caps.clone())
+        .ambient(caps)
+        .build()
+    {
+        if let Some(mut process) = spec.process().clone() {
+            process.set_capabilities(Some(lc));
+            spec.set_process(Some(process));
+        }
+    }
+
+    if let Some(mut linux) = spec.linux().clone() {
+        // Drop the /proc hardening so privileged workloads can write sysctls.
+        linux.set_masked_paths(None);
+        linux.set_readonly_paths(None);
+        // Allow access to all devices: `a *:* rwm`.
+        if let Ok(rule) = LinuxDeviceCgroupBuilder::default()
+            .allow(true)
+            .access("rwm")
+            .build()
+        {
+            let resources = match linux.resources().clone() {
+                Some(mut r) => {
+                    r.set_devices(Some(vec![rule]));
+                    Some(r)
+                }
+                None => LinuxResourcesBuilder::default().devices(vec![rule]).build().ok(),
+            };
+            linux.set_resources(resources);
+        }
+        spec.set_linux(Some(linux));
+    }
 }
 
 /// Resolve the final argv using Kubernetes/CRI override semantics.
@@ -153,6 +214,9 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     }
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     add_bind_mounts(&mut spec, &req.mounts);
+    if req.privileged {
+        apply_privileged(&mut spec);
+    }
     Ok(spec)
 }
 

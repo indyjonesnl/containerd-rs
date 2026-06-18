@@ -150,6 +150,55 @@ impl RuntimeSvc {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
+    /// Write a `resolv.conf` for a sandbox into its state dir and return the path.
+    ///
+    /// Mirrors containerd's CRI DNS handling: render `nameserver`/`search`/`options`
+    /// from the CRI `DNSConfig`. When the kubelet supplies no DNS config (e.g.
+    /// `dnsPolicy: Default` is resolved host-side and may arrive empty), copy the
+    /// node's `/etc/resolv.conf` so containers still get working resolution. Returns
+    /// `None` only if nothing could be written.
+    fn write_sandbox_resolv_conf(
+        &self,
+        sandbox_id: &str,
+        dns: Option<&v1::DnsConfig>,
+    ) -> Option<String> {
+        let dir = self.ctx.state_dir.join(self.ns()).join(sandbox_id);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(sandbox = %sandbox_id, error = %e, "resolv.conf: mkdir failed");
+            return None;
+        }
+        let path = dir.join("resolv.conf");
+
+        let has_dns = dns.is_some_and(|d| {
+            !d.servers.is_empty() || !d.searches.is_empty() || !d.options.is_empty()
+        });
+        let content = if has_dns {
+            let d = dns.unwrap();
+            let mut s = String::new();
+            if !d.searches.is_empty() {
+                s.push_str(&format!("search {}\n", d.searches.join(" ")));
+            }
+            for ns in &d.servers {
+                s.push_str(&format!("nameserver {ns}\n"));
+            }
+            if !d.options.is_empty() {
+                s.push_str(&format!("options {}\n", d.options.join(" ")));
+            }
+            s
+        } else {
+            // Fall back to the node's resolver configuration.
+            std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default()
+        };
+
+        match std::fs::write(&path, content) {
+            Ok(()) => Some(path.display().to_string()),
+            Err(e) => {
+                tracing::warn!(sandbox = %sandbox_id, error = %e, "resolv.conf: write failed");
+                None
+            }
+        }
+    }
+
     /// Sample cgroup stats for a Running container via `runc events --stats`.
     /// Returns `None` for non-running containers (no live cgroup).
     async fn container_stats_for(&self, rec: &ContainerRecord) -> Option<v1::ContainerStats> {
@@ -447,6 +496,12 @@ impl RuntimeService for RuntimeSvc {
         if netns_path == "host" {
             tracing::info!(sandbox = %id, %ip, "RunPodSandbox (host network)");
         }
+
+        // Generate the pod's resolv.conf from the CRI DNSConfig and stash it in the
+        // sandbox state dir; each container bind-mounts it at /etc/resolv.conf.
+        // Falls back to the node's /etc/resolv.conf when no DNS config is supplied.
+        let resolv_conf_path = self.write_sandbox_resolv_conf(&id, config.dns_config.as_ref());
+
         let rec = SandboxRecord {
             id: id.clone(),
             name: meta.name,
@@ -464,6 +519,7 @@ impl RuntimeService for RuntimeSvc {
             annotations: config.annotations,
             log_directory: config.log_directory,
             host_network,
+            resolv_conf_path,
         };
         // Demote any prior sandbox for the same pod (namespace/name/uid) to
         // NotReady. `gen_id` salts with a timestamp, so each call mints a fresh
@@ -666,6 +722,12 @@ impl RuntimeService for RuntimeSvc {
         } else {
             Some((uid, rustix::process::getgid().as_raw()))
         };
+        let privileged = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map(|sc| sc.privileged)
+            .unwrap_or(false);
         let container_req = runtime::bundle::ContainerRequest {
             command: config.command.clone(),
             args: config.args.clone(),
@@ -685,15 +747,31 @@ impl RuntimeService for RuntimeSvc {
             readonly_rootfs: false,
             rootless_host_ids: host_ids,
             netns_path: sandbox.netns_path.clone(),
-            mounts: config
-                .mounts
-                .iter()
-                .map(|m| runtime::bundle::MountSpec {
-                    source: m.host_path.clone(),
-                    destination: m.container_path.clone(),
-                    readonly: m.readonly,
-                })
-                .collect(),
+            mounts: {
+                let mut mounts: Vec<runtime::bundle::MountSpec> = config
+                    .mounts
+                    .iter()
+                    .map(|m| runtime::bundle::MountSpec {
+                        source: m.host_path.clone(),
+                        destination: m.container_path.clone(),
+                        readonly: m.readonly,
+                    })
+                    .collect();
+                // Bind the pod's generated resolv.conf at /etc/resolv.conf unless the
+                // container already mounts there (kubelet sometimes manages it).
+                if let Some(rc) = &sandbox.resolv_conf_path {
+                    let has_resolv = mounts.iter().any(|m| m.destination == "/etc/resolv.conf");
+                    if !has_resolv && std::path::Path::new(rc).is_file() {
+                        mounts.push(runtime::bundle::MountSpec {
+                            source: rc.clone(),
+                            destination: "/etc/resolv.conf".to_string(),
+                            readonly: true,
+                        });
+                    }
+                }
+                mounts
+            },
+            privileged,
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -742,10 +820,7 @@ impl RuntimeService for RuntimeSvc {
             .metadata
             .put(Kind::Container, self.ns(), &id, &rec)
             .map_err(|e| Status::internal(e.to_string()))?;
-        tracing::warn!(
-            container = %id,
-            "CreateContainer wrote OCI bundle + record; StartContainer (runc) not yet wired"
-        );
+        tracing::info!(container = %id, "CreateContainer wrote OCI bundle + record");
         Ok(Response::new(v1::CreateContainerResponse {
             container_id: id,
         }))
@@ -1696,6 +1771,7 @@ mod tests {
                         annotations: Default::default(),
                         log_directory: String::new(),
                         host_network: false,
+                        resolv_conf_path: None,
                     },
                 )
                 .unwrap();
