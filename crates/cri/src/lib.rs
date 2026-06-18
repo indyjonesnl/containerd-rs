@@ -13,6 +13,7 @@ pub mod v1 {
 }
 
 pub mod server;
+pub mod spdy;
 pub mod streaming;
 
 /// Crate version string, surfaced by the `Version` RPC.

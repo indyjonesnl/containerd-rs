@@ -48,6 +48,50 @@ pub fn exec(bin: &str, runc_root: &Path, id: &str, cmd: &[String]) -> std::io::R
         .output()
 }
 
+/// A live `runc exec` with piped stdio, for interactive streaming exec (the SPDY
+/// `remotecommand` path). `stderr` is `None` for a TTY exec (runc merges it into
+/// stdout). Caller pumps the handles to the client's streams and awaits `child`.
+pub struct ExecHandle {
+    pub child: tokio::process::Child,
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::process::ChildStdout,
+    pub stderr: Option<tokio::process::ChildStderr>,
+}
+
+/// Spawn `runc --root <root> exec [-t] <id> <cmd...>` with piped stdin/stdout
+/// (and stderr when not a TTY) for bidirectional streaming. Unlike [`exec`],
+/// this does not block — the caller drives the streams and waits on the child.
+pub fn exec_streaming(
+    bin: &str,
+    runc_root: &Path,
+    id: &str,
+    cmd: &[String],
+    tty: bool,
+) -> std::io::Result<ExecHandle> {
+    use std::process::Stdio;
+    let mut command = tokio::process::Command::new(bin);
+    command.arg("--root").arg(runc_root).arg("exec");
+    if tty {
+        command.arg("-t");
+    }
+    command
+        .arg(id)
+        .args(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(if tty { Stdio::null() } else { Stdio::piped() });
+    let mut child = command.spawn()?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take();
+    Ok(ExecHandle {
+        child,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 /// Sample one-shot cgroup stats for a container: `runc events --stats <id>`.
 /// Emits a single JSON `{"type":"stats","data":{...}}` line.
 pub fn stats(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {

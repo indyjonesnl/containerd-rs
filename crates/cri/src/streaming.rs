@@ -2,25 +2,33 @@
 //!
 //! The CRI `Exec`/`Attach`/`PortForward` RPCs do not stream over the gRPC
 //! connection — they return a one-time URL into this separate HTTP server, which
-//! the kubelet then connects to and upgrades to the Kubernetes remotecommand
-//! protocol. Recent Kubernetes speaks this over **WebSocket** (the
-//! `v4.channel.k8s.io` subprotocol: each binary frame is `[channel_byte] ++
-//! payload`, with stdin=0, stdout=1, stderr=2, error=3). This module issues the
-//! tokens, serves the WebSocket endpoints, and drives `runc exec` for the
-//! container's stdio.
+//! the kubelet then connects to and upgrades the connection.
+//!
+//! The **kubelet→runtime leg is SPDY/3.1** (Kubernetes KEP-4006 keeps this leg on
+//! SPDY permanently; the WebSocket transition only covers kubectl↔apiserver↔
+//! kubelet). So `kubectl exec/attach/port-forward` only work over SPDY — see
+//! [`crate::spdy`]. We also keep WebSocket (`v4.channel.k8s.io`) handlers as a
+//! fallback for clients that connect that way (e.g. crictl). Each endpoint
+//! branches on the request's `Upgrade` header. Frames carry the Kubernetes
+//! remotecommand channels: stdin=0, stdout=1, stderr=2, error=3.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxPath, State};
-use axum::response::Response;
-use axum::routing::get;
+use axum::extract::{FromRequestParts, Path as AxPath, Request, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
 use axum::Router;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::spdy;
 
 /// v4 stream channels.
 const CH_STDOUT: u8 = 1;
@@ -157,13 +165,93 @@ impl Sessions {
     }
 }
 
-/// Build the streaming router.
+/// Build the streaming router. The kubelet's remotecommand client dials these
+/// with **POST** (port-forward with GET), so accept any method — like the Go CRI
+/// streaming server, which registers both GET and POST.
 pub fn router(sessions: Arc<Sessions>) -> Router {
     Router::new()
-        .route("/exec/{token}", get(exec_ws))
-        .route("/attach/{token}", get(attach_ws))
-        .route("/portforward/{token}", get(portforward_ws))
+        .route("/exec/{token}", any(exec_entry))
+        .route("/attach/{token}", any(attach_entry))
+        .route("/portforward/{token}", any(portforward_entry))
         .with_state(sessions)
+}
+
+/// Which streaming endpoint a SPDY upgrade is for.
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Exec,
+    Attach,
+    PortForward,
+}
+
+/// True if the request is an HTTP/1.1 upgrade to SPDY/3.1 (the kubelet's client).
+fn wants_spdy(headers: &axum::http::HeaderMap) -> bool {
+    let up = headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    up.eq_ignore_ascii_case("SPDY/3.1")
+}
+
+/// Respond `101 Switching Protocols` for a SPDY upgrade and drive the chosen
+/// endpoint over the upgraded byte stream in a background task.
+fn spdy_upgrade(
+    mut req: Request,
+    sessions: Arc<Sessions>,
+    token: String,
+    endpoint: Endpoint,
+) -> Response {
+    // Negotiate the remotecommand subprotocol and echo it back in the 101, as the
+    // Go streaming server does. We implement v4 (streamType streams + an error
+    // stream carrying the exit-code metav1.Status); without echoing this header
+    // the client mis-handles the success/exit-code status on close.
+    let offered: Vec<String> = req
+        .headers()
+        .get_all("X-Stream-Protocol-Version")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_string())
+        .collect();
+    let negotiated = if offered.iter().any(|p| p == "v4.channel.k8s.io") {
+        "v4.channel.k8s.io".to_string()
+    } else {
+        offered
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "v4.channel.k8s.io".to_string())
+    };
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(error = %e, "spdy upgrade failed");
+                return;
+            }
+        };
+        let io = hyper_util::rt::TokioIo::new(upgraded);
+        let server = match spdy::serve(io).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "spdy handshake failed");
+                return;
+            }
+        };
+        tracing::info!("spdy connection established");
+        match endpoint {
+            Endpoint::Exec => spdy_exec(server, sessions, token).await,
+            Endpoint::Attach => spdy_attach(server, sessions, token).await,
+            Endpoint::PortForward => spdy_portforward(server, sessions, token).await,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "SPDY/3.1")
+        .header("X-Stream-Protocol-Version", negotiated)
+        .body(axum::body::Body::empty())
+        .unwrap()
 }
 
 /// Serve the streaming server on `addr` until `shutdown` resolves.
@@ -179,13 +267,22 @@ pub async fn serve(
         .await
 }
 
-async fn exec_ws(
+async fn exec_entry(
     State(sessions): State<Arc<Sessions>>,
     AxPath(token): AxPath<String>,
-    ws: WebSocketUpgrade,
+    req: Request,
 ) -> Response {
-    ws.protocols(["v4.channel.k8s.io", "channel.k8s.io"])
-        .on_upgrade(move |socket| handle_exec(socket, sessions, token))
+    tracing::info!(method = %req.method(), upgrade = ?req.headers().get(header::UPGRADE), "exec stream request");
+    if wants_spdy(req.headers()) {
+        return spdy_upgrade(req, sessions, token, Endpoint::Exec);
+    }
+    let (mut parts, _) = req.into_parts();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(ws) => ws
+            .protocols(["v4.channel.k8s.io", "channel.k8s.io"])
+            .on_upgrade(move |socket| handle_exec(socket, sessions, token)),
+        Err(rej) => rej.into_response(),
+    }
 }
 
 /// Frame a payload for a v4 channel: `[channel] ++ data`.
@@ -268,13 +365,21 @@ async fn handle_exec(mut socket: WebSocket, sessions: Arc<Sessions>, token: Stri
     let _ = socket.send(Message::Close(None)).await;
 }
 
-async fn attach_ws(
+async fn attach_entry(
     State(sessions): State<Arc<Sessions>>,
     AxPath(token): AxPath<String>,
-    ws: WebSocketUpgrade,
+    req: Request,
 ) -> Response {
-    ws.protocols(["v4.channel.k8s.io", "channel.k8s.io"])
-        .on_upgrade(move |socket| handle_attach(socket, sessions, token))
+    if wants_spdy(req.headers()) {
+        return spdy_upgrade(req, sessions, token, Endpoint::Attach);
+    }
+    let (mut parts, _) = req.into_parts();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(ws) => ws
+            .protocols(["v4.channel.k8s.io", "channel.k8s.io"])
+            .on_upgrade(move |socket| handle_attach(socket, sessions, token)),
+        Err(rej) => rej.into_response(),
+    }
 }
 
 /// Stream a running container's live stdout/stderr to the attach WebSocket,
@@ -318,13 +423,21 @@ async fn handle_attach(mut socket: WebSocket, sessions: Arc<Sessions>, token: St
     let _ = socket.send(Message::Close(None)).await;
 }
 
-async fn portforward_ws(
+async fn portforward_entry(
     State(sessions): State<Arc<Sessions>>,
     AxPath(token): AxPath<String>,
-    ws: WebSocketUpgrade,
+    req: Request,
 ) -> Response {
-    ws.protocols(["v4.channel.k8s.io", "portforward.k8s.io"])
-        .on_upgrade(move |socket| handle_portforward(socket, sessions, token))
+    if wants_spdy(req.headers()) {
+        return spdy_upgrade(req, sessions, token, Endpoint::PortForward);
+    }
+    let (mut parts, _) = req.into_parts();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(ws) => ws
+            .protocols(["v4.channel.k8s.io", "portforward.k8s.io"])
+            .on_upgrade(move |socket| handle_portforward(socket, sessions, token)),
+        Err(rej) => rej.into_response(),
+    }
 }
 
 /// Proxy the Kubernetes port-forward WebSocket protocol to a localhost TCP
@@ -406,6 +519,262 @@ async fn handle_portforward(socket: WebSocket, sessions: Arc<Sessions>, token: S
             }
         } else if let Some(w) = writers.get_mut(&channel) {
             let _ = w.write_all(payload).await;
+        }
+    }
+}
+
+// ===================== SPDY/3.1 handlers (kubelet path) =====================
+
+/// Collect the inbound remotecommand streams the client opens up front. Returns
+/// once the mandatory set has arrived (or a short idle timeout elapses).
+/// `(error_id, stdout_id, stderr_id, stdin_rx)`.
+async fn collect_rc_streams<W>(
+    server: &mut spdy::SpdyServer<W>,
+    want_stdin: bool,
+    want_stderr: bool,
+) -> (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (mut error_id, mut stdout_id, mut stderr_id, mut stdin_rx) = (None, None, None, None);
+    loop {
+        let have = error_id.is_some()
+            && stdout_id.is_some()
+            && (!want_stdin || stdin_rx.is_some())
+            && (!want_stderr || stderr_id.is_some());
+        if have {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(10), server.accept()).await {
+            Ok(Some(stream)) => match stream.stream_type() {
+                Some(spdy::ST_ERROR) => error_id = Some(stream.id),
+                Some(spdy::ST_STDOUT) => stdout_id = Some(stream.id),
+                Some(spdy::ST_STDERR) => stderr_id = Some(stream.id),
+                Some(spdy::ST_STDIN) => stdin_rx = Some(stream.data),
+                Some(spdy::ST_RESIZE) => {
+                    // Resize is best-effort (no PTY yet): drain so the channel
+                    // never backs up.
+                    let mut d = stream.data;
+                    tokio::spawn(async move { while d.recv().await.is_some() {} });
+                }
+                _ => {}
+            },
+            _ => break, // closed or idle
+        }
+    }
+    (error_id, stdout_id, stderr_id, stdin_rx)
+}
+
+async fn spdy_exec<W>(mut server: spdy::SpdyServer<W>, sessions: Arc<Sessions>, token: String)
+where
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let writer = server.writer.clone();
+    let Some(session) = sessions.take_exec(&token) else {
+        let _ = writer.goaway(0).await;
+        return;
+    };
+    let (error_id, stdout_id, stderr_id, stdin_rx) =
+        collect_rc_streams(&mut server, true, !session.tty).await;
+
+    let handle = match runtime::runc::exec_streaming(
+        &sessions.runc_bin,
+        &sessions.runc_root,
+        &session.container_id,
+        &session.cmd,
+        session.tty,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            if let Some(eid) = error_id {
+                let _ = writer
+                    .send_data(eid, true, &spdy::status_failure(&format!("runc exec: {e}")))
+                    .await;
+            }
+            let _ = writer.goaway(0).await;
+            return;
+        }
+    };
+    let runtime::runc::ExecHandle {
+        mut child,
+        mut stdin,
+        mut stdout,
+        stderr,
+    } = handle;
+
+    // stdin: client -> process (detached; may never close).
+    if let Some(mut rx) = stdin_rx {
+        tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if stdin.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            // Dropping `stdin` here closes the process's stdin (EOF).
+        });
+    }
+
+    // stdout/stderr: process -> client. Await these before the exit status so the
+    // final output is delivered first.
+    let mut pumps = Vec::new();
+    if let Some(oid) = stdout_id {
+        let w = writer.clone();
+        pumps.push(tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if w.send_data(oid, false, &buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    if let (Some(eid), Some(mut se)) = (stderr_id, stderr) {
+        let w = writer.clone();
+        pumps.push(tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match se.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if w.send_data(eid, false, &buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+    for p in pumps {
+        let _ = p.await;
+    }
+    if let Some(eid) = error_id {
+        let _ = writer.send_data(eid, true, &spdy::status_exit(code)).await;
+    }
+    let _ = writer.goaway(0).await;
+}
+
+async fn spdy_attach<W>(mut server: spdy::SpdyServer<W>, sessions: Arc<Sessions>, token: String)
+where
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let writer = server.writer.clone();
+    let Some(session) = sessions.take_attach(&token) else {
+        let _ = writer.goaway(0).await;
+        return;
+    };
+    let (error_id, stdout_id, stderr_id, _) = collect_rc_streams(&mut server, false, true).await;
+
+    let Some(mut rx) = sessions.subscribe_live(&session.container_id) else {
+        if let Some(eid) = error_id {
+            let _ = writer
+                .send_data(eid, true, &spdy::status_failure("container not running"))
+                .await;
+        }
+        let _ = writer.goaway(0).await;
+        return;
+    };
+    loop {
+        match rx.recv().await {
+            Ok((channel, data)) => {
+                let target = if channel == CH_STDERR {
+                    stderr_id
+                } else {
+                    stdout_id
+                };
+                if let Some(id) = target {
+                    if writer.send_data(id, false, &data).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    if let Some(eid) = error_id {
+        let _ = writer.send_data(eid, true, &spdy::status_success()).await;
+    }
+    let _ = writer.goaway(0).await;
+}
+
+async fn spdy_portforward<W>(
+    mut server: spdy::SpdyServer<W>,
+    sessions: Arc<Sessions>,
+    token: String,
+) where
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let writer = server.writer.clone();
+    if sessions.take_portforward(&token).is_none() {
+        let _ = writer.goaway(0).await;
+        return;
+    }
+    // Per forwarded port the client opens an `error` stream and a `data` stream,
+    // both carrying a `port` header. Connect localhost TCP on the data stream
+    // (pods are host-network) and pump bidirectionally.
+    let mut error_ids: HashMap<u16, u32> = HashMap::new();
+    while let Some(stream) = server.accept().await {
+        let port: u16 = spdy::header(&stream.headers, spdy::HEADER_PORT)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let stype = stream.stream_type().map(str::to_string);
+        if stype.as_deref() == Some(spdy::ST_ERROR) {
+            error_ids.insert(port, stream.id);
+            continue;
+        }
+        // data stream
+        let data_id = stream.id;
+        let mut rx = stream.data;
+        let w = writer.clone();
+        let err_id = error_ids.get(&port).copied().unwrap_or(data_id);
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(tcp) => {
+                let (mut rd, mut wr) = tokio::io::split(tcp);
+                // client -> TCP
+                tokio::spawn(async move {
+                    while let Some(chunk) = rx.recv().await {
+                        if wr.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                // TCP -> client (on the data stream)
+                let w2 = w.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match rd.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if w2.send_data(data_id, false, &buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = w
+                    .send_data(
+                        err_id,
+                        true,
+                        &spdy::status_failure(&format!("connect 127.0.0.1:{port}: {e}")),
+                    )
+                    .await;
+            }
         }
     }
 }

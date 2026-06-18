@@ -52,8 +52,13 @@ oci-spec = "0.8"
 redb = "2"
 # layer / compression / fs
 tar = "0.4"
-flate2 = "1.1"
+# `zlib` C backend enables Compress/Decompress::set_dictionary (SPDY/3.1 NV header dict).
+flate2 = { version = "1.1", features = ["zlib"] }
 zstd = "0.13"
+# SPDY/3.1 streaming transport (CRI exec/attach/port-forward over the kubelet's SPDY client)
+bytes = "1"
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 rustix = { version = "1", features = ["fs", "mount", "process"] }
 # internal crates
 core-types = { path = "crates/core-types" }
