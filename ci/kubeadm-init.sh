@@ -50,6 +50,10 @@ prepare_host() {
   modprobe overlay 2>/dev/null || true
   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1 || true
+  # Required for CNI portmap hostPort DNAT to localhost-bound services: without it
+  # the kernel won't route 127.0.0.0/8 to a remote (pod) destination, so hostPort
+  # connections fail with "No route to host" (the HostPort conformance test).
+  sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
   swapoff -a 2>/dev/null || true
 
   mkdir -p /lib/modules /etc/cni/net.d /run/flannel
