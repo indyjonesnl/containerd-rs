@@ -35,6 +35,9 @@ base64.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
+# Vendored protoc so the build needs no system protobuf-compiler (CI runners
+# don't ship one); keeps the build hermetic and local == CI.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3"
