@@ -40,3 +40,10 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 oci-spec.workspace = true
 tokio-tungstenite = "0.24"
+# Integration (contract) tests in tests/ are a separate crate, so the crates
+# they name directly must be dev-deps even when also normal deps of cri.
+content.workspace = true
+metadata.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+hyper-util.workspace = true
