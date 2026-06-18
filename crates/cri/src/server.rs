@@ -1093,6 +1093,13 @@ impl RuntimeService for RuntimeSvc {
 
         let log_path = container_log_path(&bundle, &rec.log_path);
 
+        // A `terminal: true` container needs PTY supervision (console socket).
+        let terminal = std::fs::read(bundle.config_json())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["process"]["terminal"].as_bool())
+            .unwrap_or(false);
+
         // Mark Running before launching; supervision flips it to Exited on exit.
         rec.state = ContainerState::Running;
         rec.started_at = Some(unix_nanos() as u64);
@@ -1110,7 +1117,8 @@ impl RuntimeService for RuntimeSvc {
         let bundle_dir = bundle.dir().to_path_buf();
         let live = self.ctx.streaming.live_channel(&id);
         tokio::spawn(async move {
-            let code = supervise_container(&runc_root, &bundle_dir, &cid, &log_path, live).await;
+            let code =
+                supervise_container(&runc_root, &bundle_dir, &cid, &log_path, live, terminal).await;
             if let Ok(Some(mut r)) = ctx
                 .metadata
                 .get::<ContainerRecord>(Kind::Container, &ns, &cid)
@@ -1592,13 +1600,18 @@ async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Run `runc run` with piped stdio, streaming output live; returns the exit code.
+/// A `terminal` container is supervised over a PTY instead (see [`supervise_tty`]).
 async fn supervise_container(
     runc_root: &Path,
     bundle_dir: &Path,
     cid: &str,
     log_path: &Path,
     live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
+    terminal: bool,
 ) -> i32 {
+    if terminal {
+        return supervise_tty(runc_root, bundle_dir, cid, log_path, live).await;
+    }
     let mut cmd = tokio::process::Command::new(runtime::runc::DEFAULT_BIN);
     cmd.arg("--root")
         .arg(runc_root)
@@ -1655,6 +1668,69 @@ async fn supervise_container(
         tracing::info!(container = %cid, code = ?s.code(), signal = ?s.signal(), "runc run returned");
     }
     status.ok().and_then(|s| s.code()).unwrap_or(-1)
+}
+
+/// Supervise a `terminal: true` container over a PTY. runc can't share its
+/// foreground stdio with a tty container, so [`runtime::runc::run_tty`] runs it
+/// detached with a console socket and hands back the pty master; we pump the
+/// master to the CRI log + live bus (stdout channel) until the process exits
+/// (master EOF), then clean up. The detached console path can't surface an exit
+/// code, so we report 0 (tty workloads are typically long-running/interactive).
+async fn supervise_tty(
+    runc_root: &Path,
+    bundle_dir: &Path,
+    cid: &str,
+    log_path: &Path,
+    live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
+) -> i32 {
+    if let Some(parent) = log_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let runc_root = runc_root.to_path_buf();
+    let bundle_dir = bundle_dir.to_path_buf();
+    let cid = cid.to_string();
+    let log_path = log_path.to_path_buf();
+    let console_sock = bundle_dir.join("console.sock");
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let master = match runtime::runc::run_tty(
+            runtime::runc::DEFAULT_BIN,
+            &runc_root,
+            &bundle_dir,
+            &cid,
+            &console_sock,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = std::fs::write(
+                    &log_path,
+                    cri_log_line("stderr", format!("runc run --tty: {e}").as_bytes()),
+                );
+                return -1;
+            }
+        };
+        let mut log = std::fs::File::create(&log_path).ok();
+        let mut master = std::fs::File::from(master);
+        let mut buf = [0u8; 8192];
+        loop {
+            // A pty master read returns 0 (or EIO) once the slave side closes,
+            // i.e. the container process has exited.
+            match master.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = &buf[..n];
+                    if let Some(f) = log.as_mut() {
+                        let _ = f.write_all(&cri_log_line("stdout", chunk));
+                    }
+                    let _ = live.send((1, chunk.to_vec()));
+                }
+            }
+        }
+        let _ = runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root, &cid);
+        0
+    })
+    .await
+    .unwrap_or(-1)
 }
 
 /// Resolve a container's log file path: absolute as-is, else under the bundle.

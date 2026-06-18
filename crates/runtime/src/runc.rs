@@ -36,6 +36,67 @@ pub fn run(bin: &str, runc_root: &Path, bundle_dir: &Path, id: &str) -> std::io:
         .output()
 }
 
+/// Run a TTY container and return the PTY master fd. A `terminal: true` container
+/// cannot share runc's foreground stdio, so we bind a console socket, launch
+/// `runc run --detach --console-socket`, and receive the master end of the pty
+/// that runc passes back over the socket (SCM_RIGHTS). The caller pumps the
+/// master (container stdout/stdin) and reaps the container on EOF.
+pub fn run_tty(
+    bin: &str,
+    runc_root: &Path,
+    bundle_dir: &Path,
+    id: &str,
+    console_sock: &Path,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::unix::net::UnixListener;
+    let _ = std::fs::remove_file(console_sock);
+    let listener = UnixListener::bind(console_sock)?;
+    // Detached, so this returns once the container is created+started; runc
+    // connects to the console socket during setup to hand over the pty master.
+    let mut child = Command::new(bin)
+        .arg("--root")
+        .arg(runc_root)
+        .arg("run")
+        .arg("--detach")
+        .arg("--console-socket")
+        .arg(console_sock)
+        .arg("--bundle")
+        .arg(bundle_dir)
+        .arg(id)
+        .spawn()?;
+    let (conn, _) = listener.accept()?;
+    let master = recv_console_fd(&conn);
+    let status = child.wait()?;
+    let master = master?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "runc run --detach exited with {status}"
+        )));
+    }
+    Ok(master)
+}
+
+/// Receive a single file descriptor sent over a unix socket via `SCM_RIGHTS`
+/// (runc's console-socket protocol passes the pty master this way).
+fn recv_console_fd(conn: &std::os::unix::net::UnixStream) -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+    use std::io::IoSliceMut;
+    use std::mem::MaybeUninit;
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let mut data = [0u8; 64];
+    let mut iov = [IoSliceMut::new(&mut data)];
+    recvmsg(conn, &mut iov, &mut control, RecvFlags::empty())?;
+    for msg in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(fds) = msg {
+            if let Some(fd) = fds.into_iter().next() {
+                return Ok(fd);
+            }
+        }
+    }
+    Err(std::io::Error::other("console socket sent no fd"))
+}
+
 /// Query container state: `runc state <id>`. Exit status is success once the
 /// container exists in the runc state dir. Used to close the race between our
 /// async `runc run` and an immediately-following `exec` (e.g. a postStart hook).
