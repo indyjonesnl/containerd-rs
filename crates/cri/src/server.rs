@@ -377,9 +377,30 @@ impl RuntimeService for RuntimeSvc {
         let status = v1::RuntimeStatus {
             conditions: vec![condition("RuntimeReady"), condition("NetworkReady")],
         };
-        // `verbose` would add debug info to `info`; nothing to report yet.
-        let _verbose = request.into_inner().verbose;
-        let info = std::collections::HashMap::new();
+        // When `verbose`, surface the runtime configuration under `info["config"]`,
+        // mirroring containerd's CRI. Tools (crictl, kubeadm) parse this for the
+        // sandbox image / cgroup driver; an empty `info` makes kubeadm log
+        // `no 'config' field in CRI info`.
+        let mut info = std::collections::HashMap::new();
+        if request.into_inner().verbose {
+            let config = serde_json::json!({
+                "sandboxImage": "registry.k8s.io/pause:3.10",
+                "cgroupDriver": "cgroupfs",
+                "snapshotter": "overlayfs",
+                "defaultRuntimeName": "runc",
+                "rootDir": self.ctx.snapshots_root.display().to_string(),
+                "stateDir": self.ctx.state_dir.display().to_string(),
+            });
+            info.insert("config".to_string(), config.to_string());
+            info.insert(
+                "runtime".to_string(),
+                serde_json::json!({
+                    "name": "containerd-rs",
+                    "version": env!("CARGO_PKG_VERSION"),
+                })
+                .to_string(),
+            );
+        }
         Ok(Response::new(v1::StatusResponse {
             status: Some(status),
             info,
@@ -1670,6 +1691,20 @@ mod tests {
         let conds = s.status.unwrap().conditions;
         assert!(conds.iter().any(|c| c.r#type == "RuntimeReady" && c.status));
         assert!(conds.iter().any(|c| c.r#type == "NetworkReady" && c.status));
+        // verbose=false => no info; consumers only parse it when they ask for it.
+        assert!(s.info.is_empty());
+
+        // verbose=true must surface info["config"] (kubeadm/crictl parse it; an
+        // empty map makes kubeadm warn `no 'config' field in CRI info`).
+        let sv = client
+            .status(v1::StatusRequest { verbose: true })
+            .await
+            .unwrap()
+            .into_inner();
+        let cfg = sv.info.get("config").expect("verbose status has config");
+        let parsed: serde_json::Value = serde_json::from_str(cfg).unwrap();
+        assert_eq!(parsed["sandboxImage"], "registry.k8s.io/pause:3.10");
+        assert_eq!(parsed["cgroupDriver"], "cgroupfs");
 
         // A still-unimplemented RPC returns the right gRPC code.
         let err = client
