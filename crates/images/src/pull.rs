@@ -50,11 +50,16 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// Registry credentials for a pull.
+/// Registry credentials for a pull (from the CRI `AuthConfig`).
 #[derive(Debug, Clone)]
 pub enum Auth {
     Anonymous,
-    Basic { username: String, password: String },
+    Basic {
+        username: String,
+        password: String,
+    },
+    /// A pre-issued bearer token (CRI `identity_token` / `registry_token`).
+    Bearer(String),
 }
 
 impl Auth {
@@ -64,7 +69,21 @@ impl Auth {
             Auth::Basic { username, password } => {
                 RegistryAuth::Basic(username.clone(), password.clone())
             }
+            Auth::Bearer(token) => RegistryAuth::Bearer(token.clone()),
         }
+    }
+}
+
+impl Error {
+    /// Whether this pull failed because of registry authentication/authorization
+    /// (so callers can surface `Unauthenticated` rather than a generic error).
+    pub fn is_auth_error(&self) -> bool {
+        use oci_client::errors::OciDistributionError as E;
+        matches!(
+            self,
+            Error::Registry(E::AuthenticationFailure(_))
+                | Error::Registry(E::UnauthorizedError { .. })
+        )
     }
 }
 

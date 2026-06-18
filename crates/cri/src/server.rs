@@ -84,6 +84,40 @@ fn repo_name(reference: &str) -> &str {
     }
 }
 
+/// Build pull credentials from the CRI `AuthConfig`, in priority order: a bearer
+/// identity/registry token, explicit username/password, or a base64-encoded
+/// `auth` (`"username:password"`, as found in docker config / pull secrets);
+/// otherwise anonymous. oci-client performs the docker bearer-token handshake
+/// (401 → realm/scope → token) under all of these.
+fn auth_from_config(a: v1::AuthConfig) -> images::pull::Auth {
+    use base64::Engine as _;
+    if !a.identity_token.is_empty() {
+        return images::pull::Auth::Bearer(a.identity_token);
+    }
+    if !a.registry_token.is_empty() {
+        return images::pull::Auth::Bearer(a.registry_token);
+    }
+    if !a.username.is_empty() {
+        return images::pull::Auth::Basic {
+            username: a.username,
+            password: a.password,
+        };
+    }
+    if !a.auth.is_empty() {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(a.auth.trim()) {
+            if let Ok(s) = String::from_utf8(decoded) {
+                if let Some((u, p)) = s.split_once(':') {
+                    return images::pull::Auth::Basic {
+                        username: u.to_string(),
+                        password: p.to_string(),
+                    };
+                }
+            }
+        }
+    }
+    images::pull::Auth::Anonymous
+}
+
 fn record_to_image(rec: &ImageRecord) -> v1::Image {
     v1::Image {
         id: rec.image_id.clone(),
@@ -1287,13 +1321,10 @@ impl ImageService for ImageSvc {
         // itself is idempotent: content is deduped, unpack skips populated dirs).
         let _pull_guard = self.ctx.pull_locks.guard(&reference).await;
 
-        let auth = match req.auth {
-            Some(a) if !a.username.is_empty() => images::pull::Auth::Basic {
-                username: a.username,
-                password: a.password,
-            },
-            _ => images::pull::Auth::Anonymous,
-        };
+        let auth = req
+            .auth
+            .map(auth_from_config)
+            .unwrap_or(images::pull::Auth::Anonymous);
 
         let pulled = images::pull::pull(
             &reference,
@@ -1302,7 +1333,16 @@ impl ImageService for ImageSvc {
             &auth,
         )
         .await
-        .map_err(|e| Status::internal(format!("pull {reference} failed: {e}")))?;
+        .map_err(|e| {
+            // Surface registry auth/authorization failures clearly to the kubelet.
+            if e.is_auth_error() {
+                Status::unauthenticated(format!(
+                    "pull {reference}: registry authentication failed: {e}"
+                ))
+            } else {
+                Status::internal(format!("pull {reference} failed: {e}"))
+            }
+        })?;
 
         let repo_digests = match &pulled.manifest_digest {
             Some(d) => vec![format!("{}@{}", repo_name(&reference), d)],
@@ -1865,6 +1905,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(created.state, ContainerState::Created);
+    }
+
+    #[test]
+    fn auth_config_maps_all_credential_forms() {
+        use base64::Engine as _;
+        use images::pull::Auth;
+
+        // identity_token / registry_token -> Bearer (identity wins).
+        let a = auth_from_config(v1::AuthConfig {
+            identity_token: "idtok".into(),
+            registry_token: "regtok".into(),
+            ..Default::default()
+        });
+        assert!(matches!(a, Auth::Bearer(t) if t == "idtok"));
+        let a = auth_from_config(v1::AuthConfig {
+            registry_token: "regtok".into(),
+            ..Default::default()
+        });
+        assert!(matches!(a, Auth::Bearer(t) if t == "regtok"));
+
+        // username/password -> Basic.
+        let a = auth_from_config(v1::AuthConfig {
+            username: "u".into(),
+            password: "p".into(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(a, Auth::Basic { username, password } if username == "u" && password == "p")
+        );
+
+        // base64 "user:pass" `auth` field -> Basic.
+        let enc = base64::engine::general_purpose::STANDARD.encode("alice:s3cret");
+        let a = auth_from_config(v1::AuthConfig {
+            auth: enc,
+            ..Default::default()
+        });
+        assert!(
+            matches!(a, Auth::Basic { username, password } if username == "alice" && password == "s3cret")
+        );
+
+        // empty -> Anonymous.
+        assert!(matches!(
+            auth_from_config(v1::AuthConfig::default()),
+            Auth::Anonymous
+        ));
     }
 
     #[tokio::test]

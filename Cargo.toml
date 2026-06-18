@@ -44,6 +44,7 @@ clap = { version = "4", features = ["derive"] }
 # crypto / encoding
 sha2 = "0.11"
 hex = "0.4"
+base64 = "0.22"
 # OCI registry client (ex oci-distribution)
 oci-client = "0.17"
 # OCI runtime + image spec types
