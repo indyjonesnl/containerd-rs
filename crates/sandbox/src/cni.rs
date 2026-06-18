@@ -46,6 +46,17 @@ pub struct ConfList {
     pub plugins: Vec<serde_json::Value>,
 }
 
+/// A pod host-port mapping, fed to a `portmap`-capable plugin as the
+/// `runtimeConfig.portMappings` capability arg (from CRI `PortMapping`).
+#[derive(Debug, Clone)]
+pub struct PortMapping {
+    pub host_port: i32,
+    pub container_port: i32,
+    /// Lowercase CNI protocol: "tcp" | "udp" | "sctp".
+    pub protocol: String,
+    pub host_ip: String,
+}
+
 /// CNI runtime: knows where conflists and plugin binaries live.
 #[derive(Debug, Clone)]
 pub struct Cni {
@@ -126,12 +137,21 @@ impl Cni {
     }
 
     /// Run the ADD chain for `container_id` against `netns`, returning the pod IP.
-    pub fn setup(&self, container_id: &str, netns: &str) -> Result<String> {
+    /// `port_mappings` are injected as the `runtimeConfig.portMappings` capability
+    /// arg for any plugin that declares `capabilities.portMappings` (e.g. portmap),
+    /// which is how pod `hostPort`s are programmed.
+    pub fn setup(
+        &self,
+        container_id: &str,
+        netns: &str,
+        port_mappings: &[PortMapping],
+    ) -> Result<String> {
         let conflist = self.load_conflist()?;
         let netns_path = self.netns_path(netns);
         let mut prev_result: Option<serde_json::Value> = None;
         for plugin in &conflist.plugins {
-            let netconf = assemble_netconf(&conflist, plugin, prev_result.as_ref());
+            let mut netconf = assemble_netconf(&conflist, plugin, prev_result.as_ref());
+            inject_port_mappings(&mut netconf, plugin, port_mappings);
             let result = self.exec_plugin("ADD", container_id, &netns_path, plugin, &netconf)?;
             prev_result = Some(result);
         }
@@ -209,6 +229,46 @@ fn assemble_netconf(
         }
     }
     netconf
+}
+
+/// If `plugin` declares `capabilities.portMappings`, inject the pod's host-port
+/// mappings as `runtimeConfig.portMappings` (the CNI capability-args convention).
+fn inject_port_mappings(
+    netconf: &mut serde_json::Value,
+    plugin: &serde_json::Value,
+    port_mappings: &[PortMapping],
+) {
+    if port_mappings.is_empty() {
+        return;
+    }
+    let capable = plugin
+        .get("capabilities")
+        .and_then(|c| c.get("portMappings"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    if !capable {
+        return;
+    }
+    let Some(obj) = netconf.as_object_mut() else {
+        return;
+    };
+    let mappings: Vec<serde_json::Value> = port_mappings
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "hostPort": p.host_port,
+                "containerPort": p.container_port,
+                "protocol": p.protocol,
+                "hostIP": p.host_ip,
+            })
+        })
+        .collect();
+    let rc = obj
+        .entry("runtimeConfig")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(rc_obj) = rc.as_object_mut() {
+        rc_obj.insert("portMappings".into(), serde_json::Value::Array(mappings));
+    }
 }
 
 /// Extract the first IPv4/IPv6 address (without prefix) from a CNI result.

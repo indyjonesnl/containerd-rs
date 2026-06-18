@@ -531,6 +531,22 @@ impl RuntimeService for RuntimeSvc {
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
         // plugin chain; if CNI is unavailable/fails we fall back to host network
         // (rootless containers share the host net namespace).
+        // Pod hostPort declarations -> CNI portmap capability arg.
+        let port_mappings: Vec<sandbox::cni::PortMapping> = config
+            .port_mappings
+            .iter()
+            .map(|pm| sandbox::cni::PortMapping {
+                host_port: pm.host_port,
+                container_port: pm.container_port,
+                protocol: match pm.protocol {
+                    1 => "udp",
+                    2 => "sctp",
+                    _ => "tcp",
+                }
+                .to_string(),
+                host_ip: pm.host_ip.clone(),
+            })
+            .collect();
         let (netns_path, ip) = if host_network {
             ("host".to_string(), sandbox::net::host_ip())
         } else {
@@ -538,7 +554,7 @@ impl RuntimeService for RuntimeSvc {
                 .ctx
                 .cni
                 .create_netns(&id)
-                .and_then(|_| self.ctx.cni.setup(&id, &id))
+                .and_then(|_| self.ctx.cni.setup(&id, &id, &port_mappings))
             {
                 Ok(ip) => {
                     tracing::info!(sandbox = %id, %ip, "RunPodSandbox (CNI)");
