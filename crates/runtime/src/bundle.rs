@@ -71,6 +71,13 @@ pub struct ContainerRequest {
     /// devices. Required by host components like kube-proxy (which writes
     /// `/proc/sys/net/netfilter/*` and programs iptables/nftables).
     pub privileged: bool,
+    /// CRI `security_context.run_as_user` — overrides the image `User` uid. When a
+    /// pod requests a non-root uid, the kubelet owns its projected serviceaccount
+    /// token by that uid (mode 0600); running as the image default (often root)
+    /// with caps dropped then can't read it, breaking in-cluster API access.
+    pub run_as_user: Option<u32>,
+    /// CRI `security_context.run_as_group` — overrides the image `User` gid.
+    pub run_as_group: Option<u32>,
 }
 
 /// The full Linux capability set, granted to privileged containers.
@@ -177,7 +184,10 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
         .clone()
         .or_else(|| image.working_dir.clone())
         .unwrap_or_else(|| "/".to_string());
-    let (uid, gid) = parse_user(&image.user);
+    // CRI run_as_user/run_as_group override the image's User.
+    let (img_uid, img_gid) = parse_user(&image.user);
+    let uid = req.run_as_user.unwrap_or(img_uid);
+    let gid = req.run_as_group.unwrap_or(img_gid);
 
     let user = UserBuilder::default()
         .uid(uid)
@@ -343,6 +353,25 @@ mod tests {
         assert_eq!(parse_user(&Some("1000".into())), (1000, 0));
         assert_eq!(parse_user(&Some("root".into())), (0, 0));
         assert_eq!(parse_user(&None), (0, 0));
+    }
+
+    #[test]
+    fn run_as_user_overrides_image_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = img(); // image User is "1000:1001"
+        // No override -> image user.
+        let spec = generate_spec(&i, &ContainerRequest::default(), &dir.path().join("a")).unwrap();
+        assert_eq!(spec.process().as_ref().unwrap().user().uid(), 1000);
+        // CRI run_as_user/group override the image user (e.g. conformance uid 65534).
+        let r = ContainerRequest {
+            run_as_user: Some(65534),
+            run_as_group: Some(65534),
+            ..Default::default()
+        };
+        let spec = generate_spec(&i, &r, &dir.path().join("b")).unwrap();
+        let u = spec.process().as_ref().unwrap().user();
+        assert_eq!(u.uid(), 65534);
+        assert_eq!(u.gid(), 65534);
     }
 
     #[test]

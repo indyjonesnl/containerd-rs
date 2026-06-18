@@ -743,12 +743,14 @@ impl RuntimeService for RuntimeSvc {
         } else {
             Some((uid, rustix::process::getgid().as_raw()))
         };
-        let privileged = config
-            .linux
-            .as_ref()
-            .and_then(|l| l.security_context.as_ref())
-            .map(|sc| sc.privileged)
-            .unwrap_or(false);
+        let sec_ctx = config.linux.as_ref().and_then(|l| l.security_context.as_ref());
+        let privileged = sec_ctx.map(|sc| sc.privileged).unwrap_or(false);
+        let run_as_user = sec_ctx
+            .and_then(|sc| sc.run_as_user.as_ref())
+            .map(|v| v.value as u32);
+        let run_as_group = sec_ctx
+            .and_then(|sc| sc.run_as_group.as_ref())
+            .map(|v| v.value as u32);
         let container_req = runtime::bundle::ContainerRequest {
             command: config.command.clone(),
             args: config.args.clone(),
@@ -793,6 +795,8 @@ impl RuntimeService for RuntimeSvc {
                 mounts
             },
             privileged,
+            run_as_user,
+            run_as_group,
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
