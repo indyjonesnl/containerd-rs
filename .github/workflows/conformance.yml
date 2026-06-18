@@ -1,27 +1,41 @@
 name: conformance
 
-# Kubernetes Conformance proof: stand up a single-node kubeadm cluster on the
-# runner host using containerd-rs as the SOLE container runtime, then run the
-# official [Conformance] suite via hydrophone and publish the results.
+# Kubernetes Conformance proof (SC-001): stand up a single-node kubeadm cluster
+# on the runner host using containerd-rs as the SOLE container runtime, then run
+# the official [Conformance] suite via hydrophone and publish the results.
 #
-# GATED AS MANUAL (workflow_dispatch) on purpose: this is the acceptance proof
-# and depends on the CRI runtime (tasks T015-T038) being implemented. Running it
-# before then would only burn limited CI minutes. Promote to `push` once
-# `make conformance` passes locally (see specs/001-rust-containerd/quickstart.md).
+# Manual trigger only — conformance is expensive and CI minutes are limited.
+# `smoke` runs a single Conformance test to validate the whole pipeline cheaply;
+# `full` runs the entire [Conformance] suite (hours).
 on:
   workflow_dispatch:
     inputs:
-      conformance_image:
-        description: "Conformance image tag"
-        default: "registry.k8s.io/conformance:v1.36.1"
-        required: true
+      mode:
+        description: "Conformance scope"
+        type: choice
+        options: [smoke, full]
+        default: smoke
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.31.1"
+
+permissions:
+  contents: read
+
+env:
+  K8S_VERSION: ${{ inputs.k8s_version }}
+  CRI_SOCKET: "unix:///run/containerd-rs.sock"
+  CRICTL_VERSION: "v1.31.1"
+  RUNC_VERSION: "v1.3.5"
+  CNI_PLUGINS_VERSION: "v1.5.1"
 
 jobs:
   conformance:
-    # Standard ubuntu-latest has no nested KVM; kubeadm runs directly on the
-    # host so no virtualization is required.
+    # ubuntu-latest is a real VM (host network namespace), so kubeadm + kubelet
+    # run directly on the host — no nested virtualization, no nested-netns sysctl
+    # restrictions.
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -37,25 +51,63 @@ jobs:
       - name: Build release daemon
         run: make release
 
-      - name: Bring up cluster on containerd-rs
-        run: make cluster-up
-        env:
-          CONFORMANCE_IMAGE: ${{ inputs.conformance_image }}
+      - name: Install Kubernetes, runc, crictl, CNI plugins, hydrophone
+        run: |
+          set -eux
+          cd /usr/local/bin
+          for b in kubeadm kubelet kubectl; do
+            sudo curl -fsSLo "$b" "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/$b"
+            sudo chmod +x "$b"
+          done
+          curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin
+          sudo curl -fsSLo /usr/local/bin/runc \
+            "https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.amd64"
+          sudo chmod +x /usr/local/bin/runc
+          sudo mkdir -p /opt/cni/bin
+          curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
+            | sudo tar -xz -C /opt/cni/bin
+          curl -fsSL "https://github.com/flannel-io/cni-plugin/releases/download/v1.5.1-flannel2/cni-plugin-flannel-linux-amd64-v1.5.1-flannel2.tgz" \
+            | sudo tar -xz -C /opt/cni/bin
+          sudo sh -c 'test -f /opt/cni/bin/flannel || cp /opt/cni/bin/flannel-amd64 /opt/cni/bin/flannel' || true
+          go install sigs.k8s.io/hydrophone@latest
+          sudo cp "$(go env GOPATH)/bin/hydrophone" /usr/local/bin/hydrophone
 
-      - name: Run Kubernetes Conformance
-        run: make conformance
-        env:
-          CONFORMANCE_IMAGE: ${{ inputs.conformance_image }}
+      - name: Bring up cluster on containerd-rs + run conformance
+        run: |
+          set -eux
+          # Single step: the daemon + kubelet are backgrounded by cluster-up and
+          # must stay alive for the conformance run, so do both here.
+          sudo --preserve-env=K8S_VERSION,CRI_SOCKET RUNC_SRC=/usr/local/bin/runc \
+            DAEMON_BIN="$PWD/target/release/containerd-rs" CONFIG="$PWD/ci/config.toml" \
+            bash ci/kubeadm-init.sh
+
+          sudo chmod 0644 /etc/kubernetes/admin.conf
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          CONF_IMAGE="registry.k8s.io/conformance:${K8S_VERSION}"
+          if [ "${{ inputs.mode }}" = "full" ]; then
+            CONFORMANCE_IMAGE="$CONF_IMAGE" RESULTS_DIR=conformance-results bash ci/run-conformance.sh
+          else
+            CONFORMANCE_IMAGE="$CONF_IMAGE" RESULTS_DIR=conformance-results \
+              FOCUS='Pods should be submitted and removed' bash ci/run-conformance.sh
+          fi
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          sudo tail -200 /var/log/crs.log || true
+          sudo tail -200 /var/log/kubelet.log || true
+          KUBECONFIG=/etc/kubernetes/admin.conf kubectl get pods -A -o wide || true
 
       - name: Upload conformance results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-results
+          name: conformance-results-${{ inputs.mode }}
           path: |
             conformance-results/e2e.log
             conformance-results/junit_01.xml
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Tear down
         if: always()

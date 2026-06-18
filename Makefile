@@ -3,7 +3,9 @@
 # (the rule: never let CI be the first place a failure appears).
 
 CARGO ?= cargo
-CONFORMANCE_IMAGE ?= registry.k8s.io/conformance:v1.36.1
+# Conformance image minor MUST match K8S_VERSION (the cluster kubeadm stands up).
+K8S_VERSION ?= v1.31.1
+CONFORMANCE_IMAGE ?= registry.k8s.io/conformance:$(K8S_VERSION)
 PAUSE_IMAGE ?= registry.k8s.io/pause:3.10
 CRI_SOCKET ?= unix:///run/containerd-rs.sock
 RESULTS_DIR ?= conformance-results
@@ -44,7 +46,7 @@ ci: check
 ## kubeadm/kubelet, CNI, and hydrophone. Run locally before pushing.
 
 cluster-up:
-	sudo CONFORMANCE_IMAGE=$(CONFORMANCE_IMAGE) PAUSE_IMAGE=$(PAUSE_IMAGE) \
+	sudo K8S_VERSION=$(K8S_VERSION) CONFORMANCE_IMAGE=$(CONFORMANCE_IMAGE) PAUSE_IMAGE=$(PAUSE_IMAGE) \
 		CRI_SOCKET=$(CRI_SOCKET) ./ci/kubeadm-init.sh
 
 conformance-smoke:
@@ -60,6 +62,7 @@ crictl-validate:
 
 cluster-down:
 	-sudo kubeadm reset -f
+	-sudo pkill -x kubelet || true
 	-sudo pkill -x containerd-rs || true
 
 clean:
