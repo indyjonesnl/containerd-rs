@@ -121,4 +121,4 @@ Kubernetes toolchain, brings up the cluster, and runs the suite on a real runner
 
 ## License
 
-Apache-2.0.
+MIT — see [LICENSE](LICENSE).

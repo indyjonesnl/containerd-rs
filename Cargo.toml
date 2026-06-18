@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Indy Jones <indyjonesnl@gmail.com>"]
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/indyjonesnl/containerd-rs"
 
 [workspace.dependencies]
