@@ -1135,6 +1135,9 @@ impl RuntimeService for RuntimeSvc {
                 container_id: req.container_id,
                 cmd: req.cmd,
                 tty: req.tty,
+                stdin: req.stdin,
+                stdout: req.stdout,
+                stderr: req.stderr,
             });
         Ok(Response::new(v1::ExecResponse {
             url: format!("{}/exec/{}", self.ctx.stream_base_url, token),
@@ -2563,6 +2566,9 @@ mod tests {
             container_id: cid,
             cmd: vec!["/bin/echo".into(), "WS_EXEC_MARKER".into()],
             tty: false,
+            stdin: false,
+            stdout: true,
+            stderr: true,
         });
 
         let url = format!("ws://{addr}/exec/{token}");

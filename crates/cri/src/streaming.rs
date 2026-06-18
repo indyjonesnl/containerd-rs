@@ -41,6 +41,12 @@ pub struct ExecSession {
     pub container_id: String,
     pub cmd: Vec<String>,
     pub tty: bool,
+    /// Which streams the client requested (from the CRI `ExecRequest`). The
+    /// remotecommand client opens exactly these (+ the error stream), so the SPDY
+    /// handler must collect this set — not assume stdin is always present.
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
 }
 
 /// A pending port-forward session, consumed when its URL is dialed.
@@ -272,7 +278,7 @@ async fn exec_entry(
     AxPath(token): AxPath<String>,
     req: Request,
 ) -> Response {
-    tracing::info!(method = %req.method(), upgrade = ?req.headers().get(header::UPGRADE), "exec stream request");
+    tracing::debug!(method = %req.method(), upgrade = ?req.headers().get(header::UPGRADE), "exec stream request");
     if wants_spdy(req.headers()) {
         return spdy_upgrade(req, sessions, token, Endpoint::Exec);
     }
@@ -531,6 +537,7 @@ async fn handle_portforward(socket: WebSocket, sessions: Arc<Sessions>, token: S
 async fn collect_rc_streams<W>(
     server: &mut spdy::SpdyServer<W>,
     want_stdin: bool,
+    want_stdout: bool,
     want_stderr: bool,
 ) -> (
     Option<u32>,
@@ -543,8 +550,9 @@ where
 {
     let (mut error_id, mut stdout_id, mut stderr_id, mut stdin_rx) = (None, None, None, None);
     loop {
+        // The error stream is always opened; the rest only if requested.
         let have = error_id.is_some()
-            && stdout_id.is_some()
+            && (!want_stdout || stdout_id.is_some())
             && (!want_stdin || stdin_rx.is_some())
             && (!want_stderr || stderr_id.is_some());
         if have {
@@ -579,8 +587,11 @@ where
         let _ = writer.goaway(0).await;
         return;
     };
+    // Collect exactly the streams the client requested (+ error). TTY merges
+    // stderr into stdout, so there is no stderr stream then.
+    let want_stderr = session.stderr && !session.tty;
     let (error_id, stdout_id, stderr_id, stdin_rx) =
-        collect_rc_streams(&mut server, true, !session.tty).await;
+        collect_rc_streams(&mut server, session.stdin, session.stdout, want_stderr).await;
 
     let handle = match runtime::runc::exec_streaming(
         &sessions.runc_bin,
@@ -674,7 +685,9 @@ where
         let _ = writer.goaway(0).await;
         return;
     };
-    let (error_id, stdout_id, stderr_id, _) = collect_rc_streams(&mut server, false, true).await;
+    // Attach streams the container's live stdout/stderr (no stdin).
+    let (error_id, stdout_id, stderr_id, _) =
+        collect_rc_streams(&mut server, false, true, true).await;
 
     let Some(mut rx) = sessions.subscribe_live(&session.container_id) else {
         if let Some(eid) = error_id {
@@ -786,16 +799,16 @@ mod tests {
     #[test]
     fn tokens_are_unique_and_consumed_once() {
         let s = Sessions::new(PathBuf::from("/run/x"));
-        let t1 = s.register_exec(ExecSession {
+        let mk = || ExecSession {
             container_id: "c".into(),
             cmd: vec!["echo".into()],
             tty: false,
-        });
-        let t2 = s.register_exec(ExecSession {
-            container_id: "c".into(),
-            cmd: vec!["echo".into()],
-            tty: false,
-        });
+            stdin: false,
+            stdout: true,
+            stderr: true,
+        };
+        let t1 = s.register_exec(mk());
+        let t2 = s.register_exec(mk());
         assert_ne!(t1, t2);
         assert_eq!(t1.len(), 64);
         assert_eq!(s.pending(), 2);
