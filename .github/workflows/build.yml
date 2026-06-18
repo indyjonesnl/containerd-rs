@@ -1,12 +1,12 @@
-name: ci
+name: build
 
 on:
   push:
     branches: [main]
   pull_request:
 
-# Cheap, fast gate that runs on every push/PR. Mirrors `make check` exactly so
-# local validation predicts CI (saves limited CI minutes).
+# Cheap, fast build/test gate that runs on every push/PR. Mirrors `make check`
+# exactly so local validation predicts CI (saves limited CI minutes).
 jobs:
   check:
     runs-on: ubuntu-latest

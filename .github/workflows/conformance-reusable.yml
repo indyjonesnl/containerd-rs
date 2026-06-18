@@ -1,29 +1,35 @@
-name: conformance
+name: conformance-run
 
-# Kubernetes Conformance proof (SC-001): stand up a single-node kubeadm cluster
-# on the runner host using containerd-rs as the SOLE container runtime, then run
-# the official [Conformance] suite via hydrophone and publish the results.
+# Reusable Kubernetes Conformance engine. Stands up a single-node kubeadm cluster
+# on the runner host with containerd-rs as the SOLE container runtime, then runs a
+# focused [Conformance] slice via hydrophone and publishes the results. The
+# per-sig workflows (conformance-sig-{node,storage,network}.yml) call this with
+# their own `focus`.
 #
-# Manual trigger only — conformance is expensive and CI minutes are limited.
-# `smoke` runs a single Conformance test to validate the whole pipeline cheaply;
-# `full` runs the entire [Conformance] suite (hours).
+# ubuntu-latest is a real VM (host network namespace), so kubeadm + kubelet run
+# directly on the host — no nested-netns sysctl/iptables restrictions (unlike the
+# local docker harness), which is why service/DNS/hostPort tests behave correctly.
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      mode:
-        description: "Conformance scope"
-        type: choice
-        options: [smoke, full]
-        default: smoke
+      focus:
+        description: "ginkgo --focus regex (selects which [Conformance] tests run)"
+        required: true
+        type: string
+      artifact_name:
+        description: "name for the uploaded results artifact"
+        required: true
+        type: string
       k8s_version:
         description: "Kubernetes version (cluster + conformance image)"
+        required: false
+        type: string
         default: "v1.31.1"
 
 permissions:
   contents: read
 
 env:
-  K8S_VERSION: ${{ inputs.k8s_version }}
   CRI_SOCKET: "unix:///run/containerd-rs.sock"
   CRICTL_VERSION: "v1.31.1"
   RUNC_VERSION: "v1.3.5"
@@ -31,11 +37,10 @@ env:
 
 jobs:
   conformance:
-    # ubuntu-latest is a real VM (host network namespace), so kubeadm + kubelet
-    # run directly on the host — no nested virtualization, no nested-netns sysctl
-    # restrictions.
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 240
+    env:
+      K8S_VERSION: ${{ inputs.k8s_version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,24 +78,22 @@ jobs:
           go install sigs.k8s.io/hydrophone@latest
           sudo cp "$(go env GOPATH)/bin/hydrophone" /usr/local/bin/hydrophone
 
-      - name: Bring up cluster on containerd-rs + run conformance
+      - name: Bring up cluster on containerd-rs + run focused conformance
+        env:
+          FOCUS_REGEX: ${{ inputs.focus }}
         run: |
           set -eux
-          # Single step: the daemon + kubelet are backgrounded by cluster-up and
-          # must stay alive for the conformance run, so do both here.
+          # The daemon + kubelet are backgrounded by cluster-up and must stay
+          # alive for the conformance run, so do both in one step.
           sudo --preserve-env=K8S_VERSION,CRI_SOCKET RUNC_SRC=/usr/local/bin/runc \
             DAEMON_BIN="$PWD/target/release/containerd-rs" CONFIG="$PWD/ci/config.toml" \
             bash ci/kubeadm-init.sh
 
           sudo chmod 0644 /etc/kubernetes/admin.conf
           export KUBECONFIG=/etc/kubernetes/admin.conf
-          CONF_IMAGE="registry.k8s.io/conformance:${K8S_VERSION}"
-          if [ "${{ inputs.mode }}" = "full" ]; then
-            CONFORMANCE_IMAGE="$CONF_IMAGE" RESULTS_DIR=conformance-results bash ci/run-conformance.sh
-          else
-            CONFORMANCE_IMAGE="$CONF_IMAGE" RESULTS_DIR=conformance-results \
-              FOCUS='Pods should be submitted and removed' bash ci/run-conformance.sh
-          fi
+          CONFORMANCE_IMAGE="registry.k8s.io/conformance:${K8S_VERSION}" \
+            RESULTS_DIR=conformance-results \
+            FOCUS="$FOCUS_REGEX" bash ci/run-conformance.sh
 
       - name: Collect diagnostics on failure
         if: failure()
@@ -103,7 +106,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-results-${{ inputs.mode }}
+          name: ${{ inputs.artifact_name }}
           path: |
             conformance-results/e2e.log
             conformance-results/junit_01.xml

@@ -1,5 +1,9 @@
 # containerd-rs
 
+[![conformance-sig-node](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-node.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-node.yml)
+[![conformance-sig-storage](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-storage.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-storage.yml)
+[![conformance-sig-network](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-network.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-network.yml)
+
 A Rust reimplementation of [containerd](https://containerd.io)'s kubelet-facing
 surface: a daemon that serves the **Kubernetes CRI v1** API (`RuntimeService` +
 `ImageService`) over a Unix socket and runs containers via `runc`. The goal
@@ -10,7 +14,8 @@ Status: a single-node cluster brought up with `kubeadm` runs entirely on
 containerd-rs — control plane converges, the node reaches `Ready`, the system
 pods (etcd, apiserver, controller-manager, scheduler, kube-proxy, CoreDNS) run,
 and `kubectl exec`/`attach`/`port-forward` work over SPDY. A `[Conformance]` test
-passes end-to-end; the full suite is wired up in CI (see below).
+passes end-to-end; the `[Conformance]` suite runs in CI, split into per-sig
+workflows (see below).
 
 ## Architecture at a glance
 
@@ -107,9 +112,19 @@ make conformance-smoke   # one Conformance test (fast pipeline check)
 make conformance         # full [Conformance] suite -> conformance-results/
 ```
 
-In CI, the manual workflow `.github/workflows/conformance.yml`
-(`workflow_dispatch`, `smoke` or `full`) builds the daemon, installs the
-Kubernetes toolchain, brings up the cluster, and runs the suite on a real runner.
+In CI the suite is split into three manual (`workflow_dispatch`) per-sig
+workflows, each building the daemon, installing the Kubernetes toolchain,
+bringing up the cluster on a real runner, and running its slice via hydrophone
+(they share `conformance-reusable.yml`):
+
+| Workflow | Focus | Asserts |
+|----------|-------|---------|
+| `conformance-sig-node.yml` | `[sig-node]` | runtime/CRI on the node: lifecycle, exec/attach, probes, security context, env, sysctls, ephemeral containers |
+| `conformance-sig-storage.yml` | `[sig-storage]` | volume/mount path: emptyDir, configMap/secret/projected/downwardAPI volumes, subpaths |
+| `conformance-sig-network.yml` | `[sig-network]` | pod networking, Services/ClusterIP, DNS, hostPort |
+
+They run only on demand (conformance is expensive; CI minutes are limited). The
+status badges at the top of this README reflect each workflow's latest run.
 
 ## Testing
 

@@ -1,0 +1,25 @@
+name: conformance-sig-network
+
+# Manual: run the sig-network [Conformance] slice on containerd-rs. sig-network
+# covers pod networking (CNI), Services/ClusterIP (kube-proxy), DNS (CoreDNS), and
+# hostPort (CNI portmap). These need a real host network namespace — they behave
+# correctly on the ubuntu-latest runner but not in the local nested-docker harness.
+#
+# Conformance is expensive and CI minutes are limited, so this is manual only.
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.31.1"
+
+permissions:
+  contents: read
+
+jobs:
+  sig-network:
+    uses: ./.github/workflows/conformance-reusable.yml
+    with:
+      focus: '\[sig-network\].*\[Conformance\]'
+      artifact_name: conformance-sig-network
+      k8s_version: ${{ inputs.k8s_version }}
