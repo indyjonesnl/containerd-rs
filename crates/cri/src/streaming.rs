@@ -30,10 +30,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::spdy;
 
-/// v4 stream channels.
+/// v4/v5 remotecommand channels.
+const CH_STDIN: u8 = 0;
 const CH_STDOUT: u8 = 1;
 const CH_STDERR: u8 = 2;
 const CH_ERROR: u8 = 3;
+
+/// WebSocket remotecommand subprotocols we accept, newest first. k8s 1.31
+/// clients negotiate `v5.channel.k8s.io`; v4 and the unversioned base remain for
+/// older clients/crictl. The data-channel framing is identical across them.
+const WS_PROTOCOLS: [&str; 3] = ["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"];
 
 /// A pending exec session, consumed when its URL is dialed.
 #[derive(Debug, Clone)]
@@ -278,14 +284,15 @@ async fn exec_entry(
     AxPath(token): AxPath<String>,
     req: Request,
 ) -> Response {
-    tracing::debug!(method = %req.method(), upgrade = ?req.headers().get(header::UPGRADE), "exec stream request");
+    tracing::debug!(method = %req.method(), upgrade = ?req.headers().get(header::UPGRADE),
+        ws_proto = ?req.headers().get("sec-websocket-protocol"), "exec stream request");
     if wants_spdy(req.headers()) {
         return spdy_upgrade(req, sessions, token, Endpoint::Exec);
     }
     let (mut parts, _) = req.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(ws) => ws
-            .protocols(["v4.channel.k8s.io", "channel.k8s.io"])
+            .protocols(WS_PROTOCOLS)
             .on_upgrade(move |socket| handle_exec(socket, sessions, token)),
         Err(rej) => rej.into_response(),
     }
@@ -299,13 +306,35 @@ fn frame(channel: u8, data: &[u8]) -> Vec<u8> {
     f
 }
 
-async fn handle_exec(mut socket: WebSocket, sessions: Arc<Sessions>, token: String) {
+/// Stream an exec over a WebSocket, at parity with the SPDY path. The kubelet
+/// can transparently proxy a *client* WebSocket to the runtime streaming server
+/// (so the kubelet→runtime leg is not always SPDY); the conformance test
+/// "remote command execution over websockets" lands here. We spawn
+/// `runc::exec_streaming` and multiplex on the v4/v5 channels: client stdin on
+/// channel 0 → process; process stdout/stderr → channels 1/2 as produced; the
+/// exit-code metav1.Status on channel 3 (error). Resize (4) and the v5 close
+/// channel (255) are drained.
+async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) {
+    use futures_util::{SinkExt, StreamExt};
+
+    // The base `channel.k8s.io` (v1) protocol has NO error channel — channels are
+    // stdin=0/stdout=1/stderr=2 only, and the exit is signalled by closing the
+    // connection. Only v2+ (`v4`/`v5.channel.k8s.io`) carry the channel-3
+    // metav1.Status. Sending channel 3 to a v1 client breaks it (the conformance
+    // test rejects any non-stdout frame with a payload).
+    let proto = socket
+        .protocol()
+        .and_then(|p| p.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let has_error_channel = proto != "channel.k8s.io" && !proto.is_empty();
+    let (mut sink, mut stream) = socket.split();
     let Some(session) = sessions.take_exec(&token) else {
-        let _ = socket
+        let _ = sink
             .send(Message::Binary(
                 frame(
                     CH_ERROR,
-                    b"{\"status\":\"Failure\",\"message\":\"unknown or expired exec token\"}",
+                    &spdy::status_failure("unknown or expired exec token"),
                 )
                 .into(),
             ))
@@ -313,62 +342,119 @@ async fn handle_exec(mut socket: WebSocket, sessions: Arc<Sessions>, token: Stri
         return;
     };
 
-    let runc_root = sessions.runc_root.clone();
-    let bin = sessions.runc_bin.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        runtime::runc::exec(&bin, &runc_root, &session.container_id, &session.cmd)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(output)) => {
-            if !output.stdout.is_empty() {
-                let _ = socket
-                    .send(Message::Binary(frame(CH_STDOUT, &output.stdout).into()))
-                    .await;
-            }
-            if !output.stderr.is_empty() {
-                let _ = socket
-                    .send(Message::Binary(frame(CH_STDERR, &output.stderr).into()))
-                    .await;
-            }
-            // v4 error channel carries a metav1.Status; success unless non-zero.
-            let status = match output.status.code() {
-                Some(0) => "{\"status\":\"Success\"}".to_string(),
-                code => format!(
-                    "{{\"status\":\"Failure\",\"reason\":\"NonZeroExitCode\",\"details\":{{\"causes\":[{{\"reason\":\"ExitCode\",\"message\":\"{}\"}}]}}}}",
-                    code.unwrap_or(-1)
-                ),
-            };
-            let _ = socket
-                .send(Message::Binary(frame(CH_ERROR, status.as_bytes()).into()))
-                .await;
-        }
-        Ok(Err(e)) => {
-            let _ = socket
-                .send(Message::Binary(
-                    frame(
-                        CH_ERROR,
-                        format!("{{\"status\":\"Failure\",\"message\":\"runc exec: {e}\"}}")
-                            .as_bytes(),
-                    )
-                    .into(),
-                ))
-                .await;
-        }
+    let handle = match runtime::runc::exec_streaming(
+        &sessions.runc_bin,
+        &sessions.runc_root,
+        &session.container_id,
+        &session.cmd,
+        session.tty,
+    ) {
+        Ok(h) => h,
         Err(e) => {
-            let _ = socket
+            let _ = sink
                 .send(Message::Binary(
-                    frame(
-                        CH_ERROR,
-                        format!("{{\"status\":\"Failure\",\"message\":\"{e}\"}}").as_bytes(),
-                    )
-                    .into(),
+                    frame(CH_ERROR, &spdy::status_failure(&format!("runc exec: {e}"))).into(),
                 ))
                 .await;
+            return;
         }
+    };
+    let runtime::runc::ExecHandle {
+        mut child,
+        mut stdin,
+        mut stdout,
+        stderr,
+    } = handle;
+    let sink = Arc::new(tokio::sync::Mutex::new(sink));
+
+    // client -> process: stdin frames on channel 0. Closing the WS (stream ends)
+    // drops `stdin`, closing the process's stdin (EOF). Resize/close drained.
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            let Message::Binary(data) = msg else { continue };
+            if data.is_empty() {
+                continue;
+            }
+            if data[0] == CH_STDIN && stdin.write_all(&data[1..]).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // process -> client. Await both pumps before the exit status so the final
+    // output is delivered ahead of the metav1.Status.
+    let mut pumps = Vec::new();
+    {
+        let sink = sink.clone();
+        pumps.push(tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sink
+                            .lock()
+                            .await
+                            .send(Message::Binary(frame(CH_STDOUT, &buf[..n]).into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
     }
-    let _ = socket.send(Message::Close(None)).await;
+    if let Some(mut se) = stderr {
+        let sink = sink.clone();
+        pumps.push(tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match se.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sink
+                            .lock()
+                            .await
+                            .send(Message::Binary(frame(CH_STDERR, &buf[..n]).into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+    for p in pumps {
+        let _ = p.await;
+    }
+    let mut sink = sink.lock().await;
+    if has_error_channel {
+        // v2+: exit-code metav1.Status on the error channel.
+        let _ = sink
+            .send(Message::Binary(
+                frame(CH_ERROR, &spdy::status_exit(code)).into(),
+            ))
+            .await;
+    } else if code != 0 {
+        // v1: no error channel — surface a non-zero exit on stderr (channel 2),
+        // matching the Go remotecommand v1 server. Success closes silently.
+        let _ = sink
+            .send(Message::Binary(
+                frame(
+                    CH_STDERR,
+                    format!("command terminated with exit code {code}").as_bytes(),
+                )
+                .into(),
+            ))
+            .await;
+    }
+    let _ = sink.send(Message::Close(None)).await;
 }
 
 async fn attach_entry(
@@ -382,7 +468,7 @@ async fn attach_entry(
     let (mut parts, _) = req.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(ws) => ws
-            .protocols(["v4.channel.k8s.io", "channel.k8s.io"])
+            .protocols(WS_PROTOCOLS)
             .on_upgrade(move |socket| handle_attach(socket, sessions, token)),
         Err(rej) => rej.into_response(),
     }
