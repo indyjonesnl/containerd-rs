@@ -560,7 +560,10 @@ impl RuntimeService for RuntimeSvc {
                 {
                     other.state = SandboxState::NotReady;
                     let oid = other.id.clone();
-                    let _ = self.ctx.metadata.put(Kind::Sandbox, self.ns(), &oid, &other);
+                    let _ = self
+                        .ctx
+                        .metadata
+                        .put(Kind::Sandbox, self.ns(), &oid, &other);
                 }
             }
         }
@@ -743,7 +746,10 @@ impl RuntimeService for RuntimeSvc {
         } else {
             Some((uid, rustix::process::getgid().as_raw()))
         };
-        let sec_ctx = config.linux.as_ref().and_then(|l| l.security_context.as_ref());
+        let sec_ctx = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref());
         let privileged = sec_ctx.map(|sc| sc.privileged).unwrap_or(false);
         let run_as_user = sec_ctx
             .and_then(|sc| sc.run_as_user.as_ref())

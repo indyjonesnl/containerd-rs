@@ -84,11 +84,47 @@ pub struct ContainerRequest {
 fn all_capabilities() -> std::collections::HashSet<Capability> {
     use Capability::*;
     [
-        AuditControl, AuditRead, AuditWrite, BlockSuspend, Bpf, CheckpointRestore, Chown,
-        DacOverride, DacReadSearch, Fowner, Fsetid, IpcLock, IpcOwner, Kill, Lease, LinuxImmutable,
-        MacAdmin, MacOverride, Mknod, NetAdmin, NetBindService, NetBroadcast, NetRaw, Perfmon,
-        Setfcap, Setgid, Setpcap, Setuid, SysAdmin, SysBoot, SysChroot, SysModule, SysNice,
-        SysPacct, SysPtrace, SysRawio, SysResource, SysTime, SysTtyConfig, Syslog, WakeAlarm,
+        AuditControl,
+        AuditRead,
+        AuditWrite,
+        BlockSuspend,
+        Bpf,
+        CheckpointRestore,
+        Chown,
+        DacOverride,
+        DacReadSearch,
+        Fowner,
+        Fsetid,
+        IpcLock,
+        IpcOwner,
+        Kill,
+        Lease,
+        LinuxImmutable,
+        MacAdmin,
+        MacOverride,
+        Mknod,
+        NetAdmin,
+        NetBindService,
+        NetBroadcast,
+        NetRaw,
+        Perfmon,
+        Setfcap,
+        Setgid,
+        Setpcap,
+        Setuid,
+        SysAdmin,
+        SysBoot,
+        SysChroot,
+        SysModule,
+        SysNice,
+        SysPacct,
+        SysPtrace,
+        SysRawio,
+        SysResource,
+        SysTime,
+        SysTtyConfig,
+        Syslog,
+        WakeAlarm,
     ]
     .into_iter()
     .collect()
@@ -127,7 +163,10 @@ fn apply_privileged(spec: &mut Spec) {
                     r.set_devices(Some(vec![rule]));
                     Some(r)
                 }
-                None => LinuxResourcesBuilder::default().devices(vec![rule]).build().ok(),
+                None => LinuxResourcesBuilder::default()
+                    .devices(vec![rule])
+                    .build()
+                    .ok(),
             };
             linux.set_resources(resources);
         }
@@ -359,7 +398,7 @@ mod tests {
     fn run_as_user_overrides_image_user() {
         let dir = tempfile::tempdir().unwrap();
         let i = img(); // image User is "1000:1001"
-        // No override -> image user.
+                       // No override -> image user.
         let spec = generate_spec(&i, &ContainerRequest::default(), &dir.path().join("a")).unwrap();
         assert_eq!(spec.process().as_ref().unwrap().user().uid(), 1000);
         // CRI run_as_user/group override the image user (e.g. conformance uid 65534).
