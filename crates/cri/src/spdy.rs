@@ -892,4 +892,53 @@ mod tests {
         );
         assert_eq!(parse_resize(b"garbage"), None);
     }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Golden vector: the exact bytes a real kubelet (`moby/spdystream`, the
+    /// reference client) sent to our streaming server on `kubectl exec` — the
+    /// three SYN_STREAM frames opening the error/stdout/stderr streams, captured
+    /// from the kubeadm harness. Proves our inflate + the SPDY/3 dictionary
+    /// decode the production client's compressed NV headers byte-for-byte.
+    #[test]
+    fn decodes_real_kubelet_syn_streams() {
+        let bytes = unhex(concat!(
+            "80030001000000290000000100000000000078f9e3c6a7c26260606004a7b392",
+            "a2d4c45c6851c29a0a0a6800000000ffff800300010000001900000003000000",
+            "000000c22ac5565c92925f5a02000000ffff8003000100000015000000050000",
+            "00000000c229975a5404000000ffff",
+        ));
+        let mut nv = NvCodec::new();
+        let mut off = 0;
+        let mut syn = Vec::new();
+        while let Some((frame, n)) = parse_frame(&bytes[off..], &mut nv).unwrap() {
+            if n == 0 {
+                break;
+            }
+            off += n;
+            if let Frame::SynStream {
+                stream_id, headers, ..
+            } = frame
+            {
+                let st = header(&headers, HEADER_STREAM_TYPE)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                syn.push((stream_id, st));
+            }
+        }
+        let ids: Vec<u32> = syn.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1, 3, 5], "stream ids");
+        let mut types: Vec<String> = syn.iter().map(|(_, t)| t.clone()).collect();
+        types.sort();
+        assert_eq!(
+            types,
+            vec!["error", "stderr", "stdout"],
+            "stream types: {syn:?}"
+        );
+    }
 }
