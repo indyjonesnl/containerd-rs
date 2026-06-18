@@ -36,6 +36,18 @@ pub fn run(bin: &str, runc_root: &Path, bundle_dir: &Path, id: &str) -> std::io:
         .output()
 }
 
+/// Query container state: `runc state <id>`. Exit status is success once the
+/// container exists in the runc state dir. Used to close the race between our
+/// async `runc run` and an immediately-following `exec` (e.g. a postStart hook).
+pub fn state(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {
+    Command::new(bin)
+        .arg("--root")
+        .arg(runc_root)
+        .arg("state")
+        .arg(id)
+        .output()
+}
+
 /// Execute a command inside a running container: `runc exec <id> <cmd...>`.
 /// Captures stdout/stderr/exit. Used by CRI `ExecSync` and the streaming exec.
 pub fn exec(bin: &str, runc_root: &Path, id: &str, cmd: &[String]) -> std::io::Result<Output> {

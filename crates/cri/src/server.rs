@@ -1127,6 +1127,26 @@ impl RuntimeService for RuntimeSvc {
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
 
+        // `runc run` is spawned asynchronously above, but the kubelet may issue an
+        // exec immediately (a container postStart hook is an ExecSync the instant
+        // StartContainer returns). Wait until runc has actually registered the
+        // container so that exec doesn't fail with "container does not exist".
+        let runc_root_wait = self.ctx.state_dir.join("runc");
+        let wait_id = id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for _ in 0..100 {
+                if let Ok(o) =
+                    runtime::runc::state(runtime::runc::DEFAULT_BIN, &runc_root_wait, &wait_id)
+                {
+                    if o.status.success() {
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+        .await;
+
         Ok(Response::new(v1::StartContainerResponse {}))
     }
 
