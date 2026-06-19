@@ -59,6 +59,14 @@ prepare_host() {
   # the kernel won't route 127.0.0.0/8 to a remote (pod) destination, so hostPort
   # connections fail with "No route to host" (the HostPort conformance test).
   sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+  # Disable reverse-path filtering. Service-VIP traffic from a pod is DNAT'd to a
+  # backend pod IP and masqueraded; the asymmetric path that creates trips strict/
+  # loose RPF and the reply is dropped, so a pod can't reach a pod-backed Service
+  # VIP (e.g. the CoreDNS service 10.96.0.10 -> DNS [Conformance] failures), while
+  # host-backed VIPs like the apiserver still work. cni0/veth inherit `default`, so
+  # set it before the bridge is created. kind disables RPF for the same reason.
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   # With bridge-nf-call-iptables=1, same-node pod-to-pod traffic on the CNI bridge
   # traverses the iptables FORWARD chain. On a host where Docker is installed (e.g.
   # the ubuntu-latest CI runner) the FORWARD policy defaults to DROP, so pod-to-pod
