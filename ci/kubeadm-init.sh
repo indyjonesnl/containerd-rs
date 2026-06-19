@@ -59,6 +59,13 @@ prepare_host() {
   # the kernel won't route 127.0.0.0/8 to a remote (pod) destination, so hostPort
   # connections fail with "No route to host" (the HostPort conformance test).
   sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+  # With bridge-nf-call-iptables=1, same-node pod-to-pod traffic on the CNI bridge
+  # traverses the iptables FORWARD chain. On a host where Docker is installed (e.g.
+  # the ubuntu-latest CI runner) the FORWARD policy defaults to DROP, so pod-to-pod
+  # connections silently hang — breaking lifecycle hooks that curl another pod
+  # (poststart/prestop exec hooks, PreStop-on-kill). Open the chain as kind does.
+  iptables -P FORWARD ACCEPT 2>/dev/null || true
+  ip6tables -P FORWARD ACCEPT 2>/dev/null || true
   swapoff -a 2>/dev/null || true
 
   mkdir -p /lib/modules /etc/cni/net.d /run/flannel
