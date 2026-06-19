@@ -84,6 +84,17 @@ write_kubeadm_config() {
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
   log "kubeadm config (advertise ${ip}, k8s ${K8S_VERSION})"
+  # On systemd-resolved hosts (e.g. ubuntu-latest CI runners) /etc/resolv.conf is
+  # the 127.0.0.53 stub. Pods inherit it, and CoreDNS (`forward . /etc/resolv.conf`
+  # + the `loop` plugin) detects the loopback and CrashLoopBackOffs. Point the
+  # kubelet at the real upstream so pod DNS doesn't loop. Falls back to
+  # /etc/resolv.conf on hosts without systemd-resolved (e.g. the docker harness).
+  local resolv_conf="/etc/resolv.conf"
+  if grep -qsE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53' /etc/resolv.conf \
+     && [[ -s /run/systemd/resolve/resolv.conf ]]; then
+    resolv_conf="/run/systemd/resolve/resolv.conf"
+  fi
+  log "kubelet resolvConf=${resolv_conf}"
   cat > /tmp/kubeadm.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
@@ -109,6 +120,7 @@ failSwapOn: false
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 imageGCHighThresholdPercent: 100
+resolvConf: "${resolv_conf}"
 EOF
 }
 
