@@ -9,9 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    Capability, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDeviceCgroupBuilder,
-    LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, UserBuilder,
+    Capability, LinuxCapabilitiesBuilder, LinuxDeviceCgroupBuilder, LinuxNamespaceBuilder,
+    LinuxNamespaceType, LinuxResourcesBuilder, MountBuilder, ProcessBuilder, RootBuilder, Spec,
+    UserBuilder,
 };
 
 /// A bind mount to inject into the container (from a CRI mount).
@@ -87,34 +87,6 @@ pub struct ContainerRequest {
     /// Sourced from the pod's `LinuxPodSandboxConfig.sysctls` (we run no pause
     /// container, so they are applied per-container).
     pub sysctls: std::collections::HashMap<String, String>,
-    /// CPU/memory limits + requests (from CRI `LinuxContainerResources`), applied
-    /// to the OCI `linux.resources` so runc programs the container's cgroup
-    /// (cgroup v2: `memory.max`, `cpu.max`, `cpu.weight`). Without these a
-    /// container runs unconstrained (`memory.max=max`, `cpu.max=max`).
-    pub resources: Resources,
-}
-
-/// CRI container resource limits/requests mapped to OCI `linux.resources`.
-/// `None` fields are left unset (the cgroup default).
-#[derive(Debug, Clone, Default)]
-pub struct Resources {
-    pub cpu_shares: Option<u64>,
-    pub cpu_quota: Option<i64>,
-    pub cpu_period: Option<u64>,
-    pub memory_limit: Option<i64>,
-    pub cpuset_cpus: Option<String>,
-    pub cpuset_mems: Option<String>,
-}
-
-impl Resources {
-    fn is_empty(&self) -> bool {
-        self.cpu_shares.is_none()
-            && self.cpu_quota.is_none()
-            && self.cpu_period.is_none()
-            && self.memory_limit.is_none()
-            && self.cpuset_cpus.is_none()
-            && self.cpuset_mems.is_none()
-    }
 }
 
 /// The full Linux capability set, granted to privileged containers.
@@ -304,55 +276,11 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     }
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     add_bind_mounts(&mut spec, &req.mounts);
-    apply_resources(&mut spec, &req.resources);
     if req.privileged {
         apply_privileged(&mut spec);
     }
     apply_sysctls(&mut spec, &req.sysctls);
     Ok(spec)
-}
-
-/// Map CRI resource limits/requests onto the OCI `linux.resources` so runc
-/// programs the container's cgroup (cgroup v2: `memory.max` from the memory
-/// limit, `cpu.max` from quota/period, `cpu.weight` from shares). Unset fields
-/// are left at the cgroup default.
-fn apply_resources(spec: &mut Spec, res: &Resources) {
-    if res.is_empty() {
-        return;
-    }
-    let Some(mut linux) = spec.linux().clone() else {
-        return;
-    };
-    let mut resources = linux.resources().clone().unwrap_or_default();
-
-    let mut cpu = LinuxCpuBuilder::default();
-    if let Some(s) = res.cpu_shares {
-        cpu = cpu.shares(s);
-    }
-    if let Some(q) = res.cpu_quota {
-        cpu = cpu.quota(q);
-    }
-    if let Some(p) = res.cpu_period {
-        cpu = cpu.period(p);
-    }
-    if let Some(c) = res.cpuset_cpus.clone().filter(|s| !s.is_empty()) {
-        cpu = cpu.cpus(c);
-    }
-    if let Some(m) = res.cpuset_mems.clone().filter(|s| !s.is_empty()) {
-        cpu = cpu.mems(m);
-    }
-    if let Ok(cpu) = cpu.build() {
-        resources.set_cpu(Some(cpu));
-    }
-
-    if let Some(limit) = res.memory_limit {
-        if let Ok(mem) = LinuxMemoryBuilder::default().limit(limit).build() {
-            resources.set_memory(Some(mem));
-        }
-    }
-
-    linux.set_resources(Some(resources));
-    spec.set_linux(Some(linux));
 }
 
 /// Set namespaced sysctls in the container's OCI `linux.sysctl`. runc writes
@@ -442,53 +370,6 @@ mod tests {
             working_dir: Some("/app".into()),
             user: Some("1000:1001".into()),
         }
-    }
-
-    // Regression: a pod with CPU/memory requests+limits must program the
-    // container cgroup. Without this the conformance "pod cgroup limits" test
-    // sees memory.max=max / cpu.max=max. CRI LinuxContainerResources ->
-    // OCI linux.resources (runc converts to cgroup v2 values).
-    #[test]
-    fn resources_map_to_oci_cgroup_limits() {
-        let req = ContainerRequest {
-            command: vec!["/bin/true".into()],
-            resources: Resources {
-                cpu_shares: Some(2),
-                cpu_quota: Some(2000),
-                cpu_period: Some(100_000),
-                memory_limit: Some(20_971_520),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
-        let res = spec.linux().clone().unwrap().resources().clone().unwrap();
-        let cpu = res.cpu().clone().expect("cpu resources set");
-        assert_eq!(cpu.shares(), Some(2));
-        assert_eq!(cpu.quota(), Some(2000));
-        assert_eq!(cpu.period(), Some(100_000));
-        assert_eq!(
-            res.memory().as_ref().expect("memory resources set").limit(),
-            Some(20_971_520)
-        );
-    }
-
-    #[test]
-    fn no_resources_leaves_cgroup_unset() {
-        let req = ContainerRequest {
-            command: vec!["/bin/true".into()],
-            ..Default::default()
-        };
-        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
-        let unset = spec
-            .linux()
-            .clone()
-            .unwrap()
-            .resources()
-            .clone()
-            .map(|r| r.cpu().is_none() && r.memory().is_none())
-            .unwrap_or(true);
-        assert!(unset, "no cpu/memory cgroup limits when none requested");
     }
 
     #[test]

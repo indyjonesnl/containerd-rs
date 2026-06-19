@@ -865,19 +865,6 @@ impl RuntimeService for RuntimeSvc {
                 .map(|sc| sc.supplemental_groups.iter().map(|&g| g as u32).collect())
                 .unwrap_or_default(),
             sysctls: sandbox.sysctls.clone(),
-            resources: config
-                .linux
-                .as_ref()
-                .and_then(|l| l.resources.as_ref())
-                .map(|r| runtime::bundle::Resources {
-                    cpu_shares: (r.cpu_shares > 0).then_some(r.cpu_shares as u64),
-                    cpu_quota: (r.cpu_quota != 0).then_some(r.cpu_quota),
-                    cpu_period: (r.cpu_period > 0).then_some(r.cpu_period as u64),
-                    memory_limit: (r.memory_limit_in_bytes > 0).then_some(r.memory_limit_in_bytes),
-                    cpuset_cpus: (!r.cpuset_cpus.is_empty()).then(|| r.cpuset_cpus.clone()),
-                    cpuset_mems: (!r.cpuset_mems.is_empty()).then(|| r.cpuset_mems.clone()),
-                })
-                .unwrap_or_default(),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
