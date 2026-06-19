@@ -199,11 +199,89 @@ pub fn delete(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> 
         .output()
 }
 
+/// Live-update a running container's cgroup limits: `runc update <flags> <id>`.
+/// runc applies the new limits to the existing cgroup in place (cgroup v2:
+/// `memory.max`, `cpu.max`, `cpu.weight`), which is how CRI `UpdateContainerResources`
+/// (in-place pod resize) takes effect without a restart.
+pub fn update(
+    bin: &str,
+    runc_root: &Path,
+    id: &str,
+    res: &crate::bundle::Resources,
+) -> std::io::Result<Output> {
+    Command::new(bin)
+        .arg("--root")
+        .arg(runc_root)
+        .arg("update")
+        .args(update_args(res))
+        .arg(id)
+        .output()
+}
+
+/// Build the `runc update` flags from CRI resources. Only set fields are passed
+/// so unspecified limits keep their current value.
+fn update_args(res: &crate::bundle::Resources) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(m) = res.memory_limit {
+        args.push("--memory".into());
+        args.push(m.to_string());
+    }
+    if let Some(q) = res.cpu_quota {
+        args.push("--cpu-quota".into());
+        args.push(q.to_string());
+    }
+    if let Some(p) = res.cpu_period {
+        args.push("--cpu-period".into());
+        args.push(p.to_string());
+    }
+    if let Some(s) = res.cpu_shares {
+        args.push("--cpu-share".into());
+        args.push(s.to_string());
+    }
+    if let Some(c) = res.cpuset_cpus.as_deref().filter(|s| !s.is_empty()) {
+        args.push("--cpuset-cpus".into());
+        args.push(c.to_string());
+    }
+    if let Some(m) = res.cpuset_mems.as_deref().filter(|s| !s.is_empty()) {
+        args.push("--cpuset-mems".into());
+        args.push(m.to_string());
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::{generate_spec, write_bundle, ContainerRequest, ImageConfig};
+    use crate::bundle::{generate_spec, write_bundle, ContainerRequest, ImageConfig, Resources};
     use std::os::unix::fs::PermissionsExt;
+
+    // Regression for in-place resize (UpdateContainerResources): the requested
+    // CPU/memory map to the right `runc update` flags; unset fields are omitted.
+    #[test]
+    fn update_args_maps_set_fields_only() {
+        let args = update_args(&Resources {
+            cpu_quota: Some(2000),
+            cpu_period: Some(100_000),
+            cpu_shares: Some(204),
+            memory_limit: Some(33_554_432),
+            ..Default::default()
+        });
+        assert_eq!(
+            args,
+            vec![
+                "--memory",
+                "33554432",
+                "--cpu-quota",
+                "2000",
+                "--cpu-period",
+                "100000",
+                "--cpu-share",
+                "204",
+            ]
+        );
+        // Nothing requested -> no flags (runc keeps current limits).
+        assert!(update_args(&Resources::default()).is_empty());
+    }
 
     // Runs a REAL rootless container via runc. Requires runc + unprivileged user
     // namespaces (both present on this host). Self-contained: builds a rootfs

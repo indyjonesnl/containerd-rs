@@ -22,6 +22,11 @@ set -euo pipefail
 
 K8S_VERSION="${K8S_VERSION:-v1.35.6}"
 CRI_SOCKET="${CRI_SOCKET:-unix:///run/containerd-rs.sock}"
+# Per-QoS pod cgroups (needed for CPU/memory limits + InPlace-Resize). Requires a
+# real, delegated cgroup-v2 hierarchy: a host-netns node (CI runner) can create
+# /kubepods, but the nested docker harness cannot ("cannot enter cgroupv2
+# /sys/fs/cgroup/kubepods ... invalid state"), so default off and let CI opt in.
+CGROUPS_PER_QOS="${CGROUPS_PER_QOS:-false}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 NODE_NAME="${NODE_NAME:-crs-node}"
 DAEMON_BIN="${DAEMON_BIN:-./target/release/containerd-rs}"
@@ -117,7 +122,7 @@ apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 cgroupDriver: cgroupfs
 failSwapOn: false
-cgroupsPerQOS: false
+cgroupsPerQOS: ${CGROUPS_PER_QOS}
 enforceNodeAllocatable: []
 imageGCHighThresholdPercent: 100
 resolvConf: "${resolv_conf}"
@@ -139,7 +144,7 @@ kubeadm_up() {
           --kubeconfig=/etc/kubernetes/kubelet.conf \
           --config=/var/lib/kubelet/config.yaml \
           --hostname-override="${NODE_NAME}" \
-          --cgroups-per-qos=false --enforce-node-allocatable="" \
+          --cgroups-per-qos=${CGROUPS_PER_QOS} --enforce-node-allocatable="" \
           ${KUBELET_KUBEADM_ARGS:-} >/var/log/kubelet.log 2>&1 &
   echo $! > /run/kubelet.pid
   sleep 3

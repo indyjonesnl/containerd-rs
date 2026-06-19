@@ -92,6 +92,13 @@ pub struct ContainerRequest {
     /// (cgroup v2: `memory.max`, `cpu.max`, `cpu.weight`). Without these a
     /// container runs unconstrained (`memory.max=max`, `cpu.max=max`).
     pub resources: Resources,
+    /// OCI `linux.cgroupsPath` — the kubelet-delegated cgroup the container lives
+    /// under (derived from the sandbox's `cgroup_parent`). `Some` only when the
+    /// kubelet provides a cgroup parent; resources are applied ONLY when this is
+    /// set, so runc never enables controllers on the root cgroup (which fails
+    /// cgroup-v2's "no internal processes" rule). Mirrors containerd's
+    /// `getCgroupsPath` + "set cgroup only if cgroup_parent != \"\"".
+    pub cgroup_path: Option<String>,
 }
 
 /// CRI container resource limits/requests mapped to OCI `linux.resources`.
@@ -304,7 +311,17 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     }
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     add_bind_mounts(&mut spec, &req.mounts);
-    apply_resources(&mut spec, &req.resources);
+    // Resource limits require a delegated cgroup (cgroupsPath under the kubelet's
+    // cgroup_parent); applying them with runc's default root-level path fails
+    // cgroup-v2's "no internal processes" rule. So set cgroupsPath and apply
+    // resources together, only when the kubelet gave us a cgroup parent.
+    if let Some(cgroup_path) = req.cgroup_path.as_deref().filter(|p| !p.is_empty()) {
+        if let Some(mut linux) = spec.linux().clone() {
+            linux.set_cgroups_path(Some(PathBuf::from(cgroup_path)));
+            spec.set_linux(Some(linux));
+        }
+        apply_resources(&mut spec, &req.resources);
+    }
     if req.privileged {
         apply_privileged(&mut spec);
     }
@@ -459,10 +476,17 @@ mod tests {
                 memory_limit: Some(20_971_520),
                 ..Default::default()
             },
+            // Resources are applied only when a delegated cgroup path is present.
+            cgroup_path: Some("/kubepods/pod123/abc".into()),
             ..Default::default()
         };
         let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
-        let res = spec.linux().clone().unwrap().resources().clone().unwrap();
+        let linux = spec.linux().clone().unwrap();
+        assert_eq!(
+            linux.cgroups_path().as_ref().map(|p| p.to_string_lossy()),
+            Some("/kubepods/pod123/abc".into())
+        );
+        let res = linux.resources().clone().unwrap();
         let cpu = res.cpu().clone().expect("cpu resources set");
         assert_eq!(cpu.shares(), Some(2));
         assert_eq!(cpu.quota(), Some(2000));
@@ -473,10 +497,42 @@ mod tests {
         );
     }
 
+    // Safety gate (regression for the bring-up break): with resources requested
+    // but NO cgroup_path, we must NOT apply them — otherwise runc enables
+    // controllers on the root cgroup and fails ("no internal processes").
+    #[test]
+    fn resources_skipped_without_cgroup_path() {
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            resources: Resources {
+                memory_limit: Some(20_971_520),
+                ..Default::default()
+            },
+            cgroup_path: None,
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
+        let linux = spec.linux().clone().unwrap();
+        assert!(
+            linux.cgroups_path().is_none(),
+            "no cgroupsPath without parent"
+        );
+        let no_limits = linux
+            .resources()
+            .clone()
+            .map(|r| r.cpu().is_none() && r.memory().is_none())
+            .unwrap_or(true);
+        assert!(
+            no_limits,
+            "resources must NOT be applied without a cgroup_path"
+        );
+    }
+
     #[test]
     fn no_resources_leaves_cgroup_unset() {
         let req = ContainerRequest {
             command: vec!["/bin/true".into()],
+            cgroup_path: Some("/kubepods/pod123/abc".into()),
             ..Default::default()
         };
         let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
