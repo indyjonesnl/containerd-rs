@@ -200,9 +200,20 @@ impl Cni {
         }
         let out = child.wait_with_output()?;
         if !out.status.success() {
+            // Per the CNI spec a failing plugin prints its error as JSON on
+            // STDOUT (`{"code":..,"msg":..,"details":..}`); stderr is usually
+            // empty. Surface both (and the exit code) or the failure is opaque.
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let msg = format!(
+                "exit={} stdout={} stderr={}",
+                out.status.code().unwrap_or(-1),
+                stdout.trim(),
+                stderr.trim()
+            );
             return Err(Error::Plugin {
                 plugin: plugin_type,
-                msg: String::from_utf8_lossy(&out.stderr).into_owned(),
+                msg,
             });
         }
         // DEL produces no result; ADD does. Empty stdout -> null.
