@@ -14,13 +14,13 @@
 #   DAEMON_BIN   containerd-rs binary (default ./target/release/containerd-rs)
 #   CONFIG       daemon config.toml (default ./ci/config.toml)
 #   CRI_SOCKET   CRI endpoint (default unix:///run/containerd-rs.sock)
-#   K8S_VERSION  kubernetes version (default v1.31.1)
+#   K8S_VERSION  kubernetes version (default v1.35.6)
 #   POD_CIDR     pod network CIDR (default 10.244.0.0/16)
 #   NODE_NAME    node name (default crs-node)
 #   RUNC_SRC     if set, copy this runc binary to /usr/local/bin/runc (Docker harness)
 set -euo pipefail
 
-K8S_VERSION="${K8S_VERSION:-v1.31.1}"
+K8S_VERSION="${K8S_VERSION:-v1.35.6}"
 CRI_SOCKET="${CRI_SOCKET:-unix:///run/containerd-rs.sock}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 NODE_NAME="${NODE_NAME:-crs-node}"
@@ -85,7 +85,7 @@ write_kubeadm_config() {
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
   log "kubeadm config (advertise ${ip}, k8s ${K8S_VERSION})"
   cat > /tmp/kubeadm.yaml <<EOF
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint:
   advertiseAddress: "${ip}"
@@ -93,9 +93,10 @@ nodeRegistration:
   criSocket: "${CRI_SOCKET}"
   name: ${NODE_NAME}
   kubeletExtraArgs:
-    fail-swap-on: "false"
+    - name: fail-swap-on
+      value: "false"
 ---
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 kubernetesVersion: ${K8S_VERSION}
 networking:

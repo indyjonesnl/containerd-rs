@@ -4,7 +4,7 @@
 # results into RESULTS_DIR. A pass = zero failed conformance tests (SC-001).
 set -euo pipefail
 
-CONFORMANCE_IMAGE="${CONFORMANCE_IMAGE:-registry.k8s.io/conformance:v1.36.1}"
+CONFORMANCE_IMAGE="${CONFORMANCE_IMAGE:-registry.k8s.io/conformance:v1.35.6}"
 RESULTS_DIR="${RESULTS_DIR:-conformance-results}"
 FOCUS="${FOCUS:-}"
 KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/config}"
