@@ -249,9 +249,6 @@ fn inject_port_mappings(
     plugin: &serde_json::Value,
     port_mappings: &[PortMapping],
 ) {
-    if port_mappings.is_empty() {
-        return;
-    }
     let capable = plugin
         .get("capabilities")
         .and_then(|c| c.get("portMappings"))
@@ -260,11 +257,14 @@ fn inject_port_mappings(
     if !capable {
         return;
     }
-    let Some(obj) = netconf.as_object_mut() else {
-        return;
-    };
+    // Only real hostPorts go to portmap. The kubelet also lists containerPort-only
+    // entries (hostPort=0, e.g. CoreDNS's 53/9153) in PodSandboxConfig.port_mappings;
+    // portmap rejects hostPort 0 ("Invalid host port number: 0"), which would fail
+    // CNI ADD for the whole pod. Filtering to host_port > 0 leaves an empty list for
+    // such pods, so we add no runtimeConfig at all and portmap is a pass-through.
     let mappings: Vec<serde_json::Value> = port_mappings
         .iter()
+        .filter(|p| p.host_port > 0)
         .map(|p| {
             serde_json::json!({
                 "hostPort": p.host_port,
@@ -274,6 +274,12 @@ fn inject_port_mappings(
             })
         })
         .collect();
+    if mappings.is_empty() {
+        return;
+    }
+    let Some(obj) = netconf.as_object_mut() else {
+        return;
+    };
     let rc = obj
         .entry("runtimeConfig")
         .or_insert_with(|| serde_json::json!({}));
@@ -339,6 +345,47 @@ mod tests {
         let r = serde_json::json!({"ips":[{"address":"10.244.1.7/24","gateway":"10.244.1.1"}]});
         assert_eq!(extract_ip(&r).unwrap(), "10.244.1.7");
         assert!(extract_ip(&serde_json::json!({})).is_err());
+    }
+
+    fn pm(host_port: i32, container_port: i32, proto: &str) -> PortMapping {
+        PortMapping {
+            host_port,
+            container_port,
+            protocol: proto.into(),
+            host_ip: String::new(),
+        }
+    }
+
+    // Regression: the kubelet puts a pod's containerPort-only entries (which have
+    // hostPort=0, e.g. CoreDNS's 53/9153) into PodSandboxConfig.port_mappings. The
+    // CNI portmap plugin rejects hostPort 0 ("failed to parse config: Invalid host
+    // port number: 0", code 999), which made CNI ADD fail -> host-network fallback
+    // -> CoreDNS CrashLoop. Only real (non-zero) hostPorts may reach portmap.
+    #[test]
+    fn inject_port_mappings_skips_zero_host_port() {
+        let plugin = serde_json::json!({"type":"portmap","capabilities":{"portMappings":true}});
+        let mut nc = plugin.clone();
+        inject_port_mappings(&mut nc, &plugin, &[pm(0, 53, "udp"), pm(8080, 80, "tcp")]);
+        let mapped = nc["runtimeConfig"]["portMappings"]
+            .as_array()
+            .expect("portMappings present");
+        assert_eq!(mapped.len(), 1, "the hostPort=0 entry must be filtered out");
+        assert_eq!(mapped[0]["hostPort"], 8080);
+        assert_eq!(mapped[0]["containerPort"], 80);
+    }
+
+    // CoreDNS-shaped pod: only containerPorts (all hostPort=0). portmap must get
+    // NO portMappings at all (an empty list would still be a no-op, but we omit
+    // runtimeConfig entirely so portmap is a pure pass-through).
+    #[test]
+    fn inject_port_mappings_all_zero_adds_nothing() {
+        let plugin = serde_json::json!({"type":"portmap","capabilities":{"portMappings":true}});
+        let mut nc = plugin.clone();
+        inject_port_mappings(&mut nc, &plugin, &[pm(0, 53, "udp"), pm(0, 9153, "tcp")]);
+        assert!(
+            nc.get("runtimeConfig").is_none(),
+            "no runtimeConfig.portMappings when there are no real hostPorts"
+        );
     }
 
     fn tempdir() -> PathBuf {
