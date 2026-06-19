@@ -11,7 +11,7 @@ on:
     inputs:
       k8s_version:
         description: "Kubernetes version (cluster + conformance image)"
-        default: "v1.31.1"
+        default: "v1.35.6"
 
 permissions:
   contents: read

@@ -4,7 +4,7 @@
 
 CARGO ?= cargo
 # Conformance image minor MUST match K8S_VERSION (the cluster kubeadm stands up).
-K8S_VERSION ?= v1.31.1
+K8S_VERSION ?= v1.35.6
 CONFORMANCE_IMAGE ?= registry.k8s.io/conformance:$(K8S_VERSION)
 PAUSE_IMAGE ?= registry.k8s.io/pause:3.10
 CRI_SOCKET ?= unix:///run/containerd-rs.sock

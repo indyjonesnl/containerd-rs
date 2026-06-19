@@ -24,14 +24,14 @@ on:
         description: "Kubernetes version (cluster + conformance image)"
         required: false
         type: string
-        default: "v1.31.1"
+        default: "v1.35.6"
 
 permissions:
   contents: read
 
 env:
   CRI_SOCKET: "unix:///run/containerd-rs.sock"
-  CRICTL_VERSION: "v1.31.1"
+  CRICTL_VERSION: "v1.35.0"
   RUNC_VERSION: "v1.3.5"
   CNI_PLUGINS_VERSION: "v1.5.1"
 
