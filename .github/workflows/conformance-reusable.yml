@@ -100,7 +100,20 @@ jobs:
         run: |
           sudo tail -200 /var/log/crs.log || true
           sudo tail -200 /var/log/kubelet.log || true
-          KUBECONFIG=/etc/kubernetes/admin.conf kubectl get pods -A -o wide || true
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          kubectl get pods -A -o wide || true
+          # Dump logs + describe for any pod not Running (e.g. a crashlooping
+          # CoreDNS) so the failure reason is visible without a re-run.
+          for p in $(kubectl get pods -A --no-headers 2>/dev/null | awk '$4!="Running"{print $1"/"$2}'); do
+            ns="${p%/*}"; name="${p#*/}"
+            echo "::group::logs ${p}"
+            kubectl logs -n "$ns" "$name" --previous --tail=50 2>/dev/null \
+              || kubectl logs -n "$ns" "$name" --tail=50 2>/dev/null || true
+            echo "::endgroup::"
+            echo "::group::describe ${p}"
+            kubectl describe pod -n "$ns" "$name" 2>/dev/null | tail -40 || true
+            echo "::endgroup::"
+          done
 
       - name: Upload conformance results
         if: always()
