@@ -608,6 +608,7 @@ impl RuntimeService for RuntimeSvc {
                 .map(|l| l.sysctls.clone())
                 .unwrap_or_default(),
             cgroup_parent,
+            hostname: config.hostname.clone(),
         };
         // Demote any prior sandbox for the same pod (namespace/name/uid) to
         // NotReady. `gen_id` salts with a timestamp, so each call mints a fresh
@@ -838,7 +839,10 @@ impl RuntimeService for RuntimeSvc {
                 })
                 .collect(),
             working_dir: (!config.working_dir.is_empty()).then(|| config.working_dir.clone()),
-            hostname: None,
+            // Apply the pod's hostname in the container's (private) UTS namespace.
+            // Host-network pods share the host UTS ns, so leave it to the node's.
+            hostname: (!sandbox.host_network && !sandbox.hostname.is_empty())
+                .then(|| sandbox.hostname.clone()),
             terminal: config.tty,
             readonly_rootfs: sec_ctx.map(|sc| sc.readonly_rootfs).unwrap_or(false),
             rootless_host_ids: host_ids,
@@ -2147,6 +2151,7 @@ mod tests {
                         resolv_conf_path: None,
                         sysctls: Default::default(),
                         cgroup_parent: String::new(),
+                        hostname: String::new(),
                     },
                 )
                 .unwrap();

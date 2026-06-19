@@ -86,6 +86,13 @@ pub struct SandboxRecord {
     /// root, which fails cgroup-v2's "no internal processes" rule).
     #[serde(default)]
     pub cgroup_parent: String,
+    /// CRI `PodSandboxConfig.hostname` — the pod's hostname (the kubelet sets it
+    /// to the pod name by default). We run no pause container, so it is applied
+    /// to each container's OCI `hostname` (in its private UTS namespace) so the
+    /// pod reports its own name rather than the node's (e.g. agnhost `/hostname`,
+    /// which sig-network's pod-connectivity conformance tests assert against).
+    #[serde(default)]
+    pub hostname: String,
 }
 
 /// Persisted container record.
