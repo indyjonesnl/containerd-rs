@@ -1,0 +1,25 @@
+name: conformance-sig-storage
+
+# Manual: run the sig-storage [Conformance] slice on containerd-rs. sig-storage
+# exercises the runtime's volume/mount path heavily — emptyDir, configMap/secret/
+# projected/downwardAPI volumes, subpaths, hostPath — i.e. the CRI mount + bundle
+# code.
+#
+# Conformance is expensive and CI minutes are limited, so this is manual only.
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.31.1"
+
+permissions:
+  contents: read
+
+jobs:
+  sig-storage:
+    uses: ./.github/workflows/conformance-reusable.yml
+    with:
+      focus: '\[sig-storage\].*\[Conformance\]'
+      artifact_name: conformance-sig-storage
+      k8s_version: ${{ inputs.k8s_version }}

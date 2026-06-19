@@ -1,0 +1,25 @@
+name: conformance-sig-node
+
+# Manual: run the sig-node [Conformance] slice on containerd-rs. sig-node is the
+# heaviest assertion of the container runtime/CRI on the node — pod lifecycle,
+# exec/attach (SPDY + WebSocket), probes, security context, env, sysctls,
+# termination messages, ephemeral containers.
+#
+# Conformance is expensive and CI minutes are limited, so this is manual only.
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.31.1"
+
+permissions:
+  contents: read
+
+jobs:
+  sig-node:
+    uses: ./.github/workflows/conformance-reusable.yml
+    with:
+      focus: '\[sig-node\].*\[Conformance\]'
+      artifact_name: conformance-sig-node
+      k8s_version: ${{ inputs.k8s_version }}

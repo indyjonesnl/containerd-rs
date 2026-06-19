@@ -1,0 +1,18 @@
+[package]
+name = "snapshots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tar.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

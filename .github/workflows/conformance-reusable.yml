@@ -1,0 +1,117 @@
+name: conformance-run
+
+# Reusable Kubernetes Conformance engine. Stands up a single-node kubeadm cluster
+# on the runner host with containerd-rs as the SOLE container runtime, then runs a
+# focused [Conformance] slice via hydrophone and publishes the results. The
+# per-sig workflows (conformance-sig-{node,storage,network}.yml) call this with
+# their own `focus`.
+#
+# ubuntu-latest is a real VM (host network namespace), so kubeadm + kubelet run
+# directly on the host — no nested-netns sysctl/iptables restrictions (unlike the
+# local docker harness), which is why service/DNS/hostPort tests behave correctly.
+on:
+  workflow_call:
+    inputs:
+      focus:
+        description: "ginkgo --focus regex (selects which [Conformance] tests run)"
+        required: true
+        type: string
+      artifact_name:
+        description: "name for the uploaded results artifact"
+        required: true
+        type: string
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        required: false
+        type: string
+        default: "v1.31.1"
+
+permissions:
+  contents: read
+
+env:
+  CRI_SOCKET: "unix:///run/containerd-rs.sock"
+  CRICTL_VERSION: "v1.31.1"
+  RUNC_VERSION: "v1.3.5"
+  CNI_PLUGINS_VERSION: "v1.5.1"
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      K8S_VERSION: ${{ inputs.k8s_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release daemon
+        run: make release
+
+      - name: Install Kubernetes, runc, crictl, CNI plugins, hydrophone
+        run: |
+          set -eux
+          cd /usr/local/bin
+          for b in kubeadm kubelet kubectl; do
+            sudo curl -fsSLo "$b" "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/$b"
+            sudo chmod +x "$b"
+          done
+          curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin
+          sudo curl -fsSLo /usr/local/bin/runc \
+            "https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.amd64"
+          sudo chmod +x /usr/local/bin/runc
+          sudo mkdir -p /opt/cni/bin
+          curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
+            | sudo tar -xz -C /opt/cni/bin
+          curl -fsSL "https://github.com/flannel-io/cni-plugin/releases/download/v1.5.1-flannel2/cni-plugin-flannel-linux-amd64-v1.5.1-flannel2.tgz" \
+            | sudo tar -xz -C /opt/cni/bin
+          sudo sh -c 'test -f /opt/cni/bin/flannel || cp /opt/cni/bin/flannel-amd64 /opt/cni/bin/flannel' || true
+          go install sigs.k8s.io/hydrophone@latest
+          sudo cp "$(go env GOPATH)/bin/hydrophone" /usr/local/bin/hydrophone
+
+      - name: Bring up cluster on containerd-rs + run focused conformance
+        env:
+          FOCUS_REGEX: ${{ inputs.focus }}
+        run: |
+          set -eux
+          # The daemon + kubelet are backgrounded by cluster-up and must stay
+          # alive for the conformance run, so do both in one step.
+          sudo --preserve-env=K8S_VERSION,CRI_SOCKET RUNC_SRC=/usr/local/bin/runc \
+            DAEMON_BIN="$PWD/target/release/containerd-rs" CONFIG="$PWD/ci/config.toml" \
+            bash ci/kubeadm-init.sh
+
+          sudo chmod 0644 /etc/kubernetes/admin.conf
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          CONFORMANCE_IMAGE="registry.k8s.io/conformance:${K8S_VERSION}" \
+            RESULTS_DIR=conformance-results \
+            FOCUS="$FOCUS_REGEX" bash ci/run-conformance.sh
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          sudo tail -200 /var/log/crs.log || true
+          sudo tail -200 /var/log/kubelet.log || true
+          KUBECONFIG=/etc/kubernetes/admin.conf kubectl get pods -A -o wide || true
+
+      - name: Upload conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: |
+            conformance-results/e2e.log
+            conformance-results/junit_01.xml
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: make cluster-down

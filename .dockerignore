@@ -1,0 +1,10 @@
+# Keep the Docker build context small. The release image only needs dist/<arch>/.
+target/
+.git/
+.github/
+specs/
+.specify/
+.claude/
+docs/
+tests/
+*.md

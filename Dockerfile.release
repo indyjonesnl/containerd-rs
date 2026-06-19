@@ -1,0 +1,19 @@
+# Release image: copies the prebuilt static containerd-rs binary staged under
+# dist/<arch>/. Built per-arch by `docker buildx` (TARGETARCH is set
+# automatically) in the release workflow — no cargo build here; the binary is the
+# musl build produced by that workflow.
+#
+# A CRI runtime is normally a host binary; this image is for kind-style node
+# images / CI. It carries the runtime deps the daemon shells out to: runc (the
+# OCI runtime), iproute2 + iptables (CNI / pod networking), and ca-certificates
+# (registry pulls over TLS).
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables runc \
+    && rm -rf /var/lib/apt/lists/*
+# --chmod=0755: actions/upload-artifact strips the execute bit (the binary
+# arrives here 0644 after the artifact round-trip), and plain COPY preserves
+# source mode, so set it explicitly.
+COPY --chmod=0755 dist/${TARGETARCH}/containerd-rs /usr/local/bin/containerd-rs
+ENTRYPOINT ["/usr/local/bin/containerd-rs"]

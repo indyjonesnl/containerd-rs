@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-types",
+    "crates/content",
+    "crates/metadata",
+    "crates/snapshots",
+    "crates/images",
+    "crates/cri",
+    "crates/runtime",
+    "crates/sandbox",
+    "crates/containerd-rs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Indy Jones <indyjonesnl@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/indyjonesnl/containerd-rs"
+
+[workspace.dependencies]
+# async + logging
+tokio = { version = "1.52", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1.44"
+# gRPC (CRI v1)
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+futures-core = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# errors
+thiserror = "2"
+anyhow = "1"
+# serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+# crypto / encoding
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.22"
+# OCI registry client (ex oci-distribution)
+oci-client = "0.17"
+# OCI runtime + image spec types
+oci-spec = "0.8"
+# storage
+redb = "2"
+# layer / compression / fs
+tar = "0.4"
+# `zlib` C backend enables Compress/Decompress::set_dictionary (SPDY/3.1 NV header dict).
+flate2 = { version = "1.1", features = ["zlib"] }
+zstd = "0.13"
+# SPDY/3.1 streaming transport (CRI exec/attach/port-forward over the kubelet's SPDY client)
+bytes = "1"
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustix = { version = "1", features = ["fs", "mount", "net", "process"] }
+# internal crates
+core-types = { path = "crates/core-types" }
+content = { path = "crates/content" }
+metadata = { path = "crates/metadata" }
+snapshots = { path = "crates/snapshots" }
+images = { path = "crates/images" }
+cri = { path = "crates/cri" }
+runtime = { path = "crates/runtime" }
+sandbox = { path = "crates/sandbox" }
+
+[profile.release]
+lto = "thin"
