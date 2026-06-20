@@ -32,7 +32,7 @@ permissions:
 env:
   CRI_SOCKET: "unix:///run/containerd-rs.sock"
   CRICTL_VERSION: "v1.35.0"
-  RUNC_VERSION: "v1.3.5"
+  CRUN_VERSION: "1.28"
   CNI_PLUGINS_VERSION: "v1.5.1"
 
 jobs:
@@ -56,7 +56,7 @@ jobs:
       - name: Build release daemon
         run: make release
 
-      - name: Install Kubernetes, runc, crictl, CNI plugins, hydrophone
+      - name: Install Kubernetes, crun, crictl, CNI plugins, hydrophone
         run: |
           set -eux
           cd /usr/local/bin
@@ -66,9 +66,13 @@ jobs:
           done
           curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin
-          sudo curl -fsSLo /usr/local/bin/runc \
-            "https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.amd64"
-          sudo chmod +x /usr/local/bin/runc
+          # crun is a drop-in OCI runtime (CLI-compatible with runc) but faster
+          # and lighter. The daemon execs "runc" from PATH, so install crun under
+          # both names: keep crun's real name for clarity and expose it as runc.
+          sudo curl -fsSLo /usr/local/bin/crun \
+            "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64"
+          sudo chmod +x /usr/local/bin/crun
+          sudo ln -sf /usr/local/bin/crun /usr/local/bin/runc
           sudo mkdir -p /opt/cni/bin
           curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
             | sudo tar -xz -C /opt/cni/bin
