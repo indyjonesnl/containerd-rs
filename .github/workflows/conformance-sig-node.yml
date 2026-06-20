@@ -12,6 +12,9 @@ on:
       k8s_version:
         description: "Kubernetes version (cluster + conformance image)"
         default: "v1.35.6"
+      focus:
+        description: "ginkgo --focus regex (narrow to a subset for a cheap validation run)"
+        default: '\[sig-node\].*\[Conformance\]'
 
 permissions:
   contents: read
@@ -20,6 +23,6 @@ jobs:
   sig-node:
     uses: ./.github/workflows/conformance-reusable.yml
     with:
-      focus: '\[sig-node\].*\[Conformance\]'
+      focus: ${{ inputs.focus }}
       artifact_name: conformance-sig-node
       k8s_version: ${{ inputs.k8s_version }}

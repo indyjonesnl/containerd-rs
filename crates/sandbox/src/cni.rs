@@ -119,13 +119,30 @@ impl Cni {
         self.netns_dir.join(netns)
     }
 
-    /// Create a named network namespace (`ip netns add`).
+    /// Create a named network namespace (`ip netns add`) and bring its loopback
+    /// interface up.
+    ///
+    /// A fresh netns starts with `lo` DOWN. The kubelet/CNI never touch it, so
+    /// without this every pod's `127.0.0.1` (and its own pod IP, which the kernel
+    /// routes via `lo`) is unreachable — breaking any pod that talks to itself
+    /// (the "intra-pod communication" / hairpin conformance tests, sidecars on
+    /// localhost, health checks via 127.0.0.1). Upstream containerd's CNI library
+    /// brings `lo` up as part of namespace setup; mirror that here.
     pub fn create_netns(&self, netns: &str) -> Result<PathBuf> {
         let out = Command::new("ip").args(["netns", "add", netns]).output()?;
         if !out.status.success() {
             return Err(Error::Netns(
                 String::from_utf8_lossy(&out.stderr).into_owned(),
             ));
+        }
+        let lo = Command::new("ip")
+            .args(["-n", netns, "link", "set", "lo", "up"])
+            .output()?;
+        if !lo.status.success() {
+            return Err(Error::Netns(format!(
+                "bring up lo in netns {netns}: {}",
+                String::from_utf8_lossy(&lo.stderr).trim()
+            )));
         }
         Ok(self.netns_path(netns))
     }

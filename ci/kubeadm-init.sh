@@ -22,6 +22,11 @@ set -euo pipefail
 
 K8S_VERSION="${K8S_VERSION:-v1.35.6}"
 CRI_SOCKET="${CRI_SOCKET:-unix:///run/containerd-rs.sock}"
+# Per-QoS pod cgroups (needed for CPU/memory limits + InPlace-Resize). Requires a
+# real, delegated cgroup-v2 hierarchy: a host-netns node (CI runner) can create
+# /kubepods, but the nested docker harness cannot ("cannot enter cgroupv2
+# /sys/fs/cgroup/kubepods ... invalid state"), so default off and let CI opt in.
+CGROUPS_PER_QOS="${CGROUPS_PER_QOS:-false}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 NODE_NAME="${NODE_NAME:-crs-node}"
 DAEMON_BIN="${DAEMON_BIN:-./target/release/containerd-rs}"
@@ -54,6 +59,21 @@ prepare_host() {
   # the kernel won't route 127.0.0.0/8 to a remote (pod) destination, so hostPort
   # connections fail with "No route to host" (the HostPort conformance test).
   sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+  # Disable reverse-path filtering. Service-VIP traffic from a pod is DNAT'd to a
+  # backend pod IP and masqueraded; the asymmetric path that creates trips strict/
+  # loose RPF and the reply is dropped, so a pod can't reach a pod-backed Service
+  # VIP (e.g. the CoreDNS service 10.96.0.10 -> DNS [Conformance] failures), while
+  # host-backed VIPs like the apiserver still work. cni0/veth inherit `default`, so
+  # set it before the bridge is created. kind disables RPF for the same reason.
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  # With bridge-nf-call-iptables=1, same-node pod-to-pod traffic on the CNI bridge
+  # traverses the iptables FORWARD chain. On a host where Docker is installed (e.g.
+  # the ubuntu-latest CI runner) the FORWARD policy defaults to DROP, so pod-to-pod
+  # connections silently hang — breaking lifecycle hooks that curl another pod
+  # (poststart/prestop exec hooks, PreStop-on-kill). Open the chain as kind does.
+  iptables -P FORWARD ACCEPT 2>/dev/null || true
+  ip6tables -P FORWARD ACCEPT 2>/dev/null || true
   swapoff -a 2>/dev/null || true
 
   mkdir -p /lib/modules /etc/cni/net.d /run/flannel
@@ -84,17 +104,22 @@ write_kubeadm_config() {
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
   log "kubeadm config (advertise ${ip}, k8s ${K8S_VERSION})"
-  # On systemd-resolved hosts (e.g. ubuntu-latest CI runners) /etc/resolv.conf is
-  # the 127.0.0.53 stub. Pods inherit it, and CoreDNS (`forward . /etc/resolv.conf`
-  # + the `loop` plugin) detects the loopback and CrashLoopBackOffs. Point the
-  # kubelet at the real upstream so pod DNS doesn't loop. Falls back to
-  # /etc/resolv.conf on hosts without systemd-resolved (e.g. the docker harness).
-  local resolv_conf="/etc/resolv.conf"
-  if grep -qsE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53' /etc/resolv.conf \
-     && [[ -s /run/systemd/resolve/resolv.conf ]]; then
-    resolv_conf="/run/systemd/resolve/resolv.conf"
-  fi
-  log "kubelet resolvConf=${resolv_conf}"
+  # CoreDNS runs `forward . /etc/resolv.conf` (= the kubelet resolvConf) and pods
+  # inherit this file's nameserver + search domains (with ndots:5). If the upstream
+  # is unreachable from a pod netns — the systemd-resolved 127.0.0.53 stub on CI
+  # runners, or the dev machine's LAN router inherited by the docker harness — then
+  # every search-domain-expanded lookup i/o-times-out and floods CoreDNS until it
+  # SERVFAILs even authoritative cluster.local names, failing the DNS [Conformance]
+  # tests. Host search domains (e.g. a router's "home") leaking into pods make this
+  # worse. So write a controlled resolv.conf with a reachable public upstream and no
+  # host search domains, and point the kubelet at it. Override with UPSTREAM_DNS.
+  local resolv_conf="/etc/kubernetes/crs-resolv.conf"
+  mkdir -p /etc/kubernetes
+  : > "${resolv_conf}"
+  for ns in ${UPSTREAM_DNS:-8.8.8.8 1.1.1.1}; do
+    echo "nameserver ${ns}" >> "${resolv_conf}"
+  done
+  log "kubelet resolvConf=${resolv_conf} (upstream: ${UPSTREAM_DNS:-8.8.8.8 1.1.1.1})"
   cat > /tmp/kubeadm.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
@@ -117,7 +142,7 @@ apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 cgroupDriver: cgroupfs
 failSwapOn: false
-cgroupsPerQOS: false
+cgroupsPerQOS: ${CGROUPS_PER_QOS}
 enforceNodeAllocatable: []
 imageGCHighThresholdPercent: 100
 resolvConf: "${resolv_conf}"
@@ -139,7 +164,7 @@ kubeadm_up() {
           --kubeconfig=/etc/kubernetes/kubelet.conf \
           --config=/var/lib/kubelet/config.yaml \
           --hostname-override="${NODE_NAME}" \
-          --cgroups-per-qos=false --enforce-node-allocatable="" \
+          --cgroups-per-qos=${CGROUPS_PER_QOS} --enforce-node-allocatable="" \
           ${KUBELET_KUBEADM_ARGS:-} >/var/log/kubelet.log 2>&1 &
   echo $! > /run/kubelet.pid
   sleep 3

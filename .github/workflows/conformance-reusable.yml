@@ -85,8 +85,15 @@ jobs:
           set -eux
           # The daemon + kubelet are backgrounded by cluster-up and must stay
           # alive for the conformance run, so do both in one step.
+          # cgroupsPerQOS=true creates /kubepods pod cgroups so the kubelet can
+          # set per-pod CPU/memory limits — required for InPlace-Resize tests to
+          # exercise real cgroup limits. The runner is a bare ubuntu-latest VM
+          # (host netns, full cgroup-v2 hierarchy), so it can create /kubepods
+          # directly without the kind-style delegation the nested-docker harness
+          # needs.
           sudo --preserve-env=K8S_VERSION,CRI_SOCKET RUNC_SRC=/usr/local/bin/runc \
             DAEMON_BIN="$PWD/target/release/containerd-rs" CONFIG="$PWD/ci/config.toml" \
+            CGROUPS_PER_QOS=true \
             bash ci/kubeadm-init.sh
 
           sudo chmod 0644 /etc/kubernetes/admin.conf

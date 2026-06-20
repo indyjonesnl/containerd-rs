@@ -80,6 +80,19 @@ pub struct SandboxRecord {
     /// applied to each container's OCI spec (`linux.sysctl`) at create time.
     #[serde(default)]
     pub sysctls: HashMap<String, String>,
+    /// CRI `LinuxPodSandboxConfig.cgroup_parent` — the kubelet-managed cgroup the
+    /// pod's containers live under. Containers set `linux.cgroupsPath` beneath it
+    /// so runc applies resource limits in a delegated cgroup (rather than at the
+    /// root, which fails cgroup-v2's "no internal processes" rule).
+    #[serde(default)]
+    pub cgroup_parent: String,
+    /// CRI `PodSandboxConfig.hostname` — the pod's hostname (the kubelet sets it
+    /// to the pod name by default). We run no pause container, so it is applied
+    /// to each container's OCI `hostname` (in its private UTS namespace) so the
+    /// pod reports its own name rather than the node's (e.g. agnhost `/hostname`,
+    /// which sig-network's pod-connectivity conformance tests assert against).
+    #[serde(default)]
+    pub hostname: String,
 }
 
 /// Persisted container record.
@@ -108,6 +121,11 @@ pub struct ContainerRecord {
     /// container's `terminationMessagePath` file from the host side.
     #[serde(default)]
     pub mounts: Vec<MountRecord>,
+    /// Current CRI resource limits, echoed in `ContainerStatus.resources`. Set at
+    /// CreateContainer and updated by UpdateContainerResources (in-place resize),
+    /// so the kubelet can verify a resize took effect.
+    #[serde(default)]
+    pub resources: Option<ResourcesRecord>,
 }
 
 /// A container mount echoed in `ContainerStatus.mounts`.
@@ -116,6 +134,17 @@ pub struct MountRecord {
     pub host_path: String,
     pub container_path: String,
     pub readonly: bool,
+}
+
+/// Current CRI `LinuxContainerResources` values, echoed in `ContainerStatus.resources`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourcesRecord {
+    pub cpu_period: i64,
+    pub cpu_quota: i64,
+    pub cpu_shares: i64,
+    pub memory_limit_in_bytes: i64,
+    pub cpuset_cpus: String,
+    pub cpuset_mems: String,
 }
 
 /// Persisted image record.

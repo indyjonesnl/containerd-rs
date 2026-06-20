@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use futures_core::Stream;
 use metadata::records::{
-    ContainerRecord, ContainerState, ImageRecord, MountRecord, SandboxRecord, SandboxState,
+    ContainerRecord, ContainerState, ImageRecord, MountRecord, ResourcesRecord, SandboxRecord,
+    SandboxState,
 };
 use metadata::Kind;
 use tonic::{Request, Response, Status};
@@ -519,6 +520,13 @@ impl RuntimeService for RuntimeSvc {
         let meta = config.metadata.clone().unwrap_or_default();
         let id = self.gen_id(&format!("{}/{}/{}", meta.namespace, meta.name, meta.uid));
 
+        let cgroup_parent = config
+            .linux
+            .as_ref()
+            .map(|l| l.cgroup_parent.clone())
+            .unwrap_or_default();
+        tracing::info!(%cgroup_parent, "RunPodSandbox cgroup_parent");
+
         // Host network if the pod requests NODE network mode; otherwise try CNI.
         let host_network = config
             .linux
@@ -599,6 +607,8 @@ impl RuntimeService for RuntimeSvc {
                 .as_ref()
                 .map(|l| l.sysctls.clone())
                 .unwrap_or_default(),
+            cgroup_parent,
+            hostname: config.hostname.clone(),
         };
         // Demote any prior sandbox for the same pod (namespace/name/uid) to
         // NotReady. `gen_id` salts with a timestamp, so each call mints a fresh
@@ -829,7 +839,10 @@ impl RuntimeService for RuntimeSvc {
                 })
                 .collect(),
             working_dir: (!config.working_dir.is_empty()).then(|| config.working_dir.clone()),
-            hostname: None,
+            // Apply the pod's hostname in the container's (private) UTS namespace.
+            // Host-network pods share the host UTS ns, so leave it to the node's.
+            hostname: (!sandbox.host_network && !sandbox.hostname.is_empty())
+                .then(|| sandbox.hostname.clone()),
             terminal: config.tty,
             readonly_rootfs: sec_ctx.map(|sc| sc.readonly_rootfs).unwrap_or(false),
             rootless_host_ids: host_ids,
@@ -869,15 +882,10 @@ impl RuntimeService for RuntimeSvc {
                 .linux
                 .as_ref()
                 .and_then(|l| l.resources.as_ref())
-                .map(|r| runtime::bundle::Resources {
-                    cpu_shares: (r.cpu_shares > 0).then_some(r.cpu_shares as u64),
-                    cpu_quota: (r.cpu_quota != 0).then_some(r.cpu_quota),
-                    cpu_period: (r.cpu_period > 0).then_some(r.cpu_period as u64),
-                    memory_limit: (r.memory_limit_in_bytes > 0).then_some(r.memory_limit_in_bytes),
-                    cpuset_cpus: (!r.cpuset_cpus.is_empty()).then(|| r.cpuset_cpus.clone()),
-                    cpuset_mems: (!r.cpuset_mems.is_empty()).then(|| r.cpuset_mems.clone()),
-                })
+                .map(cri_resources)
                 .unwrap_or_default(),
+            cgroup_path: (!sandbox.cgroup_parent.is_empty())
+                .then(|| cgroups_path(&sandbox.cgroup_parent, &id)),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -930,6 +938,11 @@ impl RuntimeService for RuntimeSvc {
                     readonly: m.readonly,
                 })
                 .collect(),
+            resources: config
+                .linux
+                .as_ref()
+                .and_then(|l| l.resources.as_ref())
+                .map(resources_record),
         };
         self.ctx
             .metadata
@@ -980,7 +993,7 @@ impl RuntimeService for RuntimeSvc {
                 })
                 .collect(),
             log_path: rec.log_path.clone(),
-            resources: None,
+            resources: rec.resources.as_ref().map(record_to_cri_resources),
             image_id: rec.image_id.clone(),
             user: None,
             stop_signal: 0,
@@ -1340,8 +1353,47 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(v1::ReopenContainerLogResponse {}))
     }
 
+    /// Live in-place resize: apply the new CPU/memory limits to the running
+    /// container's cgroup via `runc update` (cgroup v2 `memory.max`/`cpu.max`/
+    /// `cpu.weight`), no restart. Backs Kubernetes in-place pod resize.
+    async fn update_container_resources(
+        &self,
+        request: Request<v1::UpdateContainerResourcesRequest>,
+    ) -> Result<Response<v1::UpdateContainerResourcesResponse>, Status> {
+        let req = request.into_inner();
+        let id = req.container_id;
+        let mut rec = self
+            .get_container(&id)?
+            .ok_or_else(|| Status::not_found(format!("container {id} not found")))?;
+        let res = req.linux.as_ref().map(cri_resources).unwrap_or_default();
+        let runc_root = self.ctx.state_dir.join("runc");
+        let id2 = id.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            runtime::runc::update(runtime::runc::DEFAULT_BIN, &runc_root, &id2, &res)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(|e| Status::internal(format!("runc update: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "runc update failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        // Persist the new limits so ContainerStatus.resources reflects the resize
+        // (the kubelet reads it back to confirm the in-place resize took effect).
+        if let Some(linux) = req.linux.as_ref() {
+            rec.resources = Some(resources_record(linux));
+            self.ctx
+                .metadata
+                .put(Kind::Container, self.ns(), &id, &rec)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        tracing::info!(container = %id, "UpdateContainerResources applied");
+        Ok(Response::new(v1::UpdateContainerResourcesResponse {}))
+    }
+
     unary_unimpl! {
-        update_container_resources => UpdateContainerResourcesRequest / UpdateContainerResourcesResponse,
         pod_sandbox_stats => PodSandboxStatsRequest / PodSandboxStatsResponse,
         list_pod_sandbox_stats => ListPodSandboxStatsRequest / ListPodSandboxStatsResponse,
         update_runtime_config => UpdateRuntimeConfigRequest / UpdateRuntimeConfigResponse,
@@ -1556,6 +1608,63 @@ fn unix_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// Snapshot CRI `LinuxContainerResources` into the persisted record (for
+/// `ContainerStatus.resources`, used by the kubelet to verify in-place resizes).
+fn resources_record(r: &v1::LinuxContainerResources) -> ResourcesRecord {
+    ResourcesRecord {
+        cpu_period: r.cpu_period,
+        cpu_quota: r.cpu_quota,
+        cpu_shares: r.cpu_shares,
+        memory_limit_in_bytes: r.memory_limit_in_bytes,
+        cpuset_cpus: r.cpuset_cpus.clone(),
+        cpuset_mems: r.cpuset_mems.clone(),
+    }
+}
+
+/// Rebuild the CRI `ContainerResources` for `ContainerStatus` from a record.
+fn record_to_cri_resources(rec: &ResourcesRecord) -> v1::ContainerResources {
+    v1::ContainerResources {
+        linux: Some(v1::LinuxContainerResources {
+            cpu_period: rec.cpu_period,
+            cpu_quota: rec.cpu_quota,
+            cpu_shares: rec.cpu_shares,
+            memory_limit_in_bytes: rec.memory_limit_in_bytes,
+            cpuset_cpus: rec.cpuset_cpus.clone(),
+            cpuset_mems: rec.cpuset_mems.clone(),
+            ..Default::default()
+        }),
+        windows: None,
+    }
+}
+
+/// Map CRI `LinuxContainerResources` to the runtime's `Resources` (used by both
+/// CreateContainer's initial limits and UpdateContainerResources' live resize).
+fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources {
+    runtime::bundle::Resources {
+        cpu_shares: (r.cpu_shares > 0).then_some(r.cpu_shares as u64),
+        cpu_quota: (r.cpu_quota != 0).then_some(r.cpu_quota),
+        cpu_period: (r.cpu_period > 0).then_some(r.cpu_period as u64),
+        memory_limit: (r.memory_limit_in_bytes > 0).then_some(r.memory_limit_in_bytes),
+        cpuset_cpus: (!r.cpuset_cpus.is_empty()).then(|| r.cpuset_cpus.clone()),
+        cpuset_mems: (!r.cpuset_mems.is_empty()).then(|| r.cpuset_mems.clone()),
+    }
+}
+
+/// Derive a container's cgroup path from the pod's `cgroup_parent`, mirroring
+/// containerd's `getCgroupsPath`: a systemd slice parent (`*.slice`) →
+/// `slice:cri-containerd:id`; otherwise the cgroupfs path `parent/id`.
+fn cgroups_path(cgroup_parent: &str, id: &str) -> String {
+    let base = std::path::Path::new(cgroup_parent)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if base.ends_with(".slice") {
+        format!("{base}:cri-containerd:{id}")
+    } else {
+        format!("{}/{}", cgroup_parent.trim_end_matches('/'), id)
+    }
 }
 
 /// Format one stream's chunk into CRI log lines: `<RFC3339Nano> <stream> <P|F> <line>`.
@@ -2009,6 +2118,7 @@ mod tests {
                 labels: Default::default(),
                 annotations: Default::default(),
                 mounts: Vec::new(),
+                resources: None,
             }
         }
 
@@ -2040,6 +2150,8 @@ mod tests {
                         host_network: false,
                         resolv_conf_path: None,
                         sysctls: Default::default(),
+                        cgroup_parent: String::new(),
+                        hostname: String::new(),
                     },
                 )
                 .unwrap();
@@ -2125,6 +2237,31 @@ mod tests {
             auth_from_config(v1::AuthConfig::default()),
             Auth::Anonymous
         ));
+    }
+
+    // Regression for in-place resize reporting: CRI LinuxContainerResources must
+    // round-trip through the persisted record back into ContainerStatus.resources
+    // unchanged, so the kubelet sees the limits it requested via UpdateContainerResources.
+    #[test]
+    fn resources_round_trip_through_record() {
+        let cri = v1::LinuxContainerResources {
+            cpu_period: 100_000,
+            cpu_quota: 2_000,
+            cpu_shares: 204,
+            memory_limit_in_bytes: 33_554_432,
+            cpuset_cpus: "0-1".into(),
+            cpuset_mems: "0".into(),
+            ..Default::default()
+        };
+        let rec = resources_record(&cri);
+        let out = record_to_cri_resources(&rec);
+        let linux = out.linux.expect("linux resources present");
+        assert_eq!(linux.cpu_period, 100_000);
+        assert_eq!(linux.cpu_quota, 2_000);
+        assert_eq!(linux.cpu_shares, 204);
+        assert_eq!(linux.memory_limit_in_bytes, 33_554_432);
+        assert_eq!(linux.cpuset_cpus, "0-1");
+        assert_eq!(linux.cpuset_mems, "0");
     }
 
     #[tokio::test]
@@ -2455,6 +2592,7 @@ mod tests {
                     labels: Default::default(),
                     annotations: Default::default(),
                     mounts: Vec::new(),
+                    resources: None,
                 },
             )
             .unwrap();
