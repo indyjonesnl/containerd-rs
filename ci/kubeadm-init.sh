@@ -104,17 +104,22 @@ write_kubeadm_config() {
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
   log "kubeadm config (advertise ${ip}, k8s ${K8S_VERSION})"
-  # On systemd-resolved hosts (e.g. ubuntu-latest CI runners) /etc/resolv.conf is
-  # the 127.0.0.53 stub. Pods inherit it, and CoreDNS (`forward . /etc/resolv.conf`
-  # + the `loop` plugin) detects the loopback and CrashLoopBackOffs. Point the
-  # kubelet at the real upstream so pod DNS doesn't loop. Falls back to
-  # /etc/resolv.conf on hosts without systemd-resolved (e.g. the docker harness).
-  local resolv_conf="/etc/resolv.conf"
-  if grep -qsE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53' /etc/resolv.conf \
-     && [[ -s /run/systemd/resolve/resolv.conf ]]; then
-    resolv_conf="/run/systemd/resolve/resolv.conf"
-  fi
-  log "kubelet resolvConf=${resolv_conf}"
+  # CoreDNS runs `forward . /etc/resolv.conf` (= the kubelet resolvConf) and pods
+  # inherit this file's nameserver + search domains (with ndots:5). If the upstream
+  # is unreachable from a pod netns — the systemd-resolved 127.0.0.53 stub on CI
+  # runners, or the dev machine's LAN router inherited by the docker harness — then
+  # every search-domain-expanded lookup i/o-times-out and floods CoreDNS until it
+  # SERVFAILs even authoritative cluster.local names, failing the DNS [Conformance]
+  # tests. Host search domains (e.g. a router's "home") leaking into pods make this
+  # worse. So write a controlled resolv.conf with a reachable public upstream and no
+  # host search domains, and point the kubelet at it. Override with UPSTREAM_DNS.
+  local resolv_conf="/etc/kubernetes/crs-resolv.conf"
+  mkdir -p /etc/kubernetes
+  : > "${resolv_conf}"
+  for ns in ${UPSTREAM_DNS:-8.8.8.8 1.1.1.1}; do
+    echo "nameserver ${ns}" >> "${resolv_conf}"
+  done
+  log "kubelet resolvConf=${resolv_conf} (upstream: ${UPSTREAM_DNS:-8.8.8.8 1.1.1.1})"
   cat > /tmp/kubeadm.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
