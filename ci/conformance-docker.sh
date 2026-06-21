@@ -59,6 +59,7 @@ docker run --rm --privileged \
     # works because /var/lib/containerd-rs is mounted as tmpfs (see --tmpfs above).
     DOCKER_CONFIG=/tmp/config-docker.toml
     sed "s/systemd_cgroup = true/systemd_cgroup = false/" /work/ci/config.toml > "$DOCKER_CONFIG"
+    grep -q "systemd_cgroup = false" "$DOCKER_CONFIG" || { echo "error: failed to disable systemd_cgroup in $DOCKER_CONFIG — check ci/config.toml formatting" >&2; exit 1; }
 
     DAEMON_BIN=/work/target/release/containerd-rs CONFIG="$DOCKER_CONFIG" \
     CRI_SOCKET=unix:///run/containerd-rs.sock CGROUPS_PER_QOS="$CGROUPS_PER_QOS" \

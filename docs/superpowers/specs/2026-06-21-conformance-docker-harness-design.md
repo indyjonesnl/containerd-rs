@@ -133,3 +133,7 @@ make conformance-docker FOCUS=...
   this harness exists to derisk.
 - `--privileged` + host `/lib/modules` mount assumes the host kernel has the
   needed modules (overlay, br_netfilter, nf_* ); true on this dev machine.
+- `--cgroupns host` + rw `/sys/fs/cgroup` means cgroups created during a run
+  are not guaranteed to be fully torn down on container exit; residual cgroup
+  directories may remain under the host hierarchy and require manual cleanup
+  (e.g. `systemd-cgls` to inspect, `rmdir` on empty leaves).

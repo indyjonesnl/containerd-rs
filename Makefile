@@ -9,6 +9,7 @@ CONFORMANCE_IMAGE ?= registry.k8s.io/conformance:$(K8S_VERSION)
 PAUSE_IMAGE ?= registry.k8s.io/pause:3.10
 CRI_SOCKET ?= unix:///run/containerd-rs.sock
 RESULTS_DIR ?= conformance-results
+CGROUPS_PER_QOS ?= false
 
 .PHONY: all build release test lint fmt fmt-check check ci \
         cluster-up cluster-down conformance conformance-docker conformance-smoke crictl-validate clean
@@ -58,7 +59,7 @@ conformance:
 		./ci/run-conformance.sh
 
 conformance-docker:
-	FOCUS='$(FOCUS)' K8S_VERSION=$(K8S_VERSION) RESULTS_DIR=$(RESULTS_DIR) \
+	FOCUS='$(FOCUS)' K8S_VERSION=$(K8S_VERSION) RESULTS_DIR=$(RESULTS_DIR) CGROUPS_PER_QOS='$(CGROUPS_PER_QOS)' \
 		./ci/conformance-docker.sh
 
 crictl-validate:
