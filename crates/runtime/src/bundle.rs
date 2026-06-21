@@ -9,9 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    Capability, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDeviceCgroupBuilder,
-    LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, UserBuilder,
+    Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder,
+    LinuxDeviceCgroupBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
+    LinuxResourcesBuilder, MountBuilder, ProcessBuilder, RootBuilder, Spec, UserBuilder,
 };
 
 /// A bind mount to inject into the container (from a CRI mount).
@@ -174,18 +174,55 @@ fn all_capabilities() -> std::collections::HashSet<Capability> {
     .collect()
 }
 
-/// Turn `spec` into a privileged container: full caps, no masked/readonly paths,
-/// allow-all device cgroup. Mirrors containerd's CRI privileged handling.
-fn apply_privileged(spec: &mut Spec) {
-    let caps = all_capabilities();
-    if let Ok(lc) = LinuxCapabilitiesBuilder::default()
+/// containerd's default capability set for non-privileged containers — the same
+/// 14 caps Docker/Moby grant by default. The bare oci-spec default is only 3
+/// (`KILL`/`AUDIT_WRITE`/`NET_BIND_SERVICE`), which breaks images that adjust
+/// ownership at startup: e.g. nginx chowns its cache dir and needs `CAP_CHOWN`,
+/// without which it crashloops with `chown(...) Operation not permitted`.
+fn default_capabilities() -> std::collections::HashSet<Capability> {
+    use Capability::*;
+    [
+        AuditWrite,
+        Chown,
+        DacOverride,
+        Fowner,
+        Fsetid,
+        Kill,
+        Mknod,
+        NetBindService,
+        NetRaw,
+        Setfcap,
+        Setgid,
+        Setpcap,
+        Setuid,
+        SysChroot,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Build `LinuxCapabilities` with `caps` in the bounding/effective/permitted/
+/// inheritable sets and `ambient` as the ambient set. (Ambient is left empty for
+/// the default set — matching containerd — so non-root containers don't silently
+/// retain caps across `execve`; privileged passes the full set for ambient too.)
+fn build_caps(
+    caps: std::collections::HashSet<Capability>,
+    ambient: std::collections::HashSet<Capability>,
+) -> Option<LinuxCapabilities> {
+    LinuxCapabilitiesBuilder::default()
         .bounding(caps.clone())
         .effective(caps.clone())
         .permitted(caps.clone())
-        .inheritable(caps.clone())
-        .ambient(caps)
+        .inheritable(caps)
+        .ambient(ambient)
         .build()
-    {
+        .ok()
+}
+
+/// Turn `spec` into a privileged container: full caps, no masked/readonly paths,
+/// allow-all device cgroup. Mirrors containerd's CRI privileged handling.
+fn apply_privileged(spec: &mut Spec) {
+    if let Some(lc) = build_caps(all_capabilities(), all_capabilities()) {
         if let Some(mut process) = spec.process().clone() {
             process.set_capabilities(Some(lc));
             spec.set_process(Some(process));
@@ -282,12 +319,19 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
         .build()
         .map_err(|e| Error::Builder(e.to_string()))?;
 
-    let process = ProcessBuilder::default()
+    // Grant containerd's default capability set (privileged is upgraded to the
+    // full set later by apply_privileged). Without this the oci-spec default of
+    // 3 caps leaves out CAP_CHOWN etc., breaking images like nginx.
+    let mut process_builder = ProcessBuilder::default()
         .terminal(req.terminal)
         .args(argv)
         .env(env)
         .cwd(PathBuf::from(cwd))
-        .user(user)
+        .user(user);
+    if let Some(caps) = build_caps(default_capabilities(), std::collections::HashSet::new()) {
+        process_builder = process_builder.capabilities(caps);
+    }
+    let process = process_builder
         .build()
         .map_err(|e| Error::Builder(e.to_string()))?;
 
@@ -652,5 +696,77 @@ mod tests {
         // Round-trips back through the parser.
         let reloaded = Spec::load(&config).unwrap();
         assert_eq!(reloaded.hostname().as_deref(), Some("pod-xyz"));
+    }
+
+    // Regression: a non-privileged container must get containerd's default
+    // capability set (14 caps), not the bare oci-spec default of 3
+    // (KILL/AUDIT_WRITE/NET_BIND_SERVICE). nginx chowns its cache dir at startup
+    // and needs CAP_CHOWN; without it the ReplicationController [Conformance]
+    // test crashlooped with `chown(...) Operation not permitted`.
+    #[test]
+    fn nonprivileged_container_gets_default_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("a")).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .clone()
+            .expect("capabilities set");
+        let eff = caps.effective().clone().expect("effective set");
+        for required in [
+            Capability::Chown,
+            Capability::DacOverride,
+            Capability::Fowner,
+            Capability::Fsetid,
+            Capability::Mknod,
+            Capability::NetRaw,
+            Capability::Setgid,
+            Capability::Setuid,
+            Capability::Setpcap,
+            Capability::Setfcap,
+            Capability::SysChroot,
+            Capability::Kill,
+            Capability::AuditWrite,
+            Capability::NetBindService,
+        ] {
+            assert!(
+                eff.contains(&required),
+                "default caps must include {required:?}"
+            );
+        }
+        // ...but not a privileged-only capability.
+        assert!(
+            !eff.contains(&Capability::SysAdmin),
+            "non-privileged container must not get CAP_SYS_ADMIN"
+        );
+    }
+
+    #[test]
+    fn privileged_container_includes_chown_and_sys_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            privileged: true,
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("p")).unwrap();
+        let eff = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .clone()
+            .unwrap()
+            .effective()
+            .clone()
+            .unwrap();
+        assert!(eff.contains(&Capability::Chown));
+        assert!(eff.contains(&Capability::SysAdmin));
     }
 }
