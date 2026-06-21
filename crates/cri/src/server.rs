@@ -548,8 +548,8 @@ impl RuntimeService for RuntimeSvc {
             .unwrap_or(false);
 
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
-        // plugin chain; if CNI is unavailable/fails we fall back to host network
-        // (rootless containers share the host net namespace).
+        // plugin chain; if CNI is unavailable/fails we tear down best-effort and
+        // return Status::unavailable so the kubelet retries once CNI is ready.
         // Pod hostPort declarations -> CNI portmap capability arg.
         let port_mappings: Vec<sandbox::cni::PortMapping> = config
             .port_mappings
