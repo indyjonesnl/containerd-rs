@@ -1,0 +1,27 @@
+name: conformance-sig-apps
+
+# Manual: run the sig-apps [Conformance] slice on containerd-rs.
+# Workload controllers — Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob (rolling updates, scale, ordered bring-up).
+#
+# Conformance is expensive and CI minutes are limited, so this is manual only.
+# Validate locally first with: make conformance-docker FOCUS='\[sig-apps\].*\[Conformance\]'
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.35.6"
+      focus:
+        description: "ginkgo --focus regex (narrow to a subset for a cheap validation run)"
+        default: '\[sig-apps\].*\[Conformance\]'
+
+permissions:
+  contents: read
+
+jobs:
+  sig-apps:
+    uses: ./.github/workflows/conformance-reusable.yml
+    with:
+      focus: ${{ inputs.focus }}
+      artifact_name: conformance-sig-apps
+      k8s_version: ${{ inputs.k8s_version }}
