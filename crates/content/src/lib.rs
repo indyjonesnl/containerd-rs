@@ -61,6 +61,12 @@ impl Store {
         Ok(fs::read(self.blob_path(digest))?)
     }
 
+    /// Open a committed blob as a file handle, for streaming reads (so a caller
+    /// can process a large blob without loading it fully into memory).
+    pub fn open_blob(&self, digest: &Digest) -> Result<fs::File> {
+        Ok(fs::File::open(self.blob_path(digest))?)
+    }
+
     /// Delete a committed blob. Returns whether it existed. Idempotent.
     pub fn remove(&self, digest: &Digest) -> Result<bool> {
         let path = self.blob_path(digest);

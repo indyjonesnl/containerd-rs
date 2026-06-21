@@ -1156,6 +1156,8 @@ version = "0.1.1"
 dependencies = [
  "content",
  "core-types",
+ "flate2",
+ "futures-util",
  "hex",
  "metadata",
  "oci-client",
@@ -1163,6 +1165,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snapshots",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
