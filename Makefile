@@ -11,7 +11,7 @@ CRI_SOCKET ?= unix:///run/containerd-rs.sock
 RESULTS_DIR ?= conformance-results
 
 .PHONY: all build release test lint fmt fmt-check check ci \
-        cluster-up cluster-down conformance conformance-smoke crictl-validate clean
+        cluster-up cluster-down conformance conformance-docker conformance-smoke crictl-validate clean
 
 all: check
 
@@ -56,6 +56,10 @@ conformance-smoke:
 conformance:
 	RESULTS_DIR=$(RESULTS_DIR) CONFORMANCE_IMAGE=$(CONFORMANCE_IMAGE) \
 		./ci/run-conformance.sh
+
+conformance-docker:
+	FOCUS='$(FOCUS)' K8S_VERSION=$(K8S_VERSION) RESULTS_DIR=$(RESULTS_DIR) \
+		./ci/conformance-docker.sh
 
 crictl-validate:
 	sudo CRI_SOCKET=$(CRI_SOCKET) ./ci/crictl-validate.sh
