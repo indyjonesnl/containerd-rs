@@ -103,11 +103,21 @@ pub struct PulledImage {
     pub chain_ids: Vec<Digest>,
     /// Compressed layer blob digests, in order.
     pub layer_digests: Vec<Digest>,
+    /// OCI image config `User` (empty == root).
+    pub user: String,
 }
 
 #[derive(Deserialize)]
 struct ImageConfigJson {
     rootfs: RootFs,
+    #[serde(default)]
+    config: OciConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct OciConfig {
+    #[serde(default, rename = "User")]
+    user: String,
 }
 
 #[derive(Deserialize)]
@@ -242,6 +252,7 @@ pub async fn pull(
         diff_ids,
         chain_ids,
         layer_digests,
+        user: parsed_config.config.user,
     })
 }
 

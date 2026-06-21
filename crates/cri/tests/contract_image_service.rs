@@ -127,6 +127,9 @@ async fn pull_then_status_and_list() {
         .unwrap()
         .into_inner();
     assert!(st.image.is_some(), "pulled image is reported by status");
+    // pause:3.10 has no `User` set -> root -> no uid/username surfaced.
+    let im = st.image.expect("status has image");
+    assert!(im.uid.is_none() && im.username.is_empty());
 
     let list = h
         .img

@@ -163,6 +163,10 @@ pub struct ImageRecord {
     /// Snapshot chainIDs this image references (for GC).
     #[serde(default)]
     pub chain_ids: Vec<String>,
+    /// OCI image config `User` (e.g. "65532", "65532:65532", "nonroot"); empty
+    /// means root. Surfaced to the kubelet for runAsNonRoot admission.
+    #[serde(default)]
+    pub user: String,
 }
 
 #[cfg(test)]

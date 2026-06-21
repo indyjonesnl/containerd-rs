@@ -120,13 +120,24 @@ fn auth_from_config(a: v1::AuthConfig) -> images::pull::Auth {
 }
 
 fn record_to_image(rec: &ImageRecord) -> v1::Image {
+    // Map the stored OCI `User` to CRI fields. The uid part is everything before
+    // an optional ":gid". A purely-numeric uid -> Int64Value; a name (needs
+    // /etc/passwd to resolve) -> username. NEVER collapse a name to uid 0 — the
+    // kubelet reads uid 0 as "image runs as root" and rejects runAsNonRoot pods.
+    let (uid, username) = match rec.user.split(':').next().unwrap_or("") {
+        "" => (None, String::new()),
+        u => match u.parse::<i64>() {
+            Ok(n) => (Some(v1::Int64Value { value: n }), String::new()),
+            Err(_) => (None, u.to_string()),
+        },
+    };
     v1::Image {
         id: rec.image_id.clone(),
         repo_tags: rec.repo_tags.clone(),
         repo_digests: rec.repo_digests.clone(),
         size: rec.size,
-        uid: None,
-        username: String::new(),
+        uid,
+        username,
         spec: None,
         pinned: false,
     }
@@ -1521,6 +1532,7 @@ impl ImageService for ImageSvc {
             size: pulled.size,
             layer_digests: pulled.layer_digests.iter().map(|d| d.to_string()).collect(),
             chain_ids: pulled.chain_ids.iter().map(|d| d.to_string()).collect(),
+            user: pulled.user.clone(),
         };
         self.ctx
             .metadata
@@ -2479,6 +2491,7 @@ mod tests {
                     size: cfg_json.len() as u64,
                     layer_digests: vec![],
                     chain_ids: vec![],
+                    user: String::new(),
                 },
             )
             .unwrap();
@@ -3056,6 +3069,7 @@ mod tests {
                     size: 11,
                     layer_digests: vec![layer.to_string()],
                     chain_ids: vec![chain.to_string()],
+                    user: String::new(),
                 },
             )
             .unwrap();
@@ -3148,5 +3162,48 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(after.images.is_empty());
+    }
+
+    fn image_rec_with_user(user: &str) -> ImageRecord {
+        ImageRecord {
+            name: "img".into(),
+            target_digest: String::new(),
+            image_id: "sha256:abc".into(),
+            repo_tags: vec!["img:latest".into()],
+            repo_digests: vec![],
+            size: 0,
+            layer_digests: vec![],
+            chain_ids: vec![],
+            user: user.into(),
+        }
+    }
+
+    #[test]
+    fn record_to_image_maps_numeric_user_to_uid() {
+        let img = record_to_image(&image_rec_with_user("65532"));
+        assert_eq!(img.uid.map(|u| u.value), Some(65532));
+        assert!(img.username.is_empty());
+    }
+
+    #[test]
+    fn record_to_image_maps_uid_gid_to_uid() {
+        let img = record_to_image(&image_rec_with_user("65532:65532"));
+        assert_eq!(img.uid.map(|u| u.value), Some(65532));
+        assert!(img.username.is_empty());
+    }
+
+    #[test]
+    fn record_to_image_maps_named_user_to_username_not_zero() {
+        let img = record_to_image(&image_rec_with_user("nonroot"));
+        // MUST NOT collapse to uid 0 (that is what the kubelet reads as root).
+        assert!(img.uid.is_none(), "named user must not become a uid");
+        assert_eq!(img.username, "nonroot");
+    }
+
+    #[test]
+    fn record_to_image_empty_user_is_root_unset() {
+        let img = record_to_image(&image_rec_with_user(""));
+        assert!(img.uid.is_none());
+        assert!(img.username.is_empty());
     }
 }

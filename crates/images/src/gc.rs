@@ -80,6 +80,7 @@ mod tests {
             size: 0,
             layer_digests: layers.iter().map(|s| s.to_string()).collect(),
             chain_ids: chains.iter().map(|s| s.to_string()).collect(),
+            user: String::new(),
         }
     }
 
