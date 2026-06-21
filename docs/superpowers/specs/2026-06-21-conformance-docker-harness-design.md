@@ -133,7 +133,12 @@ make conformance-docker FOCUS=...
   this harness exists to derisk.
 - `--privileged` + host `/lib/modules` mount assumes the host kernel has the
   needed modules (overlay, br_netfilter, nf_* ); true on this dev machine.
-- `--cgroupns host` + rw `/sys/fs/cgroup` means cgroups created during a run
-  are not guaranteed to be fully torn down on container exit; residual cgroup
-  directories may remain under the host hierarchy and require manual cleanup
-  (e.g. `systemd-cgls` to inspect, `rmdir` on empty leaves).
+- `CGROUPS_PER_QOS=true` works nested (matches CI) because the container is
+  launched `--cgroupns=private` with **no** host `/sys/fs/cgroup` bind mount:
+  docker's systemd cgroup driver hands the container its own delegated cgroup-v2
+  scope as root. On entry the wrapper moves its processes into an `init.scope`
+  leaf and enables controllers in the root `subtree_control`, so the kubelet can
+  create `/kubepods` (+ QoS children) — the cgroup-v2 "no internal processes"
+  rule that previously blocked nested `/kubepods` is satisfied. All cgroup
+  mutation is confined to the container's own scope and is reaped when `--rm`
+  tears the container down — no host cgroup pollution.

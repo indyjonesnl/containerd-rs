@@ -13,7 +13,7 @@
 - Runtime is **crun 1.28** — no `RUNTIME=runc` knob. The harness does whatever CI does.
 - Tool versions live in **one place** (`ci/install-tooling.sh`), consumed by both the workflow and the Dockerfile. CI and local must not drift.
 - The `ci/` scripts (`kubeadm-init.sh`, `run-conformance.sh`) are the single source of truth and are run **unchanged** — the container is only an environment.
-- `CGROUPS_PER_QOS` defaults **false** in the harness: a nested docker container cannot create the `/kubepods` cgroup-v2 hierarchy (kubeadm-init.sh comment). It stays CI-only and overridable.
+- `CGROUPS_PER_QOS` defaults **true** in the harness, matching CI. (Post-implementation update: the original plan defaulted this false believing nested containers can't create `/kubepods`. That was a container-launch gap, not a hard limit — CI itself runs in a container. The shipped wrapper launches `--cgroupns=private` with no host `/sys/fs/cgroup` mount, moves its procs into an `init.scope` leaf, and enables root `subtree_control`, so the kubelet creates `/kubepods` nested. The `false`-default code in Task 3 below is superseded by this.)
 - Daemon binary path must respect `CARGO_TARGET_DIR` (this repo builds to `/home/jones/.cache/rusternetes-target/release/containerd-rs`, not `target/release`).
 - Pinned versions (workflow defaults, copied verbatim): `K8S_VERSION=v1.35.6`, `CRUN_VERSION=1.28`, `CRICTL_VERSION=v1.35.0`, `CNI_PLUGINS_VERSION=v1.5.1`, flannel CNI plugin `v1.5.1-flannel2`.
 
@@ -299,7 +299,7 @@ git commit -m "ci: make conformance-docker — run conformance locally in a priv
    ```bash
    make conformance-docker FOCUS='\[sig-node\].*\[Conformance\]'
    ```
-   Watch the crun `events --stats` (ContainerStats) path. Expect resize specs that require per-pod cgroup limits to be skipped/failing for the **environmental** reason (`CGROUPS_PER_QOS=false` nested) — not a crun fault; those still need CI.
+   Watch the crun `events --stats` (ContainerStats) path. Resize specs now run for real: `CGROUPS_PER_QOS=true` works nested (delegated cgroup scope), so per-pod cgroup limits are exercised locally — no longer CI-only.
 2. **CI parity:** the next dispatched conformance workflow run installs via `ci/install-tooling.sh` and must stay green — confirms the Task 1 refactor is inert.
 
 ## Self-review notes
