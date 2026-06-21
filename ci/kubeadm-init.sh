@@ -26,7 +26,7 @@ CRI_SOCKET="${CRI_SOCKET:-unix:///run/containerd-rs.sock}"
 # real, delegated cgroup-v2 hierarchy: a host-netns node (CI runner) can create
 # /kubepods, but the nested docker harness cannot ("cannot enter cgroupv2
 # /sys/fs/cgroup/kubepods ... invalid state"), so default off and let CI opt in.
-CGROUPS_PER_QOS="${CGROUPS_PER_QOS:-false}"
+CGROUPS_PER_QOS="${CGROUPS_PER_QOS:-true}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 NODE_NAME="${NODE_NAME:-crs-node}"
 DAEMON_BIN="${DAEMON_BIN:-./target/release/containerd-rs}"
