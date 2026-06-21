@@ -1393,10 +1393,27 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(v1::UpdateContainerResourcesResponse {}))
     }
 
+    async fn update_runtime_config(
+        &self,
+        request: Request<v1::UpdateRuntimeConfigRequest>,
+    ) -> Result<Response<v1::UpdateRuntimeConfigResponse>, Status> {
+        // The kubelet calls this once at startup to hand the runtime the pod
+        // CIDR. We have no per-CIDR CNI behavior yet (kube-router/flannel own
+        // IPAM), so we log it and accept. Returning Ok (not Unimplemented) is
+        // what the kubelet requires to finish node setup.
+        let pod_cidr = request
+            .into_inner()
+            .runtime_config
+            .and_then(|c| c.network_config)
+            .map(|n| n.pod_cidr)
+            .unwrap_or_default();
+        tracing::info!(%pod_cidr, "UpdateRuntimeConfig");
+        Ok(Response::new(v1::UpdateRuntimeConfigResponse {}))
+    }
+
     unary_unimpl! {
         pod_sandbox_stats => PodSandboxStatsRequest / PodSandboxStatsResponse,
         list_pod_sandbox_stats => ListPodSandboxStatsRequest / ListPodSandboxStatsResponse,
-        update_runtime_config => UpdateRuntimeConfigRequest / UpdateRuntimeConfigResponse,
         checkpoint_container => CheckpointContainerRequest / CheckpointContainerResponse,
         list_metric_descriptors => ListMetricDescriptorsRequest / ListMetricDescriptorsResponse,
         list_pod_sandbox_metrics => ListPodSandboxMetricsRequest / ListPodSandboxMetricsResponse,
@@ -2077,6 +2094,19 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(st.image.is_none());
+
+        // Gap 4: UpdateRuntimeConfig is implemented and returns Ok, accepting a
+        // pod CIDR without erroring (the kubelet calls this at startup).
+        client
+            .update_runtime_config(v1::UpdateRuntimeConfigRequest {
+                runtime_config: Some(v1::RuntimeConfig {
+                    network_config: Some(v1::NetworkConfig {
+                        pod_cidr: "10.244.0.0/16".into(),
+                    }),
+                }),
+            })
+            .await
+            .expect("update_runtime_config returns Ok");
 
         let _ = tx.send(());
         let _ = server.await;
