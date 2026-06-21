@@ -136,9 +136,12 @@ specs across nine SIGs (`registry.k8s.io/conformance:v1.35.6`):
 | `conformance-sig-auth.yml` | `[sig-auth]` | 10 | ServiceAccount tokens, projected SA volumes, related authn/authz |
 | `conformance-sig-instrumentation.yml` | `[sig-instrumentation]` | 4 | Events API lifecycle: create/patch/delete/list |
 
-The one remaining `[Conformance]` spec, `[sig-architecture] … should have at
-least two untainted nodes`, is excluded: it structurally requires a multi-node
-cluster and cannot pass on this single-node setup.
+A few `[Conformance]` specs structurally require a **multi-node** cluster (they
+fail with "needs a cluster with at least 2 nodes") and so cannot pass on this
+single-node setup — `[sig-architecture] … should have at least two untainted
+nodes` (no workflow) and `[sig-apps] Daemon set [Serial] should rollback without
+unnecessary restarts`. `ci/run-conformance.sh` skips these by default (`SKIP`
+regex, overridable); they are environmental, not runtime, limitations.
 
 They run only on demand (conformance is expensive; CI minutes are limited), and
 each can be validated locally first with the docker harness, e.g.
