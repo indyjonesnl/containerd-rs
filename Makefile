@@ -9,9 +9,12 @@ CONFORMANCE_IMAGE ?= registry.k8s.io/conformance:$(K8S_VERSION)
 PAUSE_IMAGE ?= registry.k8s.io/pause:3.10
 CRI_SOCKET ?= unix:///run/containerd-rs.sock
 RESULTS_DIR ?= conformance-results
+# Per-QoS pod cgroups, on by default to mirror CI. The conformance-docker
+# harness gives its container a delegated cgroup-v2 scope so this works nested.
+CGROUPS_PER_QOS ?= true
 
 .PHONY: all build release test lint fmt fmt-check check ci \
-        cluster-up cluster-down conformance conformance-smoke crictl-validate clean
+        cluster-up cluster-down conformance conformance-docker conformance-smoke crictl-validate clean
 
 all: check
 
@@ -56,6 +59,10 @@ conformance-smoke:
 conformance:
 	RESULTS_DIR=$(RESULTS_DIR) CONFORMANCE_IMAGE=$(CONFORMANCE_IMAGE) \
 		./ci/run-conformance.sh
+
+conformance-docker:
+	FOCUS='$(FOCUS)' K8S_VERSION=$(K8S_VERSION) RESULTS_DIR=$(RESULTS_DIR) CGROUPS_PER_QOS='$(CGROUPS_PER_QOS)' \
+		./ci/conformance-docker.sh
 
 crictl-validate:
 	sudo CRI_SOCKET=$(CRI_SOCKET) ./ci/crictl-validate.sh

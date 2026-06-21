@@ -57,30 +57,7 @@ jobs:
         run: make release
 
       - name: Install Kubernetes, crun, crictl, CNI plugins, hydrophone
-        run: |
-          set -eux
-          cd /usr/local/bin
-          for b in kubeadm kubelet kubectl; do
-            sudo curl -fsSLo "$b" "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/$b"
-            sudo chmod +x "$b"
-          done
-          curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin
-          # crun is a drop-in OCI runtime (CLI-compatible with runc) but faster
-          # and lighter. The daemon execs "runc" from PATH, so install crun under
-          # both names: keep crun's real name for clarity and expose it as runc.
-          sudo curl -fsSLo /usr/local/bin/crun \
-            "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64"
-          sudo chmod +x /usr/local/bin/crun
-          sudo ln -sf /usr/local/bin/crun /usr/local/bin/runc
-          sudo mkdir -p /opt/cni/bin
-          curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
-            | sudo tar -xz -C /opt/cni/bin
-          curl -fsSL "https://github.com/flannel-io/cni-plugin/releases/download/v1.5.1-flannel2/cni-plugin-flannel-linux-amd64-v1.5.1-flannel2.tgz" \
-            | sudo tar -xz -C /opt/cni/bin
-          sudo sh -c 'test -f /opt/cni/bin/flannel || cp /opt/cni/bin/flannel-amd64 /opt/cni/bin/flannel' || true
-          go install sigs.k8s.io/hydrophone@latest
-          sudo cp "$(go env GOPATH)/bin/hydrophone" /usr/local/bin/hydrophone
+        run: sudo --preserve-env=K8S_VERSION,CRUN_VERSION,CRICTL_VERSION,CNI_PLUGINS_VERSION bash ci/install-tooling.sh
 
       - name: Bring up cluster on containerd-rs + run focused conformance
         env:
