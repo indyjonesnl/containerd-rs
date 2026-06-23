@@ -1111,26 +1111,95 @@ impl RuntimeService for RuntimeSvc {
         &self,
         request: Request<v1::StopContainerRequest>,
     ) -> Result<Response<v1::StopContainerResponse>, Status> {
-        let id = request.into_inner().container_id;
-        if let Some(mut rec) = self.get_container(&id)? {
+        let req = request.into_inner();
+        let id = req.container_id;
+        let timeout_secs = req.timeout; // 0 = force-kill immediately
+
+        if let Some(rec) = self.get_container(&id)? {
             if rec.state != ContainerState::Exited {
-                // Actually kill the runc container (SIGTERM); the supervision
-                // task observes the exit. Without this the process lingers and
-                // a kubelet restart hits a port conflict -> CrashLoop.
                 let runc_root = self.ctx.state_dir.join("runc");
-                let id2 = id.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    runtime::runc::kill(runtime::runc::DEFAULT_BIN, &runc_root, &id2, "SIGTERM")
-                })
-                .await;
-                rec.state = ContainerState::Exited;
-                rec.finished_at = Some(unix_nanos() as u64);
-                rec.exit_code = Some(0);
-                rec.reason = Some("Completed".to_string());
-                self.ctx
-                    .metadata
-                    .put(Kind::Container, self.ns(), &id, &rec)
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let ctx = self.ctx.clone();
+                let ns = self.ns().to_string();
+
+                // Step 1: Send SIGTERM (best-effort; runc may not know the
+                // container if it was never started).
+                {
+                    let runc_root2 = runc_root.clone();
+                    let id2 = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        runtime::runc::kill(
+                            runtime::runc::DEFAULT_BIN,
+                            &runc_root2,
+                            &id2,
+                            "SIGTERM",
+                        )
+                    })
+                    .await;
+                }
+
+                // Step 2: If timeout > 0, poll the metadata store until the
+                // supervise task flips the state to Exited (it calls child.wait()
+                // after runc run returns, which SIGTERM triggers).
+                let exited_gracefully = if timeout_secs > 0 {
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(timeout_secs as u64);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        match ctx
+                            .metadata
+                            .get::<ContainerRecord>(Kind::Container, &ns, &id)
+                        {
+                            Ok(Some(r)) if r.state == ContainerState::Exited => break true,
+                            _ => {}
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                    }
+                } else {
+                    // timeout=0: caller wants immediate force-kill.
+                    false
+                };
+
+                // Step 3: If still not exited, escalate to SIGKILL then
+                // force-delete the runc container to reap any process tree.
+                if !exited_gracefully {
+                    let runc_root2 = runc_root.clone();
+                    let id2 = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = runtime::runc::kill(
+                            runtime::runc::DEFAULT_BIN,
+                            &runc_root2,
+                            &id2,
+                            "KILL",
+                        );
+                        // Force-delete sweeps any surviving process tree even if
+                        // runc kill above raced or the init ignored the signal.
+                        let _ =
+                            runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root2, &id2);
+                    })
+                    .await;
+                }
+
+                // Step 4: Re-read the record — the supervise task may have already
+                // written the real exit code; only overwrite if still not Exited.
+                if let Ok(Some(mut updated)) =
+                    ctx.metadata
+                        .get::<ContainerRecord>(Kind::Container, &ns, &id)
+                {
+                    if updated.state != ContainerState::Exited {
+                        // Supervise task didn't update yet (or container was
+                        // Created, never Running). Record a forced exit.
+                        updated.state = ContainerState::Exited;
+                        updated.finished_at = Some(unix_nanos() as u64);
+                        // -1 signals a forced/unclean exit (not a graceful 0).
+                        updated.exit_code = Some(-1);
+                        updated.reason = Some("Error".to_string());
+                        ctx.metadata
+                            .put(Kind::Container, &ns, &id, &updated)
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                }
             }
         }
         Ok(Response::new(v1::StopContainerResponse {}))
@@ -1872,7 +1941,13 @@ async fn supervise_container(
         .arg(cid)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // Place runc and the container init in their own process group so that
+        // `runc delete --force` (sent by stop_container) can sweep any stray
+        // children that were reparented to init inside the group, and so that
+        // signals sent to the daemon do not accidentally reach the container.
+        // Stdio is already fully piped (not a terminal), so this is safe.
+        .process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -2043,8 +2118,14 @@ pub fn reconcile(ctx: &Context) -> Result<ReconcileReport, metadata::Error> {
 
     let containers: Vec<ContainerRecord> = ctx.metadata.list(Kind::Container, ns)?;
     report.containers = containers.len();
+    let runc_root = ctx.state_dir.join("runc");
     for mut c in containers {
         if c.state == ContainerState::Running {
+            // Best-effort force-delete to reap any process trees that were
+            // left behind by the previous daemon instance. This is safe to
+            // call even if the container is already gone (runc delete --force
+            // is idempotent on unknown containers).
+            let _ = runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root, &c.id);
             c.state = ContainerState::Unknown;
             ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
             report.marked_unknown += 1;
@@ -2745,6 +2826,14 @@ mod tests {
             .status
             .unwrap();
         assert_eq!(st.state, v1::ContainerState::ContainerExited as i32);
+        // stop_container must NOT hardcode exit_code=0. When the container was
+        // never running (Created state here, runc unavailable in unit tests),
+        // the force-kill path sets exit_code=-1 (runc spawn failed / not found).
+        // Any non-zero code is acceptable; 0 is the old buggy hardcoded value.
+        assert_ne!(
+            st.exit_code, 0,
+            "stop_container must not hardcode exit_code=0 — got 0, expected forced-kill exit"
+        );
 
         // Remove -> gone + bundle deleted.
         svc.remove_container(Request::new(v1::RemoveContainerRequest {

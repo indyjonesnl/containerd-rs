@@ -177,25 +177,39 @@ pub fn stats(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {
         .output()
 }
 
+/// Build the argument list for `runc kill`. Separated for unit-testability.
+pub fn kill_args(runc_root: &Path, id: &str, signal: &str) -> Vec<String> {
+    vec![
+        "--root".into(),
+        runc_root.to_string_lossy().into_owned(),
+        "kill".into(),
+        id.into(),
+        signal.into(),
+    ]
+}
+
+/// Build the argument list for `runc delete --force`. Separated for unit-testability.
+pub fn delete_force_args(runc_root: &Path, id: &str) -> Vec<String> {
+    vec![
+        "--root".into(),
+        runc_root.to_string_lossy().into_owned(),
+        "delete".into(),
+        "--force".into(),
+        id.into(),
+    ]
+}
+
 /// Send a signal to a container: `runc kill <id> <signal>`.
 pub fn kill(bin: &str, runc_root: &Path, id: &str, signal: &str) -> std::io::Result<Output> {
     Command::new(bin)
-        .arg("--root")
-        .arg(runc_root)
-        .arg("kill")
-        .arg(id)
-        .arg(signal)
+        .args(kill_args(runc_root, id, signal))
         .output()
 }
 
-/// Best-effort cleanup of a (possibly leftover) container: `runc delete -f <id>`.
+/// Best-effort cleanup of a (possibly leftover) container: `runc delete --force <id>`.
 pub fn delete(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {
     Command::new(bin)
-        .arg("--root")
-        .arg(runc_root)
-        .arg("delete")
-        .arg("--force")
-        .arg(id)
+        .args(delete_force_args(runc_root, id))
         .output()
 }
 
@@ -254,6 +268,55 @@ mod tests {
     use super::*;
     use crate::bundle::{generate_spec, write_bundle, ContainerRequest, ImageConfig, Resources};
     use std::os::unix::fs::PermissionsExt;
+
+    // kill_args builds the correct CLI argv for SIGTERM and SIGKILL escalation.
+    // This ensures stop_container sends the right signal to runc on both the
+    // graceful path (SIGTERM) and the forced-reap path (SIGKILL).
+    #[test]
+    fn kill_args_passes_signal_through() {
+        let root = std::path::Path::new("/var/run/containerd-rs/runc");
+        let sigterm_args = kill_args(root, "ctr-abc", "SIGTERM");
+        assert_eq!(
+            sigterm_args,
+            vec![
+                "--root",
+                "/var/run/containerd-rs/runc",
+                "kill",
+                "ctr-abc",
+                "SIGTERM"
+            ],
+        );
+        let sigkill_args = kill_args(root, "ctr-abc", "KILL");
+        assert_eq!(
+            sigkill_args,
+            vec![
+                "--root",
+                "/var/run/containerd-rs/runc",
+                "kill",
+                "ctr-abc",
+                "KILL"
+            ],
+            "SIGKILL escalation must use signal name KILL (not SIGKILL) for runc"
+        );
+    }
+
+    // delete_force_args builds `runc delete --force <id>` correctly.
+    // stop_container must force-delete after kill so process trees are reaped.
+    #[test]
+    fn delete_force_args_includes_force_flag() {
+        let root = std::path::Path::new("/var/run/containerd-rs/runc");
+        let args = delete_force_args(root, "ctr-xyz");
+        assert_eq!(
+            args,
+            vec![
+                "--root",
+                "/var/run/containerd-rs/runc",
+                "delete",
+                "--force",
+                "ctr-xyz",
+            ]
+        );
+    }
 
     // Regression for in-place resize (UpdateContainerResources): the requested
     // CPU/memory map to the right `runc update` flags; unset fields are omitted.
