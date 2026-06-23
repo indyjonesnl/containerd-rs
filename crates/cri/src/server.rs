@@ -982,6 +982,25 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|l| l.resources.as_ref())
                 .map(resources_record),
         };
+
+        // Touch the CRI LogPath synchronously so the kubelet / crictl can
+        // stat/open it as soon as the container is in the Created state.
+        // supervise_container will later re-open it for append, so we only
+        // need an empty placeholder here.  Errors are non-fatal — if the
+        // directory doesn't exist yet we still record the container.
+        if !rec.log_path.is_empty() {
+            let lp = std::path::Path::new(&rec.log_path);
+            if lp.is_absolute() {
+                if let Some(parent) = lp.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(lp);
+            }
+        }
+
         self.ctx
             .metadata
             .put(Kind::Container, self.ns(), &id, &rec)
@@ -2740,6 +2759,102 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(list.containers.is_empty());
+    }
+
+    /// kubectl logs fails with ENOENT when the CRI LogPath file is created lazily
+    /// (only when supervise_container starts).  The kubelet stats/opens the log
+    /// file as soon as the container is Created, so we must touch it synchronously
+    /// inside create_container.
+    #[tokio::test]
+    async fn log_path_exists_after_create() {
+        use core_types::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("pod-logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let ctx = test_context(dir.path());
+        let svc = RuntimeSvc { ctx: ctx.clone() };
+
+        // Seed image (same minimal config as container_create_status_list_stop_remove).
+        let cfg_json =
+            br#"{"config":{"Env":[],"Entrypoint":["/app"],"Cmd":[],"WorkingDir":"/","User":"0"}}"#;
+        let image_id = Digest::sha256(cfg_json);
+        ctx.content.write_blob("cfg", cfg_json, &image_id).unwrap();
+        ctx.metadata
+            .put(
+                Kind::Image,
+                ctx.namespace.as_str(),
+                "img2:latest",
+                &ImageRecord {
+                    name: "img2:latest".into(),
+                    target_digest: String::new(),
+                    image_id: image_id.to_string(),
+                    repo_tags: vec!["img2:latest".into()],
+                    repo_digests: vec![],
+                    size: cfg_json.len() as u64,
+                    layer_digests: vec![],
+                    chain_ids: vec![],
+                    user: String::new(),
+                },
+            )
+            .unwrap();
+
+        // Sandbox with an explicit log_directory so the relative container
+        // log_path ("c0.log") gets resolved to an absolute path.
+        let pod = svc
+            .run_pod_sandbox(Request::new(v1::RunPodSandboxRequest {
+                config: Some(v1::PodSandboxConfig {
+                    metadata: Some(v1::PodSandboxMetadata {
+                        name: "pod2".into(),
+                        uid: "u2".into(),
+                        namespace: "default".into(),
+                        attempt: 0,
+                    }),
+                    log_directory: log_dir.to_str().unwrap().to_string(),
+                    linux: Some(v1::LinuxPodSandboxConfig {
+                        security_context: Some(v1::LinuxSandboxSecurityContext {
+                            namespace_options: Some(v1::NamespaceOption {
+                                network: v1::NamespaceMode::Node as i32,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                runtime_handler: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+
+        // create_container — the log file must exist on disk IMMEDIATELY after
+        // this call returns (before start_container / supervise_container run).
+        svc.create_container(Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: pod.clone(),
+            config: Some(v1::ContainerConfig {
+                metadata: Some(v1::ContainerMetadata {
+                    name: "c0".into(),
+                    attempt: 0,
+                }),
+                image: image_spec("img2:latest"),
+                log_path: "c0.log".into(),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }))
+        .await
+        .unwrap();
+
+        let expected_log = log_dir.join("c0.log");
+        assert!(
+            expected_log.exists(),
+            "CRI LogPath {:?} must exist after create_container (kubectl logs must not ENOENT)",
+            expected_log,
+        );
     }
 
     #[tokio::test]
