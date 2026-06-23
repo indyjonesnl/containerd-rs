@@ -1,0 +1,27 @@
+name: conformance-sig-api-machinery
+
+# Manual: run the sig-api-machinery [Conformance] slice on containerd-rs.
+# CRDs, admission webhooks, watch, namespaces, garbage collection, resource quota, and server-side apply — the apiserver contract.
+#
+# Conformance is expensive and CI minutes are limited, so this is manual only.
+# Validate locally first with: make conformance-docker FOCUS='\[sig-api-machinery\].*\[Conformance\]'
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.35.6"
+      focus:
+        description: "ginkgo --focus regex (narrow to a subset for a cheap validation run)"
+        default: '\[sig-api-machinery\].*\[Conformance\]'
+
+permissions:
+  contents: read
+
+jobs:
+  sig-api-machinery:
+    uses: ./.github/workflows/conformance-reusable.yml
+    with:
+      focus: ${{ inputs.focus }}
+      artifact_name: conformance-sig-api-machinery
+      k8s_version: ${{ inputs.k8s_version }}

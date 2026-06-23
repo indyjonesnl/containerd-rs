@@ -1,0 +1,27 @@
+name: conformance-sig-scheduling
+
+# Manual: run the sig-scheduling [Conformance] slice on containerd-rs.
+# Predicates and basic scheduling — node selectors, taints/tolerations, resource fit.
+#
+# Conformance is expensive and CI minutes are limited, so this is manual only.
+# Validate locally first with: make conformance-docker FOCUS='\[sig-scheduling\].*\[Conformance\]'
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: "Kubernetes version (cluster + conformance image)"
+        default: "v1.35.6"
+      focus:
+        description: "ginkgo --focus regex (narrow to a subset for a cheap validation run)"
+        default: '\[sig-scheduling\].*\[Conformance\]'
+
+permissions:
+  contents: read
+
+jobs:
+  sig-scheduling:
+    uses: ./.github/workflows/conformance-reusable.yml
+    with:
+      focus: ${{ inputs.focus }}
+      artifact_name: conformance-sig-scheduling
+      k8s_version: ${{ inputs.k8s_version }}

@@ -1,8 +1,14 @@
 # containerd-rs
 
 [![conformance-sig-node](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-node.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-node.yml)
+[![conformance-sig-api-machinery](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-api-machinery.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-api-machinery.yml)
 [![conformance-sig-storage](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-storage.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-storage.yml)
+[![conformance-sig-apps](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-apps.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-apps.yml)
 [![conformance-sig-network](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-network.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-network.yml)
+[![conformance-sig-cli](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-cli.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-cli.yml)
+[![conformance-sig-scheduling](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-scheduling.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-scheduling.yml)
+[![conformance-sig-auth](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-auth.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-auth.yml)
+[![conformance-sig-instrumentation](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-instrumentation.yml/badge.svg)](https://github.com/indyjonesnl/containerd-rs/actions/workflows/conformance-sig-instrumentation.yml)
 
 A Rust reimplementation of [containerd](https://containerd.io)'s kubelet-facing
 surface: a daemon that serves the **Kubernetes CRI v1** API (`RuntimeService` +
@@ -112,19 +118,35 @@ make conformance-smoke   # one Conformance test (fast pipeline check)
 make conformance         # full [Conformance] suite -> conformance-results/
 ```
 
-In CI the suite is split into three manual (`workflow_dispatch`) per-sig
-workflows, each building the daemon, installing the Kubernetes toolchain,
-bringing up the cluster on a real runner, and running its slice via hydrophone
-(they share `conformance-reusable.yml`):
+In CI the suite is split into manual (`workflow_dispatch`) per-sig workflows,
+each building the daemon, installing the Kubernetes toolchain, bringing up the
+cluster on a real runner, and running its slice via hydrophone (they share
+`conformance-reusable.yml`). The split covers **441** of the `[Conformance]`
+specs across nine SIGs (`registry.k8s.io/conformance:v1.35.6`):
 
-| Workflow | Focus | Asserts |
-|----------|-------|---------|
-| `conformance-sig-node.yml` | `[sig-node]` | runtime/CRI on the node: lifecycle, exec/attach, probes, security context, env, sysctls, ephemeral containers |
-| `conformance-sig-storage.yml` | `[sig-storage]` | volume/mount path: emptyDir, configMap/secret/projected/downwardAPI volumes, subpaths |
-| `conformance-sig-network.yml` | `[sig-network]` | pod networking, Services/ClusterIP, DNS, hostPort |
+| Workflow | Focus | Specs | Asserts |
+|----------|-------|------:|---------|
+| `conformance-sig-node.yml` | `[sig-node]` | 105 | runtime/CRI on the node: lifecycle, exec/attach, probes, security context, env, sysctls, ephemeral containers |
+| `conformance-sig-api-machinery.yml` | `[sig-api-machinery]` | 95 | apiserver contract: CRDs, admission webhooks, watch, namespaces, garbage collection, resource quota, server-side apply |
+| `conformance-sig-storage.yml` | `[sig-storage]` | 91 | volume/mount path: emptyDir, configMap/secret/projected/downwardAPI volumes, subpaths |
+| `conformance-sig-apps.yml` | `[sig-apps]` | 60 | workload controllers: Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob (rolling updates, scale, ordered bring-up) |
+| `conformance-sig-network.yml` | `[sig-network]` | 47 | pod networking, Services/ClusterIP, DNS, hostPort |
+| `conformance-sig-cli.yml` | `[sig-cli]` | 17 | kubectl behaviours: create/apply/run/expose/patch/label |
+| `conformance-sig-scheduling.yml` | `[sig-scheduling]` | 11 | predicates and basic scheduling: node selectors, taints/tolerations, resource fit |
+| `conformance-sig-auth.yml` | `[sig-auth]` | 10 | ServiceAccount tokens, projected SA volumes, related authn/authz |
+| `conformance-sig-instrumentation.yml` | `[sig-instrumentation]` | 4 | Events API lifecycle: create/patch/delete/list |
 
-They run only on demand (conformance is expensive; CI minutes are limited). The
-status badges at the top of this README reflect each workflow's latest run.
+A few `[Conformance]` specs structurally require a **multi-node** cluster (they
+fail with "needs a cluster with at least 2 nodes") and so cannot pass on this
+single-node setup — `[sig-architecture] … should have at least two untainted
+nodes` (no workflow) and `[sig-apps] Daemon set [Serial] should rollback without
+unnecessary restarts`. `ci/run-conformance.sh` skips these by default (`SKIP`
+regex, overridable); they are environmental, not runtime, limitations.
+
+They run only on demand (conformance is expensive; CI minutes are limited), and
+each can be validated locally first with the docker harness, e.g.
+`make conformance-docker FOCUS='\[sig-apps\].*\[Conformance\]'`. The status
+badges at the top of this README reflect each workflow's latest run.
 
 ## Testing
 
