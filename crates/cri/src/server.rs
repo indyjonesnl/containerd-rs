@@ -916,6 +916,14 @@ impl RuntimeService for RuntimeSvc {
                 .unwrap_or_default(),
             cgroup_path: (!sandbox.cgroup_parent.is_empty())
                 .then(|| cgroups_path(&sandbox.cgroup_parent, &id)),
+            add_capabilities: sec_ctx
+                .and_then(|sc| sc.capabilities.as_ref())
+                .map(|c| c.add_capabilities.clone())
+                .unwrap_or_default(),
+            drop_capabilities: sec_ctx
+                .and_then(|sc| sc.capabilities.as_ref())
+                .map(|c| c.drop_capabilities.clone())
+                .unwrap_or_default(),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
