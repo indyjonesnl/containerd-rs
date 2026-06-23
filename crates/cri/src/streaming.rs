@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Path as AxPath, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -339,6 +339,12 @@ async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) 
                 .into(),
             ))
             .await;
+        let _ = sink
+            .send(Message::Close(Some(CloseFrame {
+                code: close_code::NORMAL,
+                reason: "unknown or expired exec token".into(),
+            })))
+            .await;
         return;
     };
 
@@ -355,6 +361,12 @@ async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) 
                 .send(Message::Binary(
                     frame(CH_ERROR, &spdy::status_failure(&format!("runc exec: {e}"))).into(),
                 ))
+                .await;
+            let _ = sink
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::NORMAL,
+                    reason: "exec spawn failed".into(),
+                })))
                 .await;
             return;
         }
@@ -454,7 +466,12 @@ async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) 
             ))
             .await;
     }
-    let _ = sink.send(Message::Close(None)).await;
+    let _ = sink
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::NORMAL,
+            reason: "".into(),
+        })))
+        .await;
 }
 
 async fn attach_entry(
@@ -907,5 +924,48 @@ mod tests {
     fn frame_prefixes_channel() {
         assert_eq!(frame(CH_STDOUT, b"hi"), vec![1, b'h', b'i']);
         assert_eq!(frame(CH_ERROR, b""), vec![3]);
+    }
+
+    /// A WebSocket Close with no code (None) should never reach the client;
+    /// every exec exit — including the token-miss early return — must carry a
+    /// numeric close code so kubectl does not see 1005 "no status received".
+    ///
+    /// This test exercises the token-miss branch of `handle_exec` without
+    /// requiring runc: we connect with an unknown token and expect the server
+    /// to send a WS Close frame whose code is 1000 (Normal).
+    #[tokio::test]
+    async fn exec_ws_close_carries_code_on_token_miss() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as TMsg;
+
+        let sessions = Arc::new(Sessions::new(PathBuf::from("/run/x")));
+        let app = router(sessions.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Connect with a made-up (never registered) token — triggers the
+        // `take_exec` miss branch inside `handle_exec`.
+        let url = format!("ws://{addr}/exec/deadbeef-no-such-token");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+        let mut got_coded_close = false;
+        while let Some(Ok(msg)) = ws.next().await {
+            if let TMsg::Close(Some(frame)) = msg {
+                let code_u16: u16 = frame.code.into();
+                assert_eq!(
+                    code_u16, 1000,
+                    "expected close code 1000 (Normal), got {code_u16}"
+                );
+                got_coded_close = true;
+                break;
+            }
+        }
+        assert!(
+            got_coded_close,
+            "exec token-miss path must send a Close frame with a code (got bare drop / Close(None))"
+        );
     }
 }
