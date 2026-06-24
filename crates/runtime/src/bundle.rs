@@ -449,9 +449,12 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     };
     spec.set_process(Some(process));
     spec.set_root(Some(root));
-    if let Some(h) = &req.hostname {
-        spec.set_hostname(Some(h.clone()));
-    }
+    // Set the hostname from the request unconditionally — clearing it when the
+    // request has none. oci_spec's Spec::default() hardcodes hostname="youki";
+    // overriding only on Some would leak that bogus default into hostNetwork
+    // pods (and any pod with an empty CRI hostname), which then `inherit` the
+    // sandbox/host UTS instead.
+    spec.set_hostname(req.hostname.clone());
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     add_bind_mounts(&mut spec, &req.mounts);
     // Resource limits require a delegated cgroup (cgroupsPath under the kubelet's
@@ -814,6 +817,28 @@ mod tests {
         // Round-trips back through the parser.
         let reloaded = Spec::load(&config).unwrap();
         assert_eq!(reloaded.hostname().as_deref(), Some("pod-xyz"));
+    }
+
+    #[test]
+    fn no_hostname_does_not_leak_oci_spec_default() {
+        // oci_spec::runtime::Spec::default() hardcodes hostname="youki"; a
+        // request with no hostname (hostNetwork pod, or an empty CRI hostname)
+        // must NOT leak that bogus value — the container inherits the
+        // sandbox/host UTS instead. Regression guard for the "from-youki" leak.
+        let dir = tempfile::tempdir().unwrap();
+        let i = img();
+        let r = ContainerRequest {
+            hostname: None,
+            ..Default::default()
+        };
+        let rootfs = dir.path().join("merged");
+        let spec = generate_spec(&i, &r, &rootfs).unwrap();
+        assert_eq!(
+            spec.hostname().as_deref(),
+            None,
+            "hostname must be cleared when the request has none (got {:?})",
+            spec.hostname()
+        );
     }
 
     // ---------- capabilities tests ----------
