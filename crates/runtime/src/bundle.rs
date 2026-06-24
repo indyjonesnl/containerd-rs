@@ -238,9 +238,14 @@ fn parse_cap(name: &str) -> Option<Capability> {
 /// Algorithm:
 ///  1. Start from the default process caps already in `spec` (the containerd
 ///     default 14-cap set written by [`default_capabilities`]).
-///  2. Insert each parsed `add` capability (or the full set for `"ALL"`).
-///  3. Remove each parsed `drop` capability (or the full set for `"ALL"`).
-///  4. Write the result to bounding/effective/permitted/inheritable.
+///  2. Remove each parsed `drop` capability (or the full set for `"ALL"`).
+///  3. Insert each parsed `add` capability (or the full set for `"ALL"`) — adds
+///     are applied after drops so an add wins over a `drop: [ALL]`.
+///  4. Write the result to bounding/effective/permitted/inheritable **and
+///     ambient** — explicitly-requested caps must be ambient so a non-root
+///     process keeps them across `execve` (e.g. CoreDNS runs as uid 65532 and
+///     adds only `NET_BIND_SERVICE` to bind :53; without ambient, crun drops it
+///     on exec and CoreDNS crashloops). This is what containerd's CRI emits.
 fn apply_capabilities(spec: &mut Spec, add: &[String], drop: &[String]) {
     if add.is_empty() && drop.is_empty() {
         return;
@@ -253,6 +258,25 @@ fn apply_capabilities(spec: &mut Spec, add: &[String], drop: &[String]) {
         .and_then(|p| p.capabilities().as_ref())
         .and_then(|c| c.bounding().clone())
         .unwrap_or_default();
+
+    // Apply drops FIRST, then adds — so adds win when the same cap (or "ALL") is
+    // both dropped and added. This is the CRI/containerd semantic and is what the
+    // canonical hardening pattern `drop: [ALL], add: [NET_BIND_SERVICE]` (e.g.
+    // CoreDNS) relies on: drop ALL clears the set, then the add re-grants the one
+    // cap. Applying adds first would let `drop ALL` erase the just-added cap,
+    // leaving the container with no capabilities at all.
+    for name in drop {
+        let upper = name.trim().to_uppercase();
+        let mut key = upper.as_str();
+        while let Some(s) = key.strip_prefix("CAP_") {
+            key = s;
+        }
+        if key == "ALL" {
+            cap_set.clear();
+        } else if let Some(cap) = parse_cap(name) {
+            cap_set.remove(&cap);
+        }
+    }
 
     // Apply adds.  `parse_cap` returns None for "ALL"; we handle that separately.
     for name in add {
@@ -268,27 +292,7 @@ fn apply_capabilities(spec: &mut Spec, add: &[String], drop: &[String]) {
         }
     }
 
-    // Apply drops.
-    for name in drop {
-        let upper = name.trim().to_uppercase();
-        let mut key = upper.as_str();
-        while let Some(s) = key.strip_prefix("CAP_") {
-            key = s;
-        }
-        if key == "ALL" {
-            cap_set.clear();
-        } else if let Some(cap) = parse_cap(name) {
-            cap_set.remove(&cap);
-        }
-    }
-
-    if let Ok(lc) = LinuxCapabilitiesBuilder::default()
-        .bounding(cap_set.clone())
-        .effective(cap_set.clone())
-        .permitted(cap_set.clone())
-        .inheritable(cap_set)
-        .build()
-    {
+    if let Some(lc) = build_caps(cap_set.clone(), cap_set) {
         if let Some(mut process) = spec.process().clone() {
             process.set_capabilities(Some(lc));
             spec.set_process(Some(process));
@@ -851,6 +855,42 @@ mod tests {
                 .map(|s| s.contains(&Capability::NetAdmin))
                 .unwrap_or(false),
             "permitted must contain NetAdmin"
+        );
+        // Added caps must also be ambient, or a non-root process loses them on
+        // execve (crun does not silently retain them — see apply_capabilities).
+        assert!(
+            caps.ambient()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "ambient must contain NetAdmin"
+        );
+    }
+
+    /// Regression (crun CoreDNS crashloop): a container that drops ALL caps and
+    /// adds only NET_BIND_SERVICE — the CoreDNS security context — must carry
+    /// NET_BIND_SERVICE in the ambient set so the non-root process can bind :53.
+    #[test]
+    fn capabilities_drop_all_add_net_bind_is_ambient() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            drop_capabilities: vec!["ALL".into()],
+            add_capabilities: vec!["NET_BIND_SERVICE".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("rootfs")).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .clone()
+            .expect("capabilities must be set");
+        let ambient = caps.ambient().clone().expect("ambient set");
+        assert_eq!(
+            ambient,
+            std::collections::HashSet::from([Capability::NetBindService]),
+            "ambient must be exactly {{NET_BIND_SERVICE}} after drop ALL + add"
         );
     }
 
