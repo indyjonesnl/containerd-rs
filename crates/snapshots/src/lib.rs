@@ -2,7 +2,7 @@
 //!
 //! This module implements the parts of the snapshotter that are pure and
 //! portable: the overlay mount-option construction (which must produce
-//! kernel-valid, runc-acceptable mounts) and snapshot path layout. The actual
+//! kernel-valid, crun-acceptable mounts) and snapshot path layout. The actual
 //! `mount(2)` syscall is performed by [`mount_overlay`], which requires root and
 //! is therefore only exercised in privileged integration tests.
 

@@ -17,7 +17,7 @@
 #   K8S_VERSION  kubernetes version (default v1.35.6)
 #   POD_CIDR     pod network CIDR (default 10.244.0.0/16)
 #   NODE_NAME    node name (default crs-node)
-#   RUNC_SRC     if set, copy this runc binary to /usr/local/bin/runc (Docker harness)
+#   CRUN_SRC     if set, copy this crun binary to /usr/local/bin/crun (Docker harness)
 set -euo pipefail
 
 K8S_VERSION="${K8S_VERSION:-v1.35.6}"
@@ -49,8 +49,8 @@ prepare_host() {
     apt-get update -qq >/dev/null 2>&1 || true
     apt-get install -y -qq ca-certificates iproute2 iptables ethtool socat conntrack kmod procps iputils-ping >/dev/null 2>&1 || true
   fi
-  if [[ -n "${RUNC_SRC:-}" && -f "${RUNC_SRC}" ]]; then
-    cp "${RUNC_SRC}" /usr/local/bin/runc && chmod +x /usr/local/bin/runc
+  if [[ -n "${CRUN_SRC:-}" && -f "${CRUN_SRC}" ]]; then
+    cp "${CRUN_SRC}" /usr/local/bin/crun && chmod +x /usr/local/bin/crun
   fi
   modprobe br_netfilter 2>/dev/null || true
   modprobe overlay 2>/dev/null || true

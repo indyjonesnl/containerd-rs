@@ -4,7 +4,7 @@
 //! `specs/001-rust-containerd/contracts/cri-v1.md`: ListImages, ImageStatus on a
 //! hit and a miss, RemoveImage idempotency, ImageFsInfo, and PullImage argument
 //! handling. The real network pull (honoring `PullImageRequest.Auth`) is gated
-//! behind `#[ignore]`. Requires no runc.
+//! behind `#[ignore]`. Requires no crun.
 
 mod common;
 

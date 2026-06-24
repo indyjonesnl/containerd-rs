@@ -79,20 +79,20 @@ pub struct Sessions {
     attach: Mutex<HashMap<String, AttachSession>>,
     /// Per-running-container live-output broadcast buses (for Attach / log follow).
     live: Mutex<HashMap<String, tokio::sync::broadcast::Sender<LiveFrame>>>,
-    runc_root: PathBuf,
-    runc_bin: String,
+    crun_root: PathBuf,
+    crun_bin: String,
     counter: AtomicU64,
 }
 
 impl Sessions {
-    pub fn new(runc_root: PathBuf) -> Self {
+    pub fn new(crun_root: PathBuf) -> Self {
         Self {
             exec: Mutex::new(HashMap::new()),
             portforward: Mutex::new(HashMap::new()),
             attach: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
-            runc_root,
-            runc_bin: runtime::runc::DEFAULT_BIN.to_string(),
+            crun_root,
+            crun_bin: runtime::crun::DEFAULT_BIN.to_string(),
             counter: AtomicU64::new(0),
         }
     }
@@ -310,7 +310,7 @@ fn frame(channel: u8, data: &[u8]) -> Vec<u8> {
 /// can transparently proxy a *client* WebSocket to the runtime streaming server
 /// (so the kubelet→runtime leg is not always SPDY); the conformance test
 /// "remote command execution over websockets" lands here. We spawn
-/// `runc::exec_streaming` and multiplex on the v4/v5 channels: client stdin on
+/// `crun::exec_streaming` and multiplex on the v4/v5 channels: client stdin on
 /// channel 0 → process; process stdout/stderr → channels 1/2 as produced; the
 /// exit-code metav1.Status on channel 3 (error). Resize (4) and the v5 close
 /// channel (255) are drained.
@@ -348,9 +348,9 @@ async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) 
         return;
     };
 
-    let handle = match runtime::runc::exec_streaming(
-        &sessions.runc_bin,
-        &sessions.runc_root,
+    let handle = match runtime::crun::exec_streaming(
+        &sessions.crun_bin,
+        &sessions.crun_root,
         &session.container_id,
         &session.cmd,
         session.tty,
@@ -359,7 +359,7 @@ async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) 
         Err(e) => {
             let _ = sink
                 .send(Message::Binary(
-                    frame(CH_ERROR, &spdy::status_failure(&format!("runc exec: {e}"))).into(),
+                    frame(CH_ERROR, &spdy::status_failure(&format!("crun exec: {e}"))).into(),
                 ))
                 .await;
             let _ = sink
@@ -371,7 +371,7 @@ async fn handle_exec(socket: WebSocket, sessions: Arc<Sessions>, token: String) 
             return;
         }
     };
-    let runtime::runc::ExecHandle {
+    let runtime::crun::ExecHandle {
         mut child,
         mut stdin,
         mut stdout,
@@ -696,9 +696,9 @@ where
     let (error_id, stdout_id, stderr_id, stdin_rx) =
         collect_rc_streams(&mut server, session.stdin, session.stdout, want_stderr).await;
 
-    let handle = match runtime::runc::exec_streaming(
-        &sessions.runc_bin,
-        &sessions.runc_root,
+    let handle = match runtime::crun::exec_streaming(
+        &sessions.crun_bin,
+        &sessions.crun_root,
         &session.container_id,
         &session.cmd,
         session.tty,
@@ -707,14 +707,14 @@ where
         Err(e) => {
             if let Some(eid) = error_id {
                 let _ = writer
-                    .send_data(eid, true, &spdy::status_failure(&format!("runc exec: {e}")))
+                    .send_data(eid, true, &spdy::status_failure(&format!("crun exec: {e}")))
                     .await;
             }
             let _ = writer.goaway(0).await;
             return;
         }
     };
-    let runtime::runc::ExecHandle {
+    let runtime::crun::ExecHandle {
         mut child,
         mut stdin,
         mut stdout,
@@ -931,7 +931,7 @@ mod tests {
     /// numeric close code so kubectl does not see 1005 "no status received".
     ///
     /// This test exercises the token-miss branch of `handle_exec` without
-    /// requiring runc: we connect with an unknown token and expect the server
+    /// requiring crun: we connect with an unknown token and expect the server
     /// to send a WS Close frame whose code is 1000 (Normal).
     #[tokio::test]
     async fn exec_ws_close_carries_code_on_token_miss() {

@@ -4,7 +4,7 @@
 //! CreateContainer → StartContainer → logs → ExecSync → StopContainer →
 //! RemoveContainer → StopPodSandbox → RemovePodSandbox — against the real gRPC
 //! server, asserting the container state transitions (CREATED → RUNNING →
-//! EXITED) and that logs + exec work. Requires runc (rootless) + network for the
+//! EXITED) and that logs + exec work. Requires crun (rootless) + network for the
 //! image pull, so it is `#[ignore]`d:
 //!   cargo test -p cri --test integration_pod_lifecycle -- --ignored
 
@@ -58,7 +58,7 @@ async fn container_state(h: &mut common::Harness, cid: &str) -> i32 {
 }
 
 #[tokio::test]
-#[ignore = "requires rootless runc + network (pulls busybox)"]
+#[ignore = "requires rootless crun + network (pulls busybox)"]
 async fn full_pod_lifecycle() {
     let mut h = common::start().await;
     let logdir = tempfile::tempdir().unwrap();

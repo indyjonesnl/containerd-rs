@@ -31,7 +31,7 @@ impl Drop for Harness {
 }
 
 /// Start a fresh in-process CRI server (empty stores, host networking) and
-/// return connected clients. Requires no runc/network.
+/// return connected clients. Requires no crun/network.
 pub async fn start() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("cri.sock");

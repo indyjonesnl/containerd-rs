@@ -1,7 +1,7 @@
 //! Pod sandbox networking.
 //!
 //! Full CNI networking (per-pod netns + veth + routable IP) requires root, so a
-//! rootless daemon falls back to **host networking**: rootless `runc` containers
+//! rootless daemon falls back to **host networking**: rootless `crun` containers
 //! share the host network namespace by default, so all containers in a pod (and
 //! across pods) share networking and reach each other over `localhost`. The pod
 //! IP reported to the kubelet is therefore the host's primary address.

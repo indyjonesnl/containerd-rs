@@ -4,13 +4,13 @@
 # musl build produced by that workflow.
 #
 # A CRI runtime is normally a host binary; this image is for kind-style node
-# images / CI. It carries the runtime deps the daemon shells out to: runc (the
+# images / CI. It carries the runtime deps the daemon shells out to: crun (the
 # OCI runtime), iproute2 + iptables (CNI / pod networking), and ca-certificates
 # (registry pulls over TLS).
 FROM debian:bookworm-slim
 ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables runc \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables crun \
     && rm -rf /var/lib/apt/lists/*
 # --chmod=0755: actions/upload-artifact strips the execute bit (the binary
 # arrives here 0644 after the artifact round-trip), and plain COPY preserves

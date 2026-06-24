@@ -1,15 +1,16 @@
-//! Thin wrapper over the `runc` OCI runtime CLI.
+//! Thin wrapper over the `crun` OCI runtime CLI.
 //!
-//! This is the daemon-side equivalent of what `containerd-shim-runc-v2` does:
-//! drive `runc` against an OCI bundle. We shell out (as containerd does) rather
+//! This is the daemon-side equivalent of what `containerd-shim-crun-v2` does:
+//! drive `crun` against an OCI bundle. We shell out (as containerd does) rather
 //! than embedding a runtime, so the container process is supervised out of the
-//! daemon's address space.
+//! daemon's address space. `crun` is CLI-compatible with `runc`, so the same
+//! `run`/`exec`/`state`/`kill`/`delete`/`update`/`events` verbs apply.
 
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Runtime binary to invoke (overridable for crun/youki, which share the CLI).
-pub const DEFAULT_BIN: &str = "runc";
+/// Runtime binary to invoke (overridable for runc/youki, which share the CLI).
+pub const DEFAULT_BIN: &str = "crun";
 
 /// Whether a runtime binary is on `PATH`.
 pub fn available(bin: &str) -> bool {
@@ -20,15 +21,15 @@ pub fn available(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Run a container to completion: `runc --root <root> run --bundle <bundle> <id>`.
+/// Run a container to completion: `crun --root <root> run --bundle <bundle> <id>`.
 ///
-/// `runc run` performs create + start + wait + delete, returning the captured
+/// `crun run` performs create + start + wait + delete, returning the captured
 /// stdout/stderr and exit status. The bundle must contain `config.json` and a
 /// populated `rootfs/`.
-pub fn run(bin: &str, runc_root: &Path, bundle_dir: &Path, id: &str) -> std::io::Result<Output> {
+pub fn run(bin: &str, crun_root: &Path, bundle_dir: &Path, id: &str) -> std::io::Result<Output> {
     Command::new(bin)
         .arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("run")
         .arg("--bundle")
         .arg(bundle_dir)
@@ -37,13 +38,13 @@ pub fn run(bin: &str, runc_root: &Path, bundle_dir: &Path, id: &str) -> std::io:
 }
 
 /// Run a TTY container and return the PTY master fd. A `terminal: true` container
-/// cannot share runc's foreground stdio, so we bind a console socket, launch
-/// `runc run --detach --console-socket`, and receive the master end of the pty
-/// that runc passes back over the socket (SCM_RIGHTS). The caller pumps the
+/// cannot share crun's foreground stdio, so we bind a console socket, launch
+/// `crun run --detach --console-socket`, and receive the master end of the pty
+/// that crun passes back over the socket (SCM_RIGHTS). The caller pumps the
 /// master (container stdout/stdin) and reaps the container on EOF.
 pub fn run_tty(
     bin: &str,
-    runc_root: &Path,
+    crun_root: &Path,
     bundle_dir: &Path,
     id: &str,
     console_sock: &Path,
@@ -51,11 +52,11 @@ pub fn run_tty(
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(console_sock);
     let listener = UnixListener::bind(console_sock)?;
-    // Detached, so this returns once the container is created+started; runc
+    // Detached, so this returns once the container is created+started; crun
     // connects to the console socket during setup to hand over the pty master.
     let mut child = Command::new(bin)
         .arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("run")
         .arg("--detach")
         .arg("--console-socket")
@@ -70,14 +71,14 @@ pub fn run_tty(
     let master = master?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
-            "runc run --detach exited with {status}"
+            "crun run --detach exited with {status}"
         )));
     }
     Ok(master)
 }
 
 /// Receive a single file descriptor sent over a unix socket via `SCM_RIGHTS`
-/// (runc's console-socket protocol passes the pty master this way).
+/// (crun's console-socket protocol passes the pty master this way).
 fn recv_console_fd(conn: &std::os::unix::net::UnixStream) -> std::io::Result<std::os::fd::OwnedFd> {
     use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
     use std::io::IoSliceMut;
@@ -97,32 +98,32 @@ fn recv_console_fd(conn: &std::os::unix::net::UnixStream) -> std::io::Result<std
     Err(std::io::Error::other("console socket sent no fd"))
 }
 
-/// Query container state: `runc state <id>`. Exit status is success once the
-/// container exists in the runc state dir. Used to close the race between our
-/// async `runc run` and an immediately-following `exec` (e.g. a postStart hook).
-pub fn state(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {
+/// Query container state: `crun state <id>`. Exit status is success once the
+/// container exists in the crun state dir. Used to close the race between our
+/// async `crun run` and an immediately-following `exec` (e.g. a postStart hook).
+pub fn state(bin: &str, crun_root: &Path, id: &str) -> std::io::Result<Output> {
     Command::new(bin)
         .arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("state")
         .arg(id)
         .output()
 }
 
-/// Execute a command inside a running container: `runc exec <id> <cmd...>`.
+/// Execute a command inside a running container: `crun exec <id> <cmd...>`.
 /// Captures stdout/stderr/exit. Used by CRI `ExecSync` and the streaming exec.
-pub fn exec(bin: &str, runc_root: &Path, id: &str, cmd: &[String]) -> std::io::Result<Output> {
+pub fn exec(bin: &str, crun_root: &Path, id: &str, cmd: &[String]) -> std::io::Result<Output> {
     Command::new(bin)
         .arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("exec")
         .arg(id)
         .args(cmd)
         .output()
 }
 
-/// A live `runc exec` with piped stdio, for interactive streaming exec (the SPDY
-/// `remotecommand` path). `stderr` is `None` for a TTY exec (runc merges it into
+/// A live `crun exec` with piped stdio, for interactive streaming exec (the SPDY
+/// `remotecommand` path). `stderr` is `None` for a TTY exec (crun merges it into
 /// stdout). Caller pumps the handles to the client's streams and awaits `child`.
 pub struct ExecHandle {
     pub child: tokio::process::Child,
@@ -131,19 +132,19 @@ pub struct ExecHandle {
     pub stderr: Option<tokio::process::ChildStderr>,
 }
 
-/// Spawn `runc --root <root> exec [-t] <id> <cmd...>` with piped stdin/stdout
+/// Spawn `crun --root <root> exec [-t] <id> <cmd...>` with piped stdin/stdout
 /// (and stderr when not a TTY) for bidirectional streaming. Unlike [`exec`],
 /// this does not block — the caller drives the streams and waits on the child.
 pub fn exec_streaming(
     bin: &str,
-    runc_root: &Path,
+    crun_root: &Path,
     id: &str,
     cmd: &[String],
     tty: bool,
 ) -> std::io::Result<ExecHandle> {
     use std::process::Stdio;
     let mut command = tokio::process::Command::new(bin);
-    command.arg("--root").arg(runc_root).arg("exec");
+    command.arg("--root").arg(crun_root).arg("exec");
     if tty {
         command.arg("-t");
     }
@@ -165,74 +166,74 @@ pub fn exec_streaming(
     })
 }
 
-/// Sample one-shot cgroup stats for a container: `runc events --stats <id>`.
+/// Sample one-shot cgroup stats for a container: `crun events --stats <id>`.
 /// Emits a single JSON `{"type":"stats","data":{...}}` line.
-pub fn stats(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {
+pub fn stats(bin: &str, crun_root: &Path, id: &str) -> std::io::Result<Output> {
     Command::new(bin)
         .arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("events")
         .arg("--stats")
         .arg(id)
         .output()
 }
 
-/// Build the argument list for `runc kill`. Separated for unit-testability.
-pub fn kill_args(runc_root: &Path, id: &str, signal: &str) -> Vec<String> {
+/// Build the argument list for `crun kill`. Separated for unit-testability.
+pub fn kill_args(crun_root: &Path, id: &str, signal: &str) -> Vec<String> {
     vec![
         "--root".into(),
-        runc_root.to_string_lossy().into_owned(),
+        crun_root.to_string_lossy().into_owned(),
         "kill".into(),
         id.into(),
         signal.into(),
     ]
 }
 
-/// Build the argument list for `runc delete --force`. Separated for unit-testability.
-pub fn delete_force_args(runc_root: &Path, id: &str) -> Vec<String> {
+/// Build the argument list for `crun delete --force`. Separated for unit-testability.
+pub fn delete_force_args(crun_root: &Path, id: &str) -> Vec<String> {
     vec![
         "--root".into(),
-        runc_root.to_string_lossy().into_owned(),
+        crun_root.to_string_lossy().into_owned(),
         "delete".into(),
         "--force".into(),
         id.into(),
     ]
 }
 
-/// Send a signal to a container: `runc kill <id> <signal>`.
-pub fn kill(bin: &str, runc_root: &Path, id: &str, signal: &str) -> std::io::Result<Output> {
+/// Send a signal to a container: `crun kill <id> <signal>`.
+pub fn kill(bin: &str, crun_root: &Path, id: &str, signal: &str) -> std::io::Result<Output> {
     Command::new(bin)
-        .args(kill_args(runc_root, id, signal))
+        .args(kill_args(crun_root, id, signal))
         .output()
 }
 
-/// Best-effort cleanup of a (possibly leftover) container: `runc delete --force <id>`.
-pub fn delete(bin: &str, runc_root: &Path, id: &str) -> std::io::Result<Output> {
+/// Best-effort cleanup of a (possibly leftover) container: `crun delete --force <id>`.
+pub fn delete(bin: &str, crun_root: &Path, id: &str) -> std::io::Result<Output> {
     Command::new(bin)
-        .args(delete_force_args(runc_root, id))
+        .args(delete_force_args(crun_root, id))
         .output()
 }
 
-/// Live-update a running container's cgroup limits: `runc update <flags> <id>`.
-/// runc applies the new limits to the existing cgroup in place (cgroup v2:
+/// Live-update a running container's cgroup limits: `crun update <flags> <id>`.
+/// crun applies the new limits to the existing cgroup in place (cgroup v2:
 /// `memory.max`, `cpu.max`, `cpu.weight`), which is how CRI `UpdateContainerResources`
 /// (in-place pod resize) takes effect without a restart.
 pub fn update(
     bin: &str,
-    runc_root: &Path,
+    crun_root: &Path,
     id: &str,
     res: &crate::bundle::Resources,
 ) -> std::io::Result<Output> {
     Command::new(bin)
         .arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("update")
         .args(update_args(res))
         .arg(id)
         .output()
 }
 
-/// Build the `runc update` flags from CRI resources. Only set fields are passed
+/// Build the `crun update` flags from CRI resources. Only set fields are passed
 /// so unspecified limits keep their current value.
 fn update_args(res: &crate::bundle::Resources) -> Vec<String> {
     let mut args = Vec::new();
@@ -270,17 +271,17 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     // kill_args builds the correct CLI argv for SIGTERM and SIGKILL escalation.
-    // This ensures stop_container sends the right signal to runc on both the
+    // This ensures stop_container sends the right signal to crun on both the
     // graceful path (SIGTERM) and the forced-reap path (SIGKILL).
     #[test]
     fn kill_args_passes_signal_through() {
-        let root = std::path::Path::new("/var/run/containerd-rs/runc");
+        let root = std::path::Path::new("/var/run/containerd-rs/crun");
         let sigterm_args = kill_args(root, "ctr-abc", "SIGTERM");
         assert_eq!(
             sigterm_args,
             vec![
                 "--root",
-                "/var/run/containerd-rs/runc",
+                "/var/run/containerd-rs/crun",
                 "kill",
                 "ctr-abc",
                 "SIGTERM"
@@ -291,26 +292,26 @@ mod tests {
             sigkill_args,
             vec![
                 "--root",
-                "/var/run/containerd-rs/runc",
+                "/var/run/containerd-rs/crun",
                 "kill",
                 "ctr-abc",
                 "KILL"
             ],
-            "SIGKILL escalation must use signal name KILL (not SIGKILL) for runc"
+            "SIGKILL escalation must use signal name KILL (not SIGKILL) for crun"
         );
     }
 
-    // delete_force_args builds `runc delete --force <id>` correctly.
+    // delete_force_args builds `crun delete --force <id>` correctly.
     // stop_container must force-delete after kill so process trees are reaped.
     #[test]
     fn delete_force_args_includes_force_flag() {
-        let root = std::path::Path::new("/var/run/containerd-rs/runc");
+        let root = std::path::Path::new("/var/run/containerd-rs/crun");
         let args = delete_force_args(root, "ctr-xyz");
         assert_eq!(
             args,
             vec![
                 "--root",
-                "/var/run/containerd-rs/runc",
+                "/var/run/containerd-rs/crun",
                 "delete",
                 "--force",
                 "ctr-xyz",
@@ -319,7 +320,7 @@ mod tests {
     }
 
     // Regression for in-place resize (UpdateContainerResources): the requested
-    // CPU/memory map to the right `runc update` flags; unset fields are omitted.
+    // CPU/memory map to the right `crun update` flags; unset fields are omitted.
     #[test]
     fn update_args_maps_set_fields_only() {
         let args = update_args(&Resources {
@@ -342,18 +343,18 @@ mod tests {
                 "204",
             ]
         );
-        // Nothing requested -> no flags (runc keeps current limits).
+        // Nothing requested -> no flags (crun keeps current limits).
         assert!(update_args(&Resources::default()).is_empty());
     }
 
-    // Runs a REAL rootless container via runc. Requires runc + unprivileged user
+    // Runs a REAL rootless container via crun. Requires crun + unprivileged user
     // namespaces (both present on this host). Self-contained: builds a rootfs
     // from the statically-linked host busybox.
     //   cargo test -p runtime -- --ignored
     #[test]
-    #[ignore = "requires runc + unprivileged userns; launches a real rootless container"]
-    fn runc_runs_rootless_busybox() {
-        assert!(available(DEFAULT_BIN), "runc must be installed");
+    #[ignore = "requires crun + unprivileged userns; launches a real rootless container"]
+    fn crun_runs_rootless_busybox() {
+        assert!(available(DEFAULT_BIN), "crun must be installed");
 
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("bundle");
@@ -376,8 +377,8 @@ mod tests {
         let spec = generate_spec(&ImageConfig::default(), &req, &rootfs).unwrap();
         write_bundle(&bundle, &spec).unwrap();
 
-        let runc_root = dir.path().join("state");
-        let out = run(DEFAULT_BIN, &runc_root, &bundle, "crs-test").expect("runc run");
+        let crun_root = dir.path().join("state");
+        let out = run(DEFAULT_BIN, &crun_root, &bundle, "crs-test").expect("crun run");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(

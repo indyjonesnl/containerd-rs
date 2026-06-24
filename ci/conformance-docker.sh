@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a conformance focus locally inside a privileged container, mirroring CI
 # (same ci/ scripts, same pinned tooling via the conformance image, crun).
-# No host sudo, no host runc changes, no CI minutes.
+# No host sudo, no host crun changes, no CI minutes.
 #
 # Env:
 #   FOCUS            ginkgo --focus regex (empty = full [Conformance] suite)

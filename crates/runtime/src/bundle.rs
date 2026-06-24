@@ -88,14 +88,14 @@ pub struct ContainerRequest {
     /// container, so they are applied per-container).
     pub sysctls: std::collections::HashMap<String, String>,
     /// CPU/memory limits + requests (from CRI `LinuxContainerResources`), applied
-    /// to the OCI `linux.resources` so runc programs the container's cgroup
+    /// to the OCI `linux.resources` so crun programs the container's cgroup
     /// (cgroup v2: `memory.max`, `cpu.max`, `cpu.weight`). Without these a
     /// container runs unconstrained (`memory.max=max`, `cpu.max=max`).
     pub resources: Resources,
     /// OCI `linux.cgroupsPath` — the kubelet-delegated cgroup the container lives
     /// under (derived from the sandbox's `cgroup_parent`). `Some` only when the
     /// kubelet provides a cgroup parent; resources are applied ONLY when this is
-    /// set, so runc never enables controllers on the root cgroup (which fails
+    /// set, so crun never enables controllers on the root cgroup (which fails
     /// cgroup-v2's "no internal processes" rule). Mirrors containerd's
     /// `getCgroupsPath` + "set cgroup only if cgroup_parent != \"\"".
     pub cgroup_path: Option<String>,
@@ -451,7 +451,7 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     add_bind_mounts(&mut spec, &req.mounts);
     // Resource limits require a delegated cgroup (cgroupsPath under the kubelet's
-    // cgroup_parent); applying them with runc's default root-level path fails
+    // cgroup_parent); applying them with crun's default root-level path fails
     // cgroup-v2's "no internal processes" rule. So set cgroupsPath and apply
     // resources together, only when the kubelet gave us a cgroup parent.
     if let Some(cgroup_path) = req.cgroup_path.as_deref().filter(|p| !p.is_empty()) {
@@ -470,7 +470,7 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     Ok(spec)
 }
 
-/// Map CRI resource limits/requests onto the OCI `linux.resources` so runc
+/// Map CRI resource limits/requests onto the OCI `linux.resources` so crun
 /// programs the container's cgroup (cgroup v2: `memory.max` from the memory
 /// limit, `cpu.max` from quota/period, `cpu.weight` from shares). Unset fields
 /// are left at the cgroup default.
@@ -513,7 +513,7 @@ fn apply_resources(spec: &mut Spec, res: &Resources) {
     spec.set_linux(Some(linux));
 }
 
-/// Set namespaced sysctls in the container's OCI `linux.sysctl`. runc writes
+/// Set namespaced sysctls in the container's OCI `linux.sysctl`. crun writes
 /// these to `/proc/sys/...` inside the container's namespaces during init.
 fn apply_sysctls(spec: &mut Spec, sysctls: &std::collections::HashMap<String, String>) {
     if sysctls.is_empty() {
@@ -622,7 +622,7 @@ mod tests {
     // Regression: a pod with CPU/memory requests+limits must program the
     // container cgroup. Without this the conformance "pod cgroup limits" test
     // sees memory.max=max / cpu.max=max. CRI LinuxContainerResources ->
-    // OCI linux.resources (runc converts to cgroup v2 values).
+    // OCI linux.resources (crun converts to cgroup v2 values).
     #[test]
     fn resources_map_to_oci_cgroup_limits() {
         let req = ContainerRequest {
@@ -656,7 +656,7 @@ mod tests {
     }
 
     // Safety gate (regression for the bring-up break): with resources requested
-    // but NO cgroup_path, we must NOT apply them — otherwise runc enables
+    // but NO cgroup_path, we must NOT apply them — otherwise crun enables
     // controllers on the root cgroup and fails ("no internal processes").
     #[test]
     fn resources_skipped_without_cgroup_path() {

@@ -9,7 +9,7 @@
 #   docker run --rm --privileged \
 #     -v <containerd-rs>:/usr/local/bin/containerd-rs:ro \
 #     -v <crictl>:/usr/local/bin/crictl:ro \
-#     -v /usr/bin/runc:/hostrunc:ro \
+#     -v /usr/bin/crun:/hostcrun:ro \
 #     -v <cni-plugins-dir>:/opt/cni/bin:ro \
 #     -v $PWD/ci/cni-node.sh:/cni.sh:ro \
 #     ubuntu:24.04 bash /cni.sh
@@ -21,7 +21,7 @@ EP="unix:///run/containerd-rs.sock"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq ca-certificates iproute2 iptables iputils-ping >/dev/null 2>&1
-cp /hostrunc /usr/local/bin/runc && chmod +x /usr/local/bin/runc
+cp /hostcrun /usr/local/bin/crun && chmod +x /usr/local/bin/crun
 
 mkdir -p /etc/containerd-rs /run/containerd-rs /var/lib/containerd-rs /etc/cni/net.d /run/flannel
 cat > /run/flannel/subnet.env <<EOF

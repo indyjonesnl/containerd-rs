@@ -124,7 +124,7 @@ impl Default for Namespace {
 }
 
 /// A filesystem mount as produced by a snapshotter and consumed by the kernel
-/// and runc (`type`, `source`, `options`).
+/// and crun (`type`, `source`, `options`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mount {
     pub mount_type: String,

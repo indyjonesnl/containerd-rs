@@ -19,11 +19,10 @@ done
 curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
   | tar -xz -C /usr/local/bin
 # crun is a drop-in OCI runtime (CLI-compatible with runc) but faster and
-# lighter. The daemon execs "runc" from PATH, so install crun under both names.
+# lighter. The daemon execs "crun" from PATH.
 curl -fsSLo /usr/local/bin/crun \
   "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64"
 chmod +x /usr/local/bin/crun
-ln -sf /usr/local/bin/crun /usr/local/bin/runc
 mkdir -p /opt/cni/bin
 curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
   | tar -xz -C /opt/cni/bin
