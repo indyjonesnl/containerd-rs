@@ -538,6 +538,17 @@ impl RuntimeService for RuntimeSvc {
             .unwrap_or_default();
         tracing::info!(%cgroup_parent, "RunPodSandbox cgroup_parent");
 
+        // Driver is cgroupfs (we report cgroupfs to the kubelet). When the
+        // kubelet runs with cgroupsPerQOS it reads memory.max/cpu.max at the
+        // pod-level cgroup; create that cgroup (+ delegate controllers) so the
+        // reads succeed. Best-effort: a missing/RO /sys/fs/cgroup (e.g. the
+        // host-network/contract harness) must not fail sandbox creation.
+        if !cgroup_parent.is_empty() {
+            if let Err(e) = ensure_pod_cgroup(&cgroup_parent) {
+                tracing::warn!(%cgroup_parent, error = %e, "could not create pod cgroup (continuing)");
+            }
+        }
+
         // Host network if the pod requests NODE network mode; otherwise try CNI.
         let host_network = config
             .linux
@@ -1689,6 +1700,57 @@ fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources 
     }
 }
 
+/// cgroup-v2 root the kubelet (cgroupfs driver) reads pod limits under.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Create the pod-level cgroup-v2 directory for `cgroup_parent` and delegate the
+/// controllers the kubelet expects (so `memory.max`/`cpu.max` exist for it to
+/// read). Pod-level *enforcement* is out of scope — we only ensure the limit
+/// files exist (they default to "max").
+///
+/// cgroup-v2 "no internal processes": controllers are enabled by writing
+/// `+ctrl` to the *parent's* `cgroup.subtree_control`, never the leaf's. The pod
+/// cgroup is an intermediate node; container leaves live in its children.
+fn ensure_pod_cgroup(cgroup_parent: &str) -> std::io::Result<()> {
+    ensure_pod_cgroup_at(std::path::Path::new(CGROUP_ROOT), cgroup_parent)
+}
+
+fn ensure_pod_cgroup_at(root: &Path, cgroup_parent: &str) -> std::io::Result<()> {
+    let pod_dir = root.join(cgroup_parent.trim_start_matches('/'));
+    // The parent cgroup must already exist (kubelet creates the QoS tier); the
+    // pod dir is the new leaf-of-parent we own.
+    let parent = pod_dir.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cgroup_parent has no parent dir",
+        )
+    })?;
+
+    // Delegate cpu+memory from the parent so the pod cgroup gets cpu.max/memory.max.
+    // Read what the parent actually has available; only delegate the intersection
+    // of {cpu, memory} with the parent's cgroup.controllers.
+    let available = std::fs::read_to_string(parent.join("cgroup.controllers")).unwrap_or_default();
+    let want = ["cpu", "memory"];
+    let to_enable: Vec<&str> = want
+        .iter()
+        .copied()
+        .filter(|c| available.split_whitespace().any(|a| a == *c))
+        .collect();
+    if !to_enable.is_empty() {
+        let line: String = to_enable.iter().map(|c| format!("+{c} ")).collect();
+        // Best-effort: subtree_control may already list them (idempotent write).
+        let _ = std::fs::write(parent.join("cgroup.subtree_control"), line.trim_end());
+    }
+
+    // Create the pod cgroup dir (idempotent).
+    match std::fs::create_dir(&pod_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// Derive a container's cgroup path from the pod's `cgroup_parent`, mirroring
 /// containerd's `getCgroupsPath`: a systemd slice parent (`*.slice`) →
 /// `slice:cri-containerd:id`; otherwise the cgroupfs path `parent/id`.
@@ -1990,6 +2052,40 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_pod_cgroup_creates_dir_and_enables_controllers() {
+        let root = tempfile::tempdir().unwrap();
+        // Simulate the cgroup-v2 root: parent's available controllers.
+        let parent = root.path().join("kubepods").join("besteffort");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        std::fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+
+        ensure_pod_cgroup_at(root.path(), "/kubepods/besteffort/podABC").unwrap();
+
+        let pod = parent.join("podABC");
+        assert!(pod.is_dir(), "pod-level cgroup dir created");
+        // Controllers the children will need are delegated via the parent's
+        // subtree_control (cgroup-v2 no-internal-processes: enable on the parent,
+        // not the leaf).
+        let sc = std::fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
+        assert!(sc.contains("+cpu"), "cpu delegated: {sc:?}");
+        assert!(sc.contains("+memory"), "memory delegated: {sc:?}");
+    }
+
+    #[test]
+    fn ensure_pod_cgroup_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("kubepods");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("cgroup.controllers"), "cpu memory\n").unwrap();
+        std::fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+        ensure_pod_cgroup_at(root.path(), "/kubepods/pod1").unwrap();
+        // Second call must not error on the already-present dir.
+        ensure_pod_cgroup_at(root.path(), "/kubepods/pod1").unwrap();
+    }
+
     use crate::v1::image_service_client::ImageServiceClient;
     use crate::v1::runtime_service_client::RuntimeServiceClient;
     use tokio::net::UnixStream;
