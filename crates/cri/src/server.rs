@@ -3269,20 +3269,36 @@ mod tests {
         let url = format!("ws://{addr}/exec/{token}");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         let mut saw_marker = false;
+        let mut saw_coded_close = false;
         while let Some(Ok(msg)) = ws.next().await {
-            if msg.is_binary() {
-                let data = msg.into_data();
+            use tokio_tungstenite::tungstenite::Message as TMsg;
+            match msg {
                 // Channel 1 (stdout) frame carrying the marker.
-                if data.first() == Some(&1)
-                    && String::from_utf8_lossy(&data[1..]).contains("WS_EXEC_MARKER")
+                TMsg::Binary(data)
+                    if data.first() == Some(&1)
+                        && String::from_utf8_lossy(&data[1..]).contains("WS_EXEC_MARKER") =>
                 {
                     saw_marker = true;
                 }
+                TMsg::Binary(_) => {}
+                TMsg::Close(Some(frame)) => {
+                    let code_u16: u16 = frame.code.into();
+                    assert_eq!(
+                        code_u16, 1000,
+                        "exec success path must close with code 1000 (Normal), got {code_u16}"
+                    );
+                    saw_coded_close = true;
+                }
+                _ => {}
             }
         }
         assert!(
             saw_marker,
             "did not receive stdout frame with marker over WS"
+        );
+        assert!(
+            saw_coded_close,
+            "exec success path must send a Close frame with code 1000 (got bare drop / Close(None))"
         );
     }
 
