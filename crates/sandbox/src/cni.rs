@@ -1,10 +1,18 @@
 //! CNI (Container Network Interface) integration for pod networking.
 //!
-//! Mirrors what containerd's CRI plugin does for a non-host-network pod: create
-//! a network namespace, then invoke the configured CNI plugin chain (ADD) to
-//! wire a `veth` + assign a pod IP inside that netns; tear it down (DEL) on pod
-//! removal. The plugin chain comes from a `*.conflist` in the CNI conf dir
-//! (e.g. a Flannel conflist that delegates to the `bridge` plugin).
+//! Matches what upstream containerd's CRI plugin does for a non-host-network
+//! pod:
+//!
+//! 1. Create a network namespace (`ip netns add`).
+//! 2. **Loopback ADD** — invoke the CNI `loopback` plugin (ADD) with
+//!    `CNI_IFNAME=lo`.  This brings `lo` up and assigns `127.0.0.1/8` +
+//!    `::1/128`, exactly as upstream's `github.com/containernetworking/plugins`
+//!    `loopback` plugin does.
+//! 3. **Cluster network ADD** — invoke the configured CNI conflist
+//!    (Flannel/Calico/etc.) to wire `eth0` and assign a pod IP.
+//!
+//! Teardown reverses the sequence: cluster DEL (reverse plugin order), then
+//! loopback DEL, then `ip netns del`.
 //!
 //! Plugin invocation follows the CNI spec: exec `<bin_dir>/<type>` with the
 //! `CNI_*` environment and the per-plugin network config (plus the previous
@@ -36,6 +44,7 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 const IFNAME: &str = "eth0";
+const LO_IFNAME: &str = "lo";
 
 /// A parsed CNI conflist (`cniVersion` + `name` + ordered `plugins`).
 #[derive(Debug, Clone, Deserialize)]
@@ -119,30 +128,18 @@ impl Cni {
         self.netns_dir.join(netns)
     }
 
-    /// Create a named network namespace (`ip netns add`) and bring its loopback
-    /// interface up.
+    /// Create a named network namespace (`ip netns add`).
     ///
-    /// A fresh netns starts with `lo` DOWN. The kubelet/CNI never touch it, so
-    /// without this every pod's `127.0.0.1` (and its own pod IP, which the kernel
-    /// routes via `lo`) is unreachable — breaking any pod that talks to itself
-    /// (the "intra-pod communication" / hairpin conformance tests, sidecars on
-    /// localhost, health checks via 127.0.0.1). Upstream containerd's CNI library
-    /// brings `lo` up as part of namespace setup; mirror that here.
+    /// Loopback setup (`lo` UP + `127.0.0.1/8` + `::1/128`) is handled
+    /// separately by [`Cni::setup`], which invokes the CNI `loopback` plugin
+    /// (ADD) before the cluster conflist — matching upstream containerd's
+    /// two-phase CNI sequence.
     pub fn create_netns(&self, netns: &str) -> Result<PathBuf> {
         let out = Command::new("ip").args(["netns", "add", netns]).output()?;
         if !out.status.success() {
             return Err(Error::Netns(
                 String::from_utf8_lossy(&out.stderr).into_owned(),
             ));
-        }
-        let lo = Command::new("ip")
-            .args(["-n", netns, "link", "set", "lo", "up"])
-            .output()?;
-        if !lo.status.success() {
-            return Err(Error::Netns(format!(
-                "bring up lo in netns {netns}: {}",
-                String::from_utf8_lossy(&lo.stderr).trim()
-            )));
         }
         Ok(self.netns_path(netns))
     }
@@ -154,6 +151,13 @@ impl Cni {
     }
 
     /// Run the ADD chain for `container_id` against `netns`, returning the pod IP.
+    ///
+    /// Follows upstream containerd's two-phase sequence:
+    /// 1. Invoke the CNI `loopback` plugin (ADD, `CNI_IFNAME=lo`) — brings `lo`
+    ///    up and assigns `127.0.0.1/8` + `::1/128`.
+    /// 2. Invoke each plugin in the cluster conflist (ADD, `CNI_IFNAME=eth0`) to
+    ///    wire `eth0` and obtain the pod IP.
+    ///
     /// `port_mappings` are injected as the `runtimeConfig.portMappings` capability
     /// arg for any plugin that declares `capabilities.portMappings` (e.g. portmap),
     /// which is how pod `hostPort`s are programmed.
@@ -165,24 +169,57 @@ impl Cni {
     ) -> Result<String> {
         let conflist = self.load_conflist()?;
         let netns_path = self.netns_path(netns);
+
+        // Phase 1: loopback ADD — matches upstream's loopback-first sequence.
+        let lo_netconf = loopback_netconf(&conflist);
+        let lo_plugin = serde_json::json!({"type": "loopback"});
+        self.exec_plugin(
+            "ADD",
+            container_id,
+            &netns_path,
+            LO_IFNAME,
+            &lo_plugin,
+            &lo_netconf,
+        )?;
+
+        // Phase 2: cluster network ADD.
         let mut prev_result: Option<serde_json::Value> = None;
         for plugin in &conflist.plugins {
             let mut netconf = assemble_netconf(&conflist, plugin, prev_result.as_ref());
             inject_port_mappings(&mut netconf, plugin, port_mappings);
-            let result = self.exec_plugin("ADD", container_id, &netns_path, plugin, &netconf)?;
+            let result =
+                self.exec_plugin("ADD", container_id, &netns_path, IFNAME, plugin, &netconf)?;
             prev_result = Some(result);
         }
         extract_ip(prev_result.as_ref().ok_or(Error::NoIp)?)
     }
 
     /// Run the DEL chain (reverse order) for `container_id`; best-effort.
+    ///
+    /// Mirrors upstream's teardown sequence: cluster conflist DEL (reverse plugin
+    /// order), then loopback DEL, then `ip netns del`.
     pub fn teardown(&self, container_id: &str, netns: &str) -> Result<()> {
         if let Ok(conflist) = self.load_conflist() {
             let netns_path = self.netns_path(netns);
+
+            // Phase 1: cluster network DEL (reverse order).
             for plugin in conflist.plugins.iter().rev() {
                 let netconf = assemble_netconf(&conflist, plugin, None);
-                let _ = self.exec_plugin("DEL", container_id, &netns_path, plugin, &netconf);
+                let _ =
+                    self.exec_plugin("DEL", container_id, &netns_path, IFNAME, plugin, &netconf);
             }
+
+            // Phase 2: loopback DEL — best-effort, matches upstream's sequence.
+            let lo_netconf = loopback_netconf(&conflist);
+            let lo_plugin = serde_json::json!({"type": "loopback"});
+            let _ = self.exec_plugin(
+                "DEL",
+                container_id,
+                &netns_path,
+                LO_IFNAME,
+                &lo_plugin,
+                &lo_netconf,
+            );
         }
         self.delete_netns(netns)
     }
@@ -192,6 +229,7 @@ impl Cni {
         command: &str,
         container_id: &str,
         netns_path: &Path,
+        ifname: &str,
         plugin: &serde_json::Value,
         netconf: &serde_json::Value,
     ) -> Result<serde_json::Value> {
@@ -204,7 +242,7 @@ impl Cni {
             .env("CNI_COMMAND", command)
             .env("CNI_CONTAINERID", container_id)
             .env("CNI_NETNS", netns_path)
-            .env("CNI_IFNAME", IFNAME)
+            .env("CNI_IFNAME", ifname)
             .env("CNI_PATH", &self.bin_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -239,6 +277,18 @@ impl Cni {
         }
         Ok(serde_json::from_slice(&out.stdout)?)
     }
+}
+
+/// Build the minimal netconf for the CNI `loopback` plugin.
+///
+/// The loopback plugin only requires `cniVersion`, `name`, and `type`; it does
+/// not participate in the `prevResult` chain.
+fn loopback_netconf(conflist: &ConfList) -> serde_json::Value {
+    serde_json::json!({
+        "cniVersion": conflist.cni_version,
+        "name": conflist.name,
+        "type": "loopback",
+    })
 }
 
 /// Assemble the per-plugin network config the CNI spec feeds on stdin:
@@ -403,6 +453,19 @@ mod tests {
             nc.get("runtimeConfig").is_none(),
             "no runtimeConfig.portMappings when there are no real hostPorts"
         );
+    }
+
+    #[test]
+    fn loopback_netconf_has_required_fields() {
+        let cl = ConfList {
+            cni_version: "1.0.0".into(),
+            name: "cbr0".into(),
+            plugins: vec![],
+        };
+        let nc = loopback_netconf(&cl);
+        assert_eq!(nc["cniVersion"], "1.0.0");
+        assert_eq!(nc["name"], "cbr0");
+        assert_eq!(nc["type"], "loopback");
     }
 
     fn tempdir() -> PathBuf {
