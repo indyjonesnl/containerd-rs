@@ -548,8 +548,8 @@ impl RuntimeService for RuntimeSvc {
             .unwrap_or(false);
 
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
-        // plugin chain; if CNI is unavailable/fails we fall back to host network
-        // (rootless containers share the host net namespace).
+        // plugin chain; if CNI is unavailable/fails we tear down best-effort and
+        // return Status::unavailable so the kubelet retries once CNI is ready.
         // Pod hostPort declarations -> CNI portmap capability arg.
         let port_mappings: Vec<sandbox::cni::PortMapping> = config
             .port_mappings
@@ -580,9 +580,17 @@ impl RuntimeService for RuntimeSvc {
                     (self.ctx.cni.netns_path(&id).display().to_string(), ip)
                 }
                 Err(e) => {
+                    // A non-hostNetwork pod MUST get real CNI networking. If CNI
+                    // is unavailable (e.g. kube-router hasn't installed the
+                    // conflist + binaries yet) we tear down best-effort and FAIL
+                    // the sandbox so the kubelet retries — silently falling back
+                    // to host networking gives every pod the node's network and
+                    // breaks NetworkPolicy/Service routing.
                     let _ = self.ctx.cni.teardown(&id, &id);
-                    tracing::warn!(sandbox = %id, error = %e, "CNI setup failed; falling back to host network");
-                    ("host".to_string(), sandbox::net::host_ip())
+                    tracing::warn!(sandbox = %id, error = %e, "CNI setup failed; failing RunPodSandbox for kubelet retry");
+                    return Err(Status::unavailable(format!(
+                        "CNI network setup failed for sandbox {id}: {e}"
+                    )));
                 }
             }
         };
@@ -2385,6 +2393,19 @@ mod tests {
                 namespace: "default".into(),
                 attempt: 0,
             }),
+            // Use host networking so this unit test works without CNI binaries
+            // or network namespace privileges (the test exercises sandbox
+            // lifecycle, not CNI).
+            linux: Some(v1::LinuxPodSandboxConfig {
+                security_context: Some(v1::LinuxSandboxSecurityContext {
+                    namespace_options: Some(v1::NamespaceOption {
+                        network: v1::NamespaceMode::Node as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -2496,7 +2517,9 @@ mod tests {
             )
             .unwrap();
 
-        // A sandbox to host the container.
+        // A sandbox to host the container. Use host networking so this unit
+        // test works without CNI binaries or network namespace privileges (the
+        // test exercises container lifecycle, not CNI).
         let pod = svc
             .run_pod_sandbox(Request::new(v1::RunPodSandboxRequest {
                 config: Some(v1::PodSandboxConfig {
@@ -2505,6 +2528,16 @@ mod tests {
                         uid: "u".into(),
                         namespace: "default".into(),
                         attempt: 0,
+                    }),
+                    linux: Some(v1::LinuxPodSandboxConfig {
+                        security_context: Some(v1::LinuxSandboxSecurityContext {
+                            namespace_options: Some(v1::NamespaceOption {
+                                network: v1::NamespaceMode::Node as i32,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
