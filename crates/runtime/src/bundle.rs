@@ -755,7 +755,7 @@ mod tests {
             "spec must contain the bind mount for the created dir"
         );
     }
-  
+
     // Regression: a non-privileged container must get containerd's default
     // capability set (14 caps), not the bare oci-spec default of 3
     // (KILL/AUDIT_WRITE/NET_BIND_SERVICE). nginx chowns its cache dir at startup
