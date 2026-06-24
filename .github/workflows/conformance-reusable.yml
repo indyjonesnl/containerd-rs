@@ -88,6 +88,10 @@ jobs:
         run: |
           sudo tail -200 /var/log/crs.log || true
           sudo tail -200 /var/log/kubelet.log || true
+          # admin.conf is root:root 0600 and the bring-up step only chmods it on
+          # success, so make it readable here too — otherwise kubectl below fails
+          # with "permission denied" and the pod logs/describe are lost.
+          sudo chmod 0644 /etc/kubernetes/admin.conf 2>/dev/null || true
           export KUBECONFIG=/etc/kubernetes/admin.conf
           kubectl get pods -A -o wide || true
           # Dump logs + describe for any pod not Running (e.g. a crashlooping
