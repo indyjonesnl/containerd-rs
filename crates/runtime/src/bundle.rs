@@ -434,12 +434,29 @@ fn apply_sysctls(spec: &mut Spec, sysctls: &std::collections::HashMap<String, St
 }
 
 /// Append CRI host-path bind mounts to the spec.
+///
+/// **DirectoryOrCreate backstop**: if the source path does not exist it is
+/// created with `std::fs::create_dir_all` before the mount is added. This
+/// mirrors the Kubernetes `DirectoryOrCreate` host-path volume policy and is
+/// required for paths like `/etc/cni/net.d` that the node-local CNI plugin
+/// creates lazily. Only *directory* sources are created; file sources are not
+/// touched (documented limitation).
 fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
     if mounts.is_empty() {
         return;
     }
     let mut all = spec.mounts().clone().unwrap_or_default();
     for m in mounts {
+        let src = Path::new(&m.source);
+        if !src.exists() {
+            if let Err(e) = std::fs::create_dir_all(src) {
+                tracing::warn!(
+                    source = %m.source,
+                    error = %e,
+                    "DirectoryOrCreate: could not create missing bind-mount source dir; continuing"
+                );
+            }
+        }
         let opts = vec![
             "rbind".to_string(),
             "rprivate".to_string(),
@@ -696,6 +713,47 @@ mod tests {
         // Round-trips back through the parser.
         let reloaded = Spec::load(&config).unwrap();
         assert_eq!(reloaded.hostname().as_deref(), Some("pod-xyz"));
+    }
+
+    /// DirectoryOrCreate: a bind-mount whose source dir does not yet exist must
+    /// be created automatically before the OCI spec is generated.
+    #[test]
+    fn add_bind_mounts_creates_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        // This sub-directory intentionally does NOT exist yet.
+        let missing_src = tmp.path().join("net.d");
+        assert!(!missing_src.exists(), "pre-condition: dir must not exist");
+
+        let req = ContainerRequest {
+            mounts: vec![MountSpec {
+                source: missing_src.to_string_lossy().into_owned(),
+                destination: "/etc/cni/net.d".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let rootfs = tmp.path().join("rootfs");
+        let spec = generate_spec(&img(), &req, &rootfs).unwrap();
+
+        // (a) The source directory must have been created.
+        assert!(
+            missing_src.exists() && missing_src.is_dir(),
+            "expected source dir to be created by add_bind_mounts"
+        );
+
+        // (b) The spec must contain a bind mount pointing at that source.
+        let mounts = spec.mounts().as_ref().expect("spec has mounts");
+        let found = mounts.iter().any(|m| {
+            m.source()
+                .as_ref()
+                .map(|s| s == &missing_src)
+                .unwrap_or(false)
+                && m.destination() == &PathBuf::from("/etc/cni/net.d")
+        });
+        assert!(
+            found,
+            "spec must contain the bind mount for the created dir"
+        );
     }
 
     // Regression: a non-privileged container must get containerd's default
