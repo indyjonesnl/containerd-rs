@@ -12,9 +12,10 @@
 
 A Rust reimplementation of [containerd](https://containerd.io)'s kubelet-facing
 surface: a daemon that serves the **Kubernetes CRI v1** API (`RuntimeService` +
-`ImageService`) over a Unix socket and runs containers via `runc`. The goal
-(SC-001) is to be a drop-in replacement for containerd as the node container
-runtime and pass the **Kubernetes Conformance** suite.
+`ImageService`) over a Unix socket and runs containers via `crun` (a fast,
+runc-compatible OCI runtime). The goal (SC-001) is to be a drop-in replacement
+for containerd as the node container runtime and pass the **Kubernetes
+Conformance** suite.
 
 Status: a single-node cluster brought up with `kubeadm` runs entirely on
 containerd-rs — control plane converges, the node reaches `Ready`, the system
@@ -25,7 +26,7 @@ workflows (see below).
 
 ## Architecture at a glance
 
-containerd-rs uses a **direct-runc** model: the daemon shells out to `runc` and
+containerd-rs uses a **direct-crun** model: the daemon shells out to `crun` and
 supervises the container process in-process (no TTRPC shim). The CRI plugin,
 content store, snapshotter, and image puller are all built in.
 
@@ -37,7 +38,7 @@ kubelet ──CRI v1 gRPC (unix socket)──▶ containerd-rs daemon
    images ──▶ content store (verify-on-commit) + overlayfs snapshots
    metadata ──▶ redb                    │
    pods ──▶ CNI (Flannel) / host-net    ▼
-                                       runc  (one process per container)
+                                       crun  (one process per container)
 ```
 
 | Crate | Responsibility |
@@ -47,7 +48,7 @@ kubelet ──CRI v1 gRPC (unix socket)──▶ containerd-rs daemon
 | `metadata` | Persistent metadata store backed by [redb](https://www.redb.org) |
 | `snapshots` | Overlayfs snapshotter: layer diff apply, OCI whiteouts, chainIDs |
 | `images` | Image pull pipeline (oci-client), registry auth, chainID identity, GC |
-| `runtime` | OCI bundle generation + `runc` supervision (run/exec/kill/stats) |
+| `runtime` | OCI bundle generation + `crun` supervision (run/exec/kill/stats) |
 | `sandbox` | Pod sandbox model: network namespace + CNI plugin chain |
 | `cri` | CRI v1 gRPC server + the exec/attach/port-forward streaming server |
 | `containerd-rs` | The daemon binary (config, store bring-up, serve, reconcile) |
@@ -76,7 +77,7 @@ A minimal config (all fields have defaults — see the config reference):
 
 ```toml
 root  = "/var/lib/containerd-rs"      # persistent store (content, snapshots, metadata)
-state = "/run/containerd-rs"          # ephemeral state (runc root, OCI bundles)
+state = "/run/containerd-rs"          # ephemeral state (crun root, OCI bundles)
 cri_socket = "/run/containerd-rs.sock"
 stream_server_address = "127.0.0.1:10010"
 
@@ -99,7 +100,7 @@ crictl --runtime-endpoint unix:///run/containerd-rs.sock images
 ## Bring up a single-node cluster
 
 `ci/kubeadm-init.sh` (via `make cluster-up`) stands up a kubeadm control plane on
-containerd-rs as the sole runtime. Requires root + `runc`, `kubeadm`/`kubelet`/
+containerd-rs as the sole runtime. Requires root + `crun`, `kubeadm`/`kubelet`/
 `kubectl`, `crictl`, and CNI plugins on the host.
 
 ```sh
@@ -151,7 +152,7 @@ badges at the top of this README reflect each workflow's latest run.
 ## Testing
 
 - Unit + contract + integration tests: `make test` (or `cargo test --workspace`).
-- Tests that need `runc`/network are `#[ignore]`d; run them with
+- Tests that need `crun`/network are `#[ignore]`d; run them with
   `cargo test -p <crate> -- --ignored`.
 - CRI contract tests: `crates/cri/tests/contract_*.rs`.
 - End-to-end pod lifecycle + image management: `crates/cri/tests/integration_*.rs`.

@@ -60,8 +60,8 @@ impl Default for CriConfig {
     fn default() -> Self {
         Self {
             sandbox_image: "registry.k8s.io/pause:3.10".to_string(),
-            default_runtime_name: "runc".to_string(),
-            runtime_type: "io.containerd.runc.v2".to_string(),
+            default_runtime_name: "crun".to_string(),
+            runtime_type: "io.containerd.crun.v2".to_string(),
             snapshotter: "overlayfs".to_string(),
             systemd_cgroup: false,
             registry_config_path: PathBuf::from("/etc/containerd-rs/certs.d"),
@@ -113,7 +113,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.cri_socket, PathBuf::from("/run/containerd-rs.sock"));
         assert_eq!(c.cri.sandbox_image, "registry.k8s.io/pause:3.10");
-        assert_eq!(c.cri.runtime_type, "io.containerd.runc.v2");
+        assert_eq!(c.cri.runtime_type, "io.containerd.crun.v2");
         assert_eq!(c.cri.snapshotter, "overlayfs");
     }
 
@@ -130,7 +130,7 @@ mod tests {
         assert!(c.cri.systemd_cgroup);
         assert_eq!(c.cri.sandbox_image, "registry.k8s.io/pause:3.9");
         // Untouched fields keep defaults.
-        assert_eq!(c.cri.runtime_type, "io.containerd.runc.v2");
+        assert_eq!(c.cri.runtime_type, "io.containerd.crun.v2");
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub struct Context {
     pub content: content::Store,
     pub metadata: metadata::Store,
     pub snapshots_root: PathBuf,
-    /// Ephemeral state dir; holds per-container OCI bundles + the runc state.
+    /// Ephemeral state dir; holds per-container OCI bundles + the crun state.
     pub state_dir: PathBuf,
     pub namespace: String,
     /// Streaming-session registry shared with the streaming HTTP server.
@@ -60,7 +60,7 @@ impl Context {
         cni_conf_dir: PathBuf,
         cni_bin_dir: PathBuf,
     ) -> Self {
-        let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("runc")));
+        let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("crun")));
         Self {
             content,
             metadata,
@@ -248,16 +248,16 @@ impl RuntimeSvc {
         }
     }
 
-    /// Sample cgroup stats for a Running container via `runc events --stats`.
+    /// Sample cgroup stats for a Running container via `crun events --stats`.
     /// Returns `None` for non-running containers (no live cgroup).
     async fn container_stats_for(&self, rec: &ContainerRecord) -> Option<v1::ContainerStats> {
         if rec.state != ContainerState::Running {
             return None;
         }
-        let runc_root = self.ctx.state_dir.join("runc");
+        let crun_root = self.ctx.state_dir.join("crun");
         let id = rec.id.clone();
         let out = tokio::task::spawn_blocking(move || {
-            runtime::runc::stats(runtime::runc::DEFAULT_BIN, &runc_root, &id)
+            runtime::crun::stats(runtime::crun::DEFAULT_BIN, &crun_root, &id)
         })
         .await
         .ok()?
@@ -436,7 +436,7 @@ impl RuntimeService for RuntimeSvc {
                 "sandboxImage": "registry.k8s.io/pause:3.10",
                 "cgroupDriver": "cgroupfs",
                 "snapshotter": "overlayfs",
-                "defaultRuntimeName": "runc",
+                "defaultRuntimeName": "crun",
                 "rootDir": self.ctx.snapshots_root.display().to_string(),
                 "stateDir": self.ctx.state_dir.display().to_string(),
             });
@@ -835,7 +835,7 @@ impl RuntimeService for RuntimeSvc {
 
         // Use a rootless spec (user namespace + uid/gid mapping) only when the
         // daemon itself is non-root. As root (e.g. inside a privileged
-        // kind/Docker node), a rootless spec's userns + dropped caps make runc's
+        // kind/Docker node), a rootless spec's userns + dropped caps make crun's
         // init exec fail ("fork/exec /proc/self/fd/N: permission denied"), so use
         // a full root spec instead.
         let uid = rustix::process::getuid().as_raw();
@@ -1117,19 +1117,19 @@ impl RuntimeService for RuntimeSvc {
 
         if let Some(rec) = self.get_container(&id)? {
             if rec.state != ContainerState::Exited {
-                let runc_root = self.ctx.state_dir.join("runc");
+                let crun_root = self.ctx.state_dir.join("crun");
                 let ctx = self.ctx.clone();
                 let ns = self.ns().to_string();
 
-                // Step 1: Send SIGTERM (best-effort; runc may not know the
+                // Step 1: Send SIGTERM (best-effort; crun may not know the
                 // container if it was never started).
                 {
-                    let runc_root2 = runc_root.clone();
+                    let crun_root2 = crun_root.clone();
                     let id2 = id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        runtime::runc::kill(
-                            runtime::runc::DEFAULT_BIN,
-                            &runc_root2,
+                        runtime::crun::kill(
+                            runtime::crun::DEFAULT_BIN,
+                            &crun_root2,
                             &id2,
                             "SIGTERM",
                         )
@@ -1139,7 +1139,7 @@ impl RuntimeService for RuntimeSvc {
 
                 // Step 2: If timeout > 0, poll the metadata store until the
                 // supervise task flips the state to Exited (it calls child.wait()
-                // after runc run returns, which SIGTERM triggers).
+                // after crun run returns, which SIGTERM triggers).
                 let exited_gracefully = if timeout_secs > 0 {
                     let deadline = std::time::Instant::now()
                         + std::time::Duration::from_secs(timeout_secs as u64);
@@ -1162,21 +1162,21 @@ impl RuntimeService for RuntimeSvc {
                 };
 
                 // Step 3: If still not exited, escalate to SIGKILL then
-                // force-delete the runc container to reap any process tree.
+                // force-delete the crun container to reap any process tree.
                 if !exited_gracefully {
-                    let runc_root2 = runc_root.clone();
+                    let crun_root2 = crun_root.clone();
                     let id2 = id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        let _ = runtime::runc::kill(
-                            runtime::runc::DEFAULT_BIN,
-                            &runc_root2,
+                        let _ = runtime::crun::kill(
+                            runtime::crun::DEFAULT_BIN,
+                            &crun_root2,
                             &id2,
                             "KILL",
                         );
                         // Force-delete sweeps any surviving process tree even if
-                        // runc kill above raced or the init ignored the signal.
+                        // crun kill above raced or the init ignored the signal.
                         let _ =
-                            runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root2, &id2);
+                            runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root2, &id2);
                     })
                     .await;
                 }
@@ -1210,11 +1210,11 @@ impl RuntimeService for RuntimeSvc {
         request: Request<v1::RemoveContainerRequest>,
     ) -> Result<Response<v1::RemoveContainerResponse>, Status> {
         let id = request.into_inner().container_id;
-        // Force-delete any leftover runc state, then drop record + bundle.
-        let runc_root = self.ctx.state_dir.join("runc");
+        // Force-delete any leftover crun state, then drop record + bundle.
+        let crun_root = self.ctx.state_dir.join("crun");
         let id2 = id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root, &id2)
+            runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &id2)
         })
         .await;
         self.ctx
@@ -1243,8 +1243,8 @@ impl RuntimeService for RuntimeSvc {
         if !bundle.config_json().is_file() {
             return Err(Status::internal("container bundle config.json missing"));
         }
-        let runc_root = self.ctx.state_dir.join("runc");
-        std::fs::create_dir_all(&runc_root).map_err(|e| Status::internal(e.to_string()))?;
+        let crun_root = self.ctx.state_dir.join("crun");
+        std::fs::create_dir_all(&crun_root).map_err(|e| Status::internal(e.to_string()))?;
 
         let log_path = container_log_path(&bundle, &rec.log_path);
 
@@ -1263,7 +1263,7 @@ impl RuntimeService for RuntimeSvc {
             .put(Kind::Container, self.ns(), &id, &rec)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Supervise the container with LIVE stdio: spawn `runc run` with piped
+        // Supervise the container with LIVE stdio: spawn `crun run` with piped
         // stdout/stderr, stream each chunk to the CRI log file *and* a broadcast
         // bus (for Attach / log-follow), then record the exit code.
         let ctx = self.ctx.clone();
@@ -1273,7 +1273,7 @@ impl RuntimeService for RuntimeSvc {
         let live = self.ctx.streaming.live_channel(&id);
         tokio::spawn(async move {
             let code =
-                supervise_container(&runc_root, &bundle_dir, &cid, &log_path, live, terminal).await;
+                supervise_container(&crun_root, &bundle_dir, &cid, &log_path, live, terminal).await;
             if let Ok(Some(mut r)) = ctx
                 .metadata
                 .get::<ContainerRecord>(Kind::Container, &ns, &cid)
@@ -1290,16 +1290,16 @@ impl RuntimeService for RuntimeSvc {
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
 
-        // `runc run` is spawned asynchronously above, but the kubelet may issue an
+        // `crun run` is spawned asynchronously above, but the kubelet may issue an
         // exec immediately (a container postStart hook is an ExecSync the instant
-        // StartContainer returns). Wait until runc has actually registered the
+        // StartContainer returns). Wait until crun has actually registered the
         // container so that exec doesn't fail with "container does not exist".
-        let runc_root_wait = self.ctx.state_dir.join("runc");
+        let crun_root_wait = self.ctx.state_dir.join("crun");
         let wait_id = id.clone();
         let _ = tokio::task::spawn_blocking(move || {
             for _ in 0..100 {
                 if let Ok(o) =
-                    runtime::runc::state(runtime::runc::DEFAULT_BIN, &runc_root_wait, &wait_id)
+                    runtime::crun::state(runtime::crun::DEFAULT_BIN, &crun_root_wait, &wait_id)
                 {
                     if o.status.success() {
                         return;
@@ -1325,15 +1325,15 @@ impl RuntimeService for RuntimeSvc {
             Status::not_found(format!("container {} not found", req.container_id))
         })?;
 
-        let runc_root = self.ctx.state_dir.join("runc");
+        let crun_root = self.ctx.state_dir.join("crun");
         let id = req.container_id.clone();
         let cmd = req.cmd.clone();
         let out = tokio::task::spawn_blocking(move || {
-            runtime::runc::exec(runtime::runc::DEFAULT_BIN, &runc_root, &id, &cmd)
+            runtime::crun::exec(runtime::crun::DEFAULT_BIN, &crun_root, &id, &cmd)
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| Status::internal(format!("runc exec: {e}")))?;
+        .map_err(|e| Status::internal(format!("crun exec: {e}")))?;
 
         Ok(Response::new(v1::ExecSyncResponse {
             stdout: out.stdout,
@@ -1480,7 +1480,7 @@ impl RuntimeService for RuntimeSvc {
     }
 
     /// Live in-place resize: apply the new CPU/memory limits to the running
-    /// container's cgroup via `runc update` (cgroup v2 `memory.max`/`cpu.max`/
+    /// container's cgroup via `crun update` (cgroup v2 `memory.max`/`cpu.max`/
     /// `cpu.weight`), no restart. Backs Kubernetes in-place pod resize.
     async fn update_container_resources(
         &self,
@@ -1492,17 +1492,17 @@ impl RuntimeService for RuntimeSvc {
             .get_container(&id)?
             .ok_or_else(|| Status::not_found(format!("container {id} not found")))?;
         let res = req.linux.as_ref().map(cri_resources).unwrap_or_default();
-        let runc_root = self.ctx.state_dir.join("runc");
+        let crun_root = self.ctx.state_dir.join("crun");
         let id2 = id.clone();
         let out = tokio::task::spawn_blocking(move || {
-            runtime::runc::update(runtime::runc::DEFAULT_BIN, &runc_root, &id2, &res)
+            runtime::crun::update(runtime::crun::DEFAULT_BIN, &crun_root, &id2, &res)
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| Status::internal(format!("runc update: {e}")))?;
+        .map_err(|e| Status::internal(format!("crun update: {e}")))?;
         if !out.status.success() {
             return Err(Status::internal(format!(
-                "runc update failed: {}",
+                "crun update failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
@@ -1894,7 +1894,7 @@ fn cri_log_line(stream: &str, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Pump one runc output stream to both the CRI log file and the live bus.
+/// Pump one crun output stream to both the CRI log file and the live bus.
 async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     channel: u8,
@@ -1919,10 +1919,10 @@ async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// Run `runc run` with piped stdio, streaming output live; returns the exit code.
+/// Run `crun run` with piped stdio, streaming output live; returns the exit code.
 /// A `terminal` container is supervised over a PTY instead (see [`supervise_tty`]).
 async fn supervise_container(
-    runc_root: &Path,
+    crun_root: &Path,
     bundle_dir: &Path,
     cid: &str,
     log_path: &Path,
@@ -1930,11 +1930,11 @@ async fn supervise_container(
     terminal: bool,
 ) -> i32 {
     if terminal {
-        return supervise_tty(runc_root, bundle_dir, cid, log_path, live).await;
+        return supervise_tty(crun_root, bundle_dir, cid, log_path, live).await;
     }
-    let mut cmd = tokio::process::Command::new(runtime::runc::DEFAULT_BIN);
+    let mut cmd = tokio::process::Command::new(runtime::crun::DEFAULT_BIN);
     cmd.arg("--root")
-        .arg(runc_root)
+        .arg(crun_root)
         .arg("run")
         .arg("--bundle")
         .arg(bundle_dir)
@@ -1942,8 +1942,8 @@ async fn supervise_container(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // Place runc and the container init in their own process group so that
-        // `runc delete --force` (sent by stop_container) can sweep any stray
+        // Place crun and the container init in their own process group so that
+        // `crun delete --force` (sent by stop_container) can sweep any stray
         // children that were reparented to init inside the group, and so that
         // signals sent to the daemon do not accidentally reach the container.
         // Stdio is already fully piped (not a terminal), so this is safe.
@@ -1953,7 +1953,7 @@ async fn supervise_container(
         Err(e) => {
             let _ = std::fs::write(
                 log_path,
-                cri_log_line("stderr", format!("runc spawn: {e}").as_bytes()),
+                cri_log_line("stderr", format!("crun spawn: {e}").as_bytes()),
             );
             return -1;
         }
@@ -1991,19 +1991,19 @@ async fn supervise_container(
     let status = child.wait().await;
     if let Ok(s) = &status {
         use std::os::unix::process::ExitStatusExt;
-        tracing::info!(container = %cid, code = ?s.code(), signal = ?s.signal(), "runc run returned");
+        tracing::info!(container = %cid, code = ?s.code(), signal = ?s.signal(), "crun run returned");
     }
     status.ok().and_then(|s| s.code()).unwrap_or(-1)
 }
 
-/// Supervise a `terminal: true` container over a PTY. runc can't share its
-/// foreground stdio with a tty container, so [`runtime::runc::run_tty`] runs it
+/// Supervise a `terminal: true` container over a PTY. crun can't share its
+/// foreground stdio with a tty container, so [`runtime::crun::run_tty`] runs it
 /// detached with a console socket and hands back the pty master; we pump the
 /// master to the CRI log + live bus (stdout channel) until the process exits
 /// (master EOF), then clean up. The detached console path can't surface an exit
 /// code, so we report 0 (tty workloads are typically long-running/interactive).
 async fn supervise_tty(
-    runc_root: &Path,
+    crun_root: &Path,
     bundle_dir: &Path,
     cid: &str,
     log_path: &Path,
@@ -2012,16 +2012,16 @@ async fn supervise_tty(
     if let Some(parent) = log_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    let runc_root = runc_root.to_path_buf();
+    let crun_root = crun_root.to_path_buf();
     let bundle_dir = bundle_dir.to_path_buf();
     let cid = cid.to_string();
     let log_path = log_path.to_path_buf();
     let console_sock = bundle_dir.join("console.sock");
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Write};
-        let master = match runtime::runc::run_tty(
-            runtime::runc::DEFAULT_BIN,
-            &runc_root,
+        let master = match runtime::crun::run_tty(
+            runtime::crun::DEFAULT_BIN,
+            &crun_root,
             &bundle_dir,
             &cid,
             &console_sock,
@@ -2030,7 +2030,7 @@ async fn supervise_tty(
             Err(e) => {
                 let _ = std::fs::write(
                     &log_path,
-                    cri_log_line("stderr", format!("runc run --tty: {e}").as_bytes()),
+                    cri_log_line("stderr", format!("crun run --tty: {e}").as_bytes()),
                 );
                 return -1;
             }
@@ -2052,7 +2052,7 @@ async fn supervise_tty(
                 }
             }
         }
-        let _ = runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root, &cid);
+        let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &cid);
         0
     })
     .await
@@ -2118,14 +2118,14 @@ pub fn reconcile(ctx: &Context) -> Result<ReconcileReport, metadata::Error> {
 
     let containers: Vec<ContainerRecord> = ctx.metadata.list(Kind::Container, ns)?;
     report.containers = containers.len();
-    let runc_root = ctx.state_dir.join("runc");
+    let crun_root = ctx.state_dir.join("crun");
     for mut c in containers {
         if c.state == ContainerState::Running {
             // Best-effort force-delete to reap any process trees that were
             // left behind by the previous daemon instance. This is safe to
-            // call even if the container is already gone (runc delete --force
+            // call even if the container is already gone (crun delete --force
             // is idempotent on unknown containers).
-            let _ = runtime::runc::delete(runtime::runc::DEFAULT_BIN, &runc_root, &c.id);
+            let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
             c.state = ContainerState::Unknown;
             ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
             report.marked_unknown += 1;
@@ -2827,8 +2827,8 @@ mod tests {
             .unwrap();
         assert_eq!(st.state, v1::ContainerState::ContainerExited as i32);
         // stop_container must NOT hardcode exit_code=0. When the container was
-        // never running (Created state here, runc unavailable in unit tests),
-        // the force-kill path sets exit_code=-1 (runc spawn failed / not found).
+        // never running (Created state here, crun unavailable in unit tests),
+        // the force-kill path sets exit_code=-1 (crun spawn failed / not found).
         // Any non-zero code is acceptable; 0 is the old buggy hardcoded value.
         assert_ne!(
             st.exit_code, 0,
@@ -3075,7 +3075,7 @@ mod tests {
         (ctx, rt, cid)
     }
 
-    /// Wait until `runc exec` works (the container is actually running).
+    /// Wait until `crun exec` works (the container is actually running).
     async fn wait_execable(rt: &RuntimeSvc, cid: &str) {
         for _ in 0..200 {
             if let Ok(resp) = rt
@@ -3096,7 +3096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network + runc: ExecSync into a running busybox container"]
+    #[ignore = "requires network + crun: ExecSync into a running busybox container"]
     async fn exec_sync_runs_in_container() {
         let dir = tempfile::tempdir().unwrap();
         let (_ctx, rt, cid) =
@@ -3117,7 +3117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network + runc: pod container reaches host localhost (shared netns)"]
+    #[ignore = "requires network + crun: pod container reaches host localhost (shared netns)"]
     async fn pod_container_has_network() {
         use tokio::io::AsyncReadExt;
 
@@ -3161,7 +3161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network + runc: attach to a running container's live stdout"]
+    #[ignore = "requires network + crun: attach to a running container's live stdout"]
     async fn attach_streams_live_stdout() {
         use futures_util::StreamExt;
 
@@ -3208,7 +3208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network + runc: reads cgroup stats from a running container"]
+    #[ignore = "requires network + crun: reads cgroup stats from a running container"]
     async fn container_stats_from_cgroup() {
         let dir = tempfile::tempdir().unwrap();
         let (_ctx, rt, cid) =
@@ -3240,7 +3240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network + runc: streaming exec over a real WebSocket"]
+    #[ignore = "requires network + crun: streaming exec over a real WebSocket"]
     async fn streaming_exec_over_websocket() {
         use futures_util::StreamExt;
 
@@ -3304,10 +3304,10 @@ mod tests {
 
     // End-to-end through the CRI services: pull busybox, create + start a
     // container running `echo`, and confirm it actually executed (exit 0 + log
-    // marker). Requires network (image pull) + runc + unprivileged userns.
+    // marker). Requires network (image pull) + crun + unprivileged userns.
     //   cargo test -p cri -- --ignored --test-threads=1
     #[tokio::test]
-    #[ignore = "requires network + runc: pulls busybox and runs a container via CRI"]
+    #[ignore = "requires network + crun: pulls busybox and runs a container via CRI"]
     async fn cri_runs_busybox_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_context(dir.path());

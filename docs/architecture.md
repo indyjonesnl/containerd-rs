@@ -5,19 +5,19 @@ kubelet. It implements the **CRI v1** contract (`RuntimeService` +
 `ImageService`) and everything beneath it — image pull, content storage,
 snapshots, container execution, pod networking, and streaming — in one daemon.
 
-## Direct-runc model
+## Direct-crun model
 
-Upstream containerd launches a per-pod `containerd-shim-runc-v2` and talks to it
-over TTRPC. containerd-rs instead **shells out to `runc` directly** and
+Upstream containerd launches a per-pod `containerd-shim-crun-v2` and talks to it
+over TTRPC. containerd-rs instead **shells out to `crun` directly** and
 supervises the container process inside the daemon (`crates/runtime`):
 
 - `CreateContainer` writes an OCI bundle (merged rootfs + generated
   `config.json`).
-- `StartContainer` spawns `runc run` with piped stdio; a supervision task pumps
+- `StartContainer` spawns `crun run` with piped stdio; a supervision task pumps
   stdout/stderr to the container log file and a live broadcast bus, and records
   the exit code.
-- `ExecSync`/`Exec` shell out to `runc exec`; `StopContainer`/`RemoveContainer`
-  use `runc kill`/`runc delete`.
+- `ExecSync`/`Exec` shell out to `crun exec`; `StopContainer`/`RemoveContainer`
+  use `crun kill`/`crun delete`.
 
 This trades the shim's out-of-process isolation for simplicity. The TTRPC shim
 client (tasks T015/T016) is therefore not implemented.
@@ -45,7 +45,7 @@ using **SPDY/3.1** — the kubelet↔runtime leg stays on SPDY permanently
 `moby/spdystream` client uses: the HTTP/1.1 upgrade, frame codec, the zlib NV
 header (de)compressor with the fixed SPDY dictionary, and a stream multiplexer
 mapping the remotecommand `streamType` streams (stdin/stdout/stderr/error/resize)
-to a streaming `runc exec`. WebSocket (`v4.channel.k8s.io`) handlers remain as a
+to a streaming `crun exec`. WebSocket (`v4.channel.k8s.io`) handlers remain as a
 fallback for clients (e.g. crictl) that connect that way.
 
 ## Content store (`crates/content`)
@@ -101,8 +101,8 @@ gone are marked appropriately) so a restart doesn't leave orphans or duplicates.
 3. `CreateContainer` → overlay the image's chainID dirs into a rootfs, generate
    the OCI `config.json` (honoring `privileged`, `run_as_user`, mounts, env),
    write the bundle, record `CREATED`.
-4. `StartContainer` → `runc run`, supervise stdio → log file + live bus, record
+4. `StartContainer` → `crun run`, supervise stdio → log file + live bus, record
    `RUNNING`; on exit record `EXITED` with the code.
 5. `Exec`/`Attach`/`PortForward` → mint a streaming URL; the kubelet connects over
-   SPDY and is wired to a live `runc exec` / the container's output bus / a
+   SPDY and is wired to a live `crun exec` / the container's output bus / a
    localhost TCP proxy.

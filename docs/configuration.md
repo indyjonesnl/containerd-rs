@@ -8,7 +8,7 @@ valid; the defaults below match a typical node layout.
 # Persistent store root: content blobs, snapshot layers, and the redb metadata db.
 root = "/var/lib/containerd-rs"
 
-# Ephemeral state: the runc state root and per-container OCI bundles. Put this on
+# Ephemeral state: the crun state root and per-container OCI bundles. Put this on
 # a tmpfs (e.g. /run) so it clears on reboot.
 state = "/run/containerd-rs"
 
@@ -24,10 +24,10 @@ stream_server_address = "127.0.0.1:10010"
 # Pause image for pod sandboxes (also reported in Status info).
 sandbox_image = "registry.k8s.io/pause:3.10"
 
-# Default runtime name / type. The direct-runc model uses runc; these mirror
+# Default runtime name / type. The direct-crun model uses crun; these mirror
 # containerd's config keys for compatibility.
-default_runtime_name = "runc"
-runtime_type = "io.containerd.runc.v2"
+default_runtime_name = "crun"
+runtime_type = "io.containerd.crun.v2"
 
 # Snapshotter. overlayfs is the implemented snapshotter.
 snapshotter = "overlayfs"
@@ -51,7 +51,7 @@ cni_bin_dir  = "/opt/cni/bin"
 | Field | Default | Purpose |
 |-------|---------|---------|
 | `root` | `/var/lib/containerd-rs` | Persistent store (content, snapshots, metadata) |
-| `state` | `/run/containerd-rs` | Ephemeral state (runc root, OCI bundles) |
+| `state` | `/run/containerd-rs` | Ephemeral state (crun root, OCI bundles) |
 | `cri_socket` | `/run/containerd-rs.sock` | CRI gRPC Unix socket |
 | `stream_server_address` | `127.0.0.1:10010` | Streaming server listen address |
 
@@ -60,8 +60,8 @@ cni_bin_dir  = "/opt/cni/bin"
 | Field | Default | Purpose |
 |-------|---------|---------|
 | `sandbox_image` | `registry.k8s.io/pause:3.10` | Pod sandbox (pause) image |
-| `default_runtime_name` | `runc` | Default OCI runtime |
-| `runtime_type` | `io.containerd.runc.v2` | Runtime type (compatibility) |
+| `default_runtime_name` | `crun` | Default OCI runtime |
+| `runtime_type` | `io.containerd.crun.v2` | Runtime type (compatibility) |
 | `snapshotter` | `overlayfs` | Snapshotter implementation |
 | `systemd_cgroup` | `false` | Use systemd cgroup driver (else cgroupfs) |
 | `registry_config_path` | `/etc/containerd-rs/certs.d` | Per-registry host config dir |

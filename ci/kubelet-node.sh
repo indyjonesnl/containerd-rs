@@ -12,19 +12,19 @@
 #     -v <containerd-rs binary>:/usr/local/bin/containerd-rs:ro \
 #     -v <kubelet>:/usr/local/bin/kubelet:ro \
 #     -v <crictl>:/usr/local/bin/crictl:ro \
-#     -v /usr/bin/runc:/hostrunc:ro \
+#     -v /usr/bin/crun:/hostcrun:ro \
 #     -v $PWD/ci/kubelet-node.sh:/node.sh:ro \
 #     ubuntu:24.04 bash /node.sh
 #
-# IMPORTANT: runc must be COPIED to a normal path (not bind-mounted read-only) —
-# runc's CVE-2019-5736 memfd self-exec fails to start init from a ro bind mount
-# ("fork/exec /proc/self/fd/N: permission denied").
+# IMPORTANT: the OCI runtime must be COPIED to a normal path (not bind-mounted
+# read-only) — a runtime that self-execs from /proc/self/fd fails to start init
+# from a ro bind mount ("fork/exec /proc/self/fd/N: permission denied").
 set -u
 EP="unix:///run/containerd-rs.sock"
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ca-certificates >/dev/null 2>&1
-cp /hostrunc /usr/local/bin/runc && chmod +x /usr/local/bin/runc
+cp /hostcrun /usr/local/bin/crun && chmod +x /usr/local/bin/crun
 
 mkdir -p /etc/containerd-rs /run /var/lib/containerd-rs /etc/kubernetes/manifests /var/lib/kubelet
 cat > /etc/containerd-rs/config.toml <<EOF

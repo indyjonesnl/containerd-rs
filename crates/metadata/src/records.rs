@@ -82,7 +82,7 @@ pub struct SandboxRecord {
     pub sysctls: HashMap<String, String>,
     /// CRI `LinuxPodSandboxConfig.cgroup_parent` — the kubelet-managed cgroup the
     /// pod's containers live under. Containers set `linux.cgroupsPath` beneath it
-    /// so runc applies resource limits in a delegated cgroup (rather than at the
+    /// so crun applies resource limits in a delegated cgroup (rather than at the
     /// root, which fails cgroup-v2's "no internal processes" rule).
     #[serde(default)]
     pub cgroup_parent: String,

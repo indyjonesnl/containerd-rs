@@ -5,7 +5,7 @@
 //! per-shim TTRPC **socket address** hashing, and the on-disk **bundle layout**
 //! used for launch and restart recovery (see contracts/external-contracts.md §1
 //! and §7). The actual process launch + bootstrap handshake + TTRPC Task client
-//! require the `containerd-shim-runc-v2` binary and a live node, so they are not
+//! require the `containerd-shim-crun-v2` binary and a live node, so they are not
 //! implemented here yet (remainder of T015/T016).
 
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use core_types::Digest;
 ///
 /// containerd takes the last two dot-separated components of the runtime id,
 /// joins them with `-`, and prefixes `containerd-shim-`. So
-/// `io.containerd.runc.v2` -> `containerd-shim-runc-v2`.
+/// `io.containerd.crun.v2` -> `containerd-shim-crun-v2`.
 pub fn shim_binary_name(runtime_id: &str) -> String {
     let parts: Vec<&str> = runtime_id.split('.').collect();
     let n = parts.len();
@@ -98,8 +98,8 @@ mod tests {
     #[test]
     fn binary_name_from_runtime_id() {
         assert_eq!(
-            shim_binary_name("io.containerd.runc.v2"),
-            "containerd-shim-runc-v2"
+            shim_binary_name("io.containerd.crun.v2"),
+            "containerd-shim-crun-v2"
         );
         assert_eq!(
             shim_binary_name("io.containerd.runwasi.v1"),

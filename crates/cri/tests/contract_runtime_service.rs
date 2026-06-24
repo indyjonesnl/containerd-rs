@@ -5,7 +5,7 @@
 //! handshake, sandbox/container lifecycle + status, list filters, the
 //! SANDBOX/CONTAINER state enums, idempotent stop/remove, the streaming-URL
 //! contract for Exec/Attach/PortForward, and the Status runtime conditions.
-//! Requires no runc/network (host-network sandbox, container stays Created).
+//! Requires no crun/network (host-network sandbox, container stays Created).
 
 mod common;
 
@@ -260,7 +260,7 @@ async fn container_create_status_enum_is_created() {
 }
 
 /// Create a host-network sandbox + a (Created) container; return their ids.
-/// No runc needed — CreateContainer writes the bundle/record without starting.
+/// No crun needed — CreateContainer writes the bundle/record without starting.
 async fn make_pod_and_container(h: &mut common::Harness) -> (String, String) {
     let sb = host_network_sandbox("pod-x", "uid-x");
     let sid =
@@ -301,7 +301,7 @@ async fn make_pod_and_container(h: &mut common::Harness) -> (String, String) {
 async fn exec_attach_portforward_return_streaming_urls() {
     let mut h = common::start().await;
     let (sid, cid) = make_pod_and_container(&mut h).await;
-    // These mint a one-time URL into the streaming server without touching runc.
+    // These mint a one-time URL into the streaming server without touching crun.
     let exec =
         h.rt.exec(v1::ExecRequest {
             container_id: cid.clone(),

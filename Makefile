@@ -45,7 +45,7 @@ check: fmt-check lint test
 ci: check
 
 ## --- Conformance pipeline (pending CRI runtime: tasks T015-T038) ---
-## These targets are the eventual proof harness. They require root, runc,
+## These targets are the eventual proof harness. They require root, crun,
 ## kubeadm/kubelet, CNI, and hydrophone. Run locally before pushing.
 
 cluster-up:

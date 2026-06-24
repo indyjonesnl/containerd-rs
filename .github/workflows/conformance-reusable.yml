@@ -72,7 +72,7 @@ jobs:
           # (host netns, full cgroup-v2 hierarchy), so it can create /kubepods
           # directly without the kind-style delegation the nested-docker harness
           # needs.
-          sudo --preserve-env=K8S_VERSION,CRI_SOCKET RUNC_SRC=/usr/local/bin/runc \
+          sudo --preserve-env=K8S_VERSION,CRI_SOCKET CRUN_SRC=/usr/local/bin/crun \
             DAEMON_BIN="$PWD/target/release/containerd-rs" CONFIG="$PWD/ci/config.toml" \
             CGROUPS_PER_QOS=true \
             bash ci/kubeadm-init.sh
