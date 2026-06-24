@@ -99,6 +99,17 @@ pub struct ContainerRequest {
     /// cgroup-v2's "no internal processes" rule). Mirrors containerd's
     /// `getCgroupsPath` + "set cgroup only if cgroup_parent != \"\"".
     pub cgroup_path: Option<String>,
+    /// CRI `security_context.capabilities.add_capabilities` — capability names to
+    /// add to the container's OCI `process.capabilities` sets (bounding/effective/
+    /// permitted/inheritable). Names may be given with or without the `CAP_` prefix
+    /// (e.g. `"NET_ADMIN"` or `"CAP_NET_ADMIN"`). `"ALL"` expands to every
+    /// capability in `all_capabilities()`. Ignored for privileged containers.
+    pub add_capabilities: Vec<String>,
+    /// CRI `security_context.capabilities.drop_capabilities` — capability names to
+    /// remove from the container's OCI `process.capabilities` sets. Applied after
+    /// `add_capabilities`. `"ALL"` drops every capability. Ignored for privileged
+    /// containers.
+    pub drop_capabilities: Vec<String>,
 }
 
 /// CRI container resource limits/requests mapped to OCI `linux.resources`.
@@ -199,6 +210,90 @@ fn default_capabilities() -> std::collections::HashSet<Capability> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Parse a CRI capability name (e.g. `"NET_ADMIN"` or `"CAP_NET_ADMIN"`) into
+/// an `oci_spec::runtime::Capability` variant.  Returns `None` for `"ALL"`
+/// (case-insensitive) — the caller expands that to `all_capabilities()` — and
+/// also for unknown names.
+///
+/// `Capability` derives `strum::EnumString` with `SCREAMING_SNAKE_CASE`, so
+/// `"NET_ADMIN".parse::<Capability>()` works directly after stripping any
+/// leading `CAP_` prefix.
+fn parse_cap(name: &str) -> Option<Capability> {
+    let upper = name.trim().to_uppercase();
+    // Strip any number of leading "CAP_" prefixes (oci-spec does the same in Deserialize).
+    let mut key = upper.as_str();
+    while let Some(stripped) = key.strip_prefix("CAP_") {
+        key = stripped;
+    }
+    if key == "ALL" {
+        return None;
+    }
+    key.parse::<Capability>().ok()
+}
+
+/// Apply `add_capabilities` / `drop_capabilities` to a non-privileged spec.
+///
+/// Algorithm:
+///  1. Start from the default process caps already in `spec` (the containerd
+///     default 14-cap set written by [`default_capabilities`]).
+///  2. Insert each parsed `add` capability (or the full set for `"ALL"`).
+///  3. Remove each parsed `drop` capability (or the full set for `"ALL"`).
+///  4. Write the result to bounding/effective/permitted/inheritable.
+fn apply_capabilities(spec: &mut Spec, add: &[String], drop: &[String]) {
+    if add.is_empty() && drop.is_empty() {
+        return;
+    }
+
+    // Seed from the default caps already present in the spec's process.
+    let mut cap_set: std::collections::HashSet<Capability> = spec
+        .process()
+        .as_ref()
+        .and_then(|p| p.capabilities().as_ref())
+        .and_then(|c| c.bounding().clone())
+        .unwrap_or_default();
+
+    // Apply adds.  `parse_cap` returns None for "ALL"; we handle that separately.
+    for name in add {
+        let upper = name.trim().to_uppercase();
+        let mut key = upper.as_str();
+        while let Some(s) = key.strip_prefix("CAP_") {
+            key = s;
+        }
+        if key == "ALL" {
+            cap_set.extend(all_capabilities());
+        } else if let Some(cap) = parse_cap(name) {
+            cap_set.insert(cap);
+        }
+    }
+
+    // Apply drops.
+    for name in drop {
+        let upper = name.trim().to_uppercase();
+        let mut key = upper.as_str();
+        while let Some(s) = key.strip_prefix("CAP_") {
+            key = s;
+        }
+        if key == "ALL" {
+            cap_set.clear();
+        } else if let Some(cap) = parse_cap(name) {
+            cap_set.remove(&cap);
+        }
+    }
+
+    if let Ok(lc) = LinuxCapabilitiesBuilder::default()
+        .bounding(cap_set.clone())
+        .effective(cap_set.clone())
+        .permitted(cap_set.clone())
+        .inheritable(cap_set)
+        .build()
+    {
+        if let Some(mut process) = spec.process().clone() {
+            process.set_capabilities(Some(lc));
+            spec.set_process(Some(process));
+        }
+    }
 }
 
 /// Build `LinuxCapabilities` with `caps` in the bounding/effective/permitted/
@@ -368,6 +463,8 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     }
     if req.privileged {
         apply_privileged(&mut spec);
+    } else {
+        apply_capabilities(&mut spec, &req.add_capabilities, &req.drop_capabilities);
     }
     apply_sysctls(&mut spec, &req.sysctls);
     Ok(spec)
@@ -713,6 +810,133 @@ mod tests {
         // Round-trips back through the parser.
         let reloaded = Spec::load(&config).unwrap();
         assert_eq!(reloaded.hostname().as_deref(), Some("pod-xyz"));
+    }
+
+    // ---------- capabilities tests ----------
+
+    /// Non-privileged container with add_capabilities=["NET_ADMIN"]:
+    /// OCI process.capabilities bounding/effective/permitted must contain NetAdmin.
+    #[test]
+    fn capabilities_add_net_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            add_capabilities: vec!["NET_ADMIN".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("rootfs")).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .as_ref()
+            .expect("capabilities must be set");
+        assert!(
+            caps.bounding()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "bounding must contain NetAdmin"
+        );
+        assert!(
+            caps.effective()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "effective must contain NetAdmin"
+        );
+        assert!(
+            caps.permitted()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "permitted must contain NetAdmin"
+        );
+    }
+
+    /// Non-privileged container with drop_capabilities=["NET_ADMIN"]:
+    /// OCI process.capabilities bounding/effective/permitted must NOT contain NetAdmin.
+    #[test]
+    fn capabilities_drop_net_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            drop_capabilities: vec!["NET_ADMIN".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("rootfs")).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .as_ref()
+            .expect("capabilities must be set");
+        assert!(
+            !caps
+                .bounding()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "bounding must NOT contain NetAdmin"
+        );
+        assert!(
+            !caps
+                .effective()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "effective must NOT contain NetAdmin"
+        );
+        assert!(
+            !caps
+                .permitted()
+                .as_ref()
+                .map(|s| s.contains(&Capability::NetAdmin))
+                .unwrap_or(false),
+            "permitted must NOT contain NetAdmin"
+        );
+    }
+
+    /// Privileged container: add/drop fields are ignored; full all_capabilities() set
+    /// is always applied (short-circuit unchanged).
+    #[test]
+    fn capabilities_privileged_short_circuit() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            privileged: true,
+            drop_capabilities: vec!["NET_ADMIN".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("rootfs")).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .as_ref()
+            .expect("capabilities must be set for privileged");
+        let expected = all_capabilities();
+        assert!(
+            caps.bounding()
+                .as_ref()
+                .map(|s| *s == expected)
+                .unwrap_or(false),
+            "privileged bounding must equal full all_capabilities() set"
+        );
+        assert!(
+            caps.effective()
+                .as_ref()
+                .map(|s| *s == expected)
+                .unwrap_or(false),
+            "privileged effective must equal full all_capabilities() set"
+        );
+        assert!(
+            caps.permitted()
+                .as_ref()
+                .map(|s| *s == expected)
+                .unwrap_or(false),
+            "privileged permitted must equal full all_capabilities() set"
+        );
     }
 
     /// DirectoryOrCreate: a bind-mount whose source dir does not yet exist must
