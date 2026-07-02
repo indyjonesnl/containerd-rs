@@ -981,6 +981,12 @@ impl RuntimeService for RuntimeSvc {
                 .as_ref()
                 .and_then(|l| l.resources.as_ref())
                 .map(resources_record),
+            // Re-adoption fields are populated when the container is started
+            // (see restart-survival wiring, feature 002 US1). Unset at creation.
+            crun_root: None,
+            bundle_dir: None,
+            pid: None,
+            restart_count: 0,
         };
 
         // Touch the CRI LogPath synchronously so the kubelet / crictl can
@@ -1936,6 +1942,12 @@ async fn supervise_container(
     cmd.arg("--root")
         .arg(crun_root)
         .arg("run")
+        // M2a: the container rootfs lives inside the initramfs ramfs (state =
+        // /run/containerd-rs). pivot_root(2) requires the new root and the
+        // put-old dir to be on different filesystems — it fails with EINVAL
+        // when both are on the same ramfs mount. --no-pivot uses MS_MOVE +
+        // chroot instead and works regardless of filesystem boundaries.
+        .arg("--no-pivot")
         .arg("--bundle")
         .arg(bundle_dir)
         .arg(cid)
@@ -1992,6 +2004,15 @@ async fn supervise_container(
     if let Ok(s) = &status {
         use std::os::unix::process::ExitStatusExt;
         tracing::info!(container = %cid, code = ?s.code(), signal = ?s.signal(), "crun run returned");
+        // M2a debug: on non-zero exit, tee the CRI log (crun's stderr) to the
+        // tracing output so it surfaces on the serial console. Remove once the
+        // systemic crun exit-1 root cause is identified.
+        if s.code() != Some(0) {
+            if let Ok(bytes) = tokio::fs::read(log_path).await {
+                let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+                tracing::error!(container = %cid, log = %snippet, "crun stderr (debug)");
+            }
+        }
     }
     status.ok().and_then(|s| s.code()).unwrap_or(-1)
 }
@@ -2373,6 +2394,10 @@ mod tests {
                 annotations: Default::default(),
                 mounts: Vec::new(),
                 resources: None,
+                crun_root: None,
+                bundle_dir: None,
+                pid: None,
+                restart_count: 0,
             }
         }
 
@@ -2977,6 +3002,10 @@ mod tests {
                     annotations: Default::default(),
                     mounts: Vec::new(),
                     resources: None,
+                    crun_root: None,
+                    bundle_dir: None,
+                    pid: None,
+                    restart_count: 0,
                 },
             )
             .unwrap();
