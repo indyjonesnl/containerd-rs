@@ -40,6 +40,21 @@ async fn main() -> anyhow::Result<()> {
         "containerd-rs starting"
     );
 
+    // containerd-rs targets a unified cgroup v2 hierarchy only. Refuse a v1 /
+    // hybrid host up front with a clear error rather than misprogramming limits
+    // (feature 002 FR-015). Detection failure is non-fatal (assume v2).
+    match runtime::cgroup::detect_default() {
+        Ok(runtime::cgroup::CgroupVersion::V2) => {}
+        Ok(runtime::cgroup::CgroupVersion::V1OrHybrid) => {
+            anyhow::bail!(
+                "containerd-rs requires a unified cgroup v2 hierarchy at \
+                 /sys/fs/cgroup, but this host is cgroup v1 or hybrid. Boot with \
+                 systemd.unified_cgroup_hierarchy=1 (or the distro equivalent) and retry."
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "could not detect cgroup version; assuming v2"),
+    }
+
     // Initialize persistent subsystems. This validates the on-disk layout.
     std::fs::create_dir_all(&cfg.root)?;
     std::fs::create_dir_all(&cfg.state)?;
