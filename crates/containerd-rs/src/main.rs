@@ -86,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
         Ok(r) => tracing::info!(
             sandboxes = r.sandboxes,
             containers = r.containers,
+            readopted = r.readopted,
+            reaped = r.reaped,
             marked_unknown = r.marked_unknown,
             "reconciled persisted state"
         ),

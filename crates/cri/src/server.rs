@@ -1264,6 +1264,11 @@ impl RuntimeService for RuntimeSvc {
         // Mark Running before launching; supervision flips it to Exited on exit.
         rec.state = ContainerState::Running;
         rec.started_at = Some(unix_nanos() as u64);
+        // Persist re-adoption handles (feature 002 US1 / T009) so that after a
+        // daemon restart `reconcile()` can probe `crun state <id>` and re-adopt a
+        // still-running container instead of tearing it down.
+        rec.crun_root = Some(crun_root.display().to_string());
+        rec.bundle_dir = Some(bundle.dir().display().to_string());
         self.ctx
             .metadata
             .put(Kind::Container, self.ns(), &id, &rec)
@@ -2119,17 +2124,35 @@ fn dir_size(path: &Path) -> u64 {
 pub struct ReconcileReport {
     pub sandboxes: usize,
     pub containers: usize,
+    /// Previously-`Running` containers still alive under crun — re-adopted
+    /// (kept `Running`, not torn down). These are the pods that survive a
+    /// daemon restart (feature 002 US1 / FR-001).
+    pub readopted: usize,
+    /// Previously-`Running` containers found already exited/created under crun
+    /// while the daemon was down — reaped and recorded as `Exited`.
+    pub reaped: usize,
+    /// Previously-`Running` containers crun no longer knows about — marked
+    /// `Unknown` for the kubelet to reconcile.
     pub marked_unknown: usize,
 }
 
 /// Reconcile persisted state after a daemon restart.
 ///
 /// The metadata DB survives restarts, so sandboxes and containers are
-/// re-discovered (not orphaned or duplicated). Because task supervision
-/// (T015–T016) is not yet wired, there is no live shim to confirm a previously
-/// `Running` container is still alive — such containers are conservatively
-/// marked `Unknown` so the kubelet reconciles them, rather than being falsely
-/// reported as `Running`.
+/// re-discovered. For each previously-`Running` container we probe
+/// `crun state <id>` (feature 002 US1):
+///  - **running** → **re-adopt**: keep it `Running` and refresh its re-adoption
+///    handles. Crucially we do NOT `crun delete --force` it (the old behavior,
+///    which killed every running container's process tree on restart and churned
+///    every pod on the node).
+///  - **created/stopped** → it exited or never fully started while we were down:
+///    reap it (`crun delete --force`) and record `Exited` (exit code unknown for
+///    a container whose init we did not parent — this generation's exit fidelity
+///    is degraded; see feature 002 US1 notes / deferred T008/T012).
+///  - **unknown to crun** → mark `Unknown` for the kubelet to reconcile.
+///
+/// Idempotent and crash-safe (T013): re-running it converges; a container that
+/// exits between probe and write is caught on the next status query or pass.
 pub fn reconcile(ctx: &Context) -> Result<ReconcileReport, metadata::Error> {
     let ns = &ctx.namespace;
     let mut report = ReconcileReport::default();
@@ -2141,15 +2164,40 @@ pub fn reconcile(ctx: &Context) -> Result<ReconcileReport, metadata::Error> {
     report.containers = containers.len();
     let crun_root = ctx.state_dir.join("crun");
     for mut c in containers {
-        if c.state == ContainerState::Running {
-            // Best-effort force-delete to reap any process trees that were
-            // left behind by the previous daemon instance. This is safe to
-            // call even if the container is already gone (crun delete --force
-            // is idempotent on unknown containers).
-            let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
-            c.state = ContainerState::Unknown;
-            ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
-            report.marked_unknown += 1;
+        if c.state != ContainerState::Running {
+            continue;
+        }
+        match runtime::crun::probe(runtime::crun::DEFAULT_BIN, &crun_root, &c.id) {
+            Ok(Some(st)) if st.is_running() => {
+                // Still alive — re-adopt. Refresh handles; leave state Running.
+                c.crun_root = Some(crun_root.display().to_string());
+                if st.pid.is_some() {
+                    c.pid = st.pid;
+                }
+                ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
+                report.readopted += 1;
+            }
+            Ok(Some(_)) => {
+                // created/stopped while we were down: reap and record exit.
+                let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
+                c.state = ContainerState::Exited;
+                if c.finished_at.is_none() {
+                    c.finished_at = Some(unix_nanos() as u64);
+                }
+                if c.exit_code.is_none() {
+                    c.exit_code = Some(-1);
+                    c.reason = Some("Unknown".to_string());
+                }
+                ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
+                report.reaped += 1;
+            }
+            Ok(None) | Err(_) => {
+                // crun has no record — idempotent cleanup, then mark Unknown.
+                let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
+                c.state = ContainerState::Unknown;
+                ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
+                report.marked_unknown += 1;
+            }
         }
     }
     Ok(report)
