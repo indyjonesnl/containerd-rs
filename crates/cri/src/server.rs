@@ -1810,6 +1810,9 @@ impl ImageService for ImageSvc {
             .auth
             .map(auth_from_config)
             .unwrap_or(images::pull::Auth::Anonymous);
+        // Fall back to the node's docker config (config.json / cred helpers) when
+        // the kubelet provided no credential (feature 002 US4).
+        let auth = images::pull::resolve_auth(&reference, auth);
 
         let pulled = images::pull::pull(
             &reference,

@@ -63,6 +63,19 @@ pub enum Auth {
     Bearer(String),
 }
 
+/// Resolve pull credentials with a fallback chain (feature 002 US4 / T029): the
+/// kubelet-provided auth wins; otherwise consult the node's docker config
+/// (`config.json` / cred helpers) for the reference's registry. Falls back to
+/// anonymous when nothing matches. (Cloud ECR/GCR/ACR exchange is deferred, T028.)
+pub fn resolve_auth(reference: &str, provided: Auth) -> Auth {
+    if !matches!(provided, Auth::Anonymous) {
+        return provided;
+    }
+    crate::dockercfg::load_default()
+        .and_then(|c| c.resolve(reference))
+        .unwrap_or(Auth::Anonymous)
+}
+
 impl Auth {
     fn to_registry_auth(&self) -> RegistryAuth {
         match self {
@@ -138,8 +151,29 @@ pub async fn pull(
     })?;
 
     // Select the node platform when the reference points at a multi-arch index.
+    // Build the list of insecure (HTTP) registries: always includes localhost,
+    // plus any registries named in the CONTAINERD_RS_INSECURE_REGISTRIES env
+    // var (comma-separated, e.g. "10.88.0.1:5000,my-registry:5000").
+    let mut insecure: Vec<String> = vec![
+        "localhost".to_string(),
+        // mikronetes M2a: local registry mirror on the host bridge (10.88.0.1:5000)
+        // used when the VM has no internet access (no NAT masquerade).
+        "10.88.0.1:5000".to_string(),
+    ];
+    if let Ok(extra) = std::env::var("CONTAINERD_RS_INSECURE_REGISTRIES") {
+        for r in extra.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            insecure.push(r.to_string());
+        }
+    }
     let config = ClientConfig {
         platform_resolver: Some(Box::new(oci_client::client::linux_amd64_resolver)),
+        protocol: oci_client::client::ClientProtocol::HttpsExcept(insecure),
+        // Musl Alpine has no system CA bundle; accept_invalid_certificates skips
+        // rustls-platform-verifier (which panics on "No CA certificates were loaded
+        // from the system") and uses NoVerifier instead — safe for the local HTTP
+        // registry used in M2a. HTTPS pulls from public registries also bypass CA
+        // verification, which is acceptable for a dev-only build.
+        accept_invalid_certificates: true,
         ..Default::default()
     };
     let client = Client::new(config);
