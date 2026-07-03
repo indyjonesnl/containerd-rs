@@ -1559,6 +1559,33 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(v1::ListPodSandboxStatsResponse { stats }))
     }
 
+    async fn list_metric_descriptors(
+        &self,
+        _request: Request<v1::ListMetricDescriptorsRequest>,
+    ) -> Result<Response<v1::ListMetricDescriptorsResponse>, Status> {
+        Ok(Response::new(v1::ListMetricDescriptorsResponse {
+            descriptors: metric_descriptors(),
+        }))
+    }
+
+    async fn list_pod_sandbox_metrics(
+        &self,
+        _request: Request<v1::ListPodSandboxMetricsRequest>,
+    ) -> Result<Response<v1::ListPodSandboxMetricsResponse>, Status> {
+        let sandboxes: Vec<SandboxRecord> = self
+            .ctx
+            .metadata
+            .list(Kind::Sandbox, self.ns())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let pod_metrics = sandboxes
+            .iter()
+            .map(pod_sandbox_metrics_for)
+            .collect::<Vec<_>>();
+        Ok(Response::new(v1::ListPodSandboxMetricsResponse {
+            pod_metrics,
+        }))
+    }
+
     async fn list_container_stats(
         &self,
         request: Request<v1::ListContainerStatsRequest>,
@@ -1715,8 +1742,6 @@ impl RuntimeService for RuntimeSvc {
 
     unary_unimpl! {
         checkpoint_container => CheckpointContainerRequest / CheckpointContainerResponse,
-        list_metric_descriptors => ListMetricDescriptorsRequest / ListMetricDescriptorsResponse,
-        list_pod_sandbox_metrics => ListPodSandboxMetricsRequest / ListPodSandboxMetricsResponse,
         update_pod_sandbox_resources => UpdatePodSandboxResourcesRequest / UpdatePodSandboxResourcesResponse,
     }
 }
@@ -2008,6 +2033,65 @@ fn map_selinux(opt: Option<&v1::SeLinuxOption>) -> Option<String> {
 /// label unconditionally broke them on the (non-SELinux) CI runner.
 fn host_selinux_enabled() -> bool {
     std::path::Path::new("/sys/fs/selinux/enforce").exists()
+}
+
+/// The metric families containerd-rs exports via `ListMetricDescriptors` /
+/// `ListPodSandboxMetrics` (feature 002 US3 / T024). A minimal cadvisor-style
+/// set — pod-level CPU and memory read from the pod cgroup. (Full metric-family
+/// parity with containerd needs the reference set; see feature 002 SC-004.)
+fn metric_descriptors() -> Vec<v1::MetricDescriptor> {
+    vec![
+        v1::MetricDescriptor {
+            name: "container_cpu_usage_seconds_total".to_string(),
+            help: "Cumulative CPU time consumed, in nanoseconds.".to_string(),
+            label_keys: Vec::new(),
+        },
+        v1::MetricDescriptor {
+            name: "container_memory_working_set_bytes".to_string(),
+            help: "Current memory working set, in bytes.".to_string(),
+            label_keys: Vec::new(),
+        },
+    ]
+}
+
+fn metric(name: &str, ty: v1::MetricType, value: u64, ts: i64) -> v1::Metric {
+    v1::Metric {
+        name: name.to_string(),
+        timestamp: ts,
+        metric_type: ty as i32,
+        label_values: Vec::new(),
+        value: Some(v1::UInt64Value { value }),
+    }
+}
+
+/// Build `PodSandboxMetrics` for a sandbox from its pod cgroup (feature 002 T024).
+fn pod_sandbox_metrics_for(sb: &SandboxRecord) -> v1::PodSandboxMetrics {
+    let ts = unix_nanos();
+    let cg = if sb.cgroup_parent.is_empty() {
+        runtime::cgroup::CgroupStats::default()
+    } else {
+        let dir =
+            std::path::Path::new("/sys/fs/cgroup").join(sb.cgroup_parent.trim_start_matches('/'));
+        runtime::cgroup::read_stats(&dir)
+    };
+    v1::PodSandboxMetrics {
+        pod_sandbox_id: sb.id.clone(),
+        metrics: vec![
+            metric(
+                "container_cpu_usage_seconds_total",
+                v1::MetricType::Counter,
+                cg.cpu_usage_nanos,
+                ts,
+            ),
+            metric(
+                "container_memory_working_set_bytes",
+                v1::MetricType::Gauge,
+                cg.memory_current_bytes,
+                ts,
+            ),
+        ],
+        container_metrics: Vec::new(),
+    }
 }
 
 fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources {
@@ -2494,6 +2578,19 @@ mod tests {
             dir.join("cni/net.d"),
             dir.join("cni/bin"),
         ))
+    }
+
+    // Feature 002 US3 / T024: the exported metric descriptors are stable and the
+    // per-metric builder tags type/value correctly.
+    #[test]
+    fn metric_descriptors_and_builder() {
+        let d = metric_descriptors();
+        let names: Vec<&str> = d.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"container_cpu_usage_seconds_total"));
+        assert!(names.contains(&"container_memory_working_set_bytes"));
+        let m = metric("container_memory_working_set_bytes", v1::MetricType::Gauge, 4096, 1);
+        assert_eq!(m.metric_type, v1::MetricType::Gauge as i32);
+        assert_eq!(m.value.unwrap().value, 4096);
     }
 
     // Feature 002 US3 / T026: the container-event bus delivers lifecycle events
