@@ -299,6 +299,81 @@ impl RuntimeSvc {
         })
     }
 
+    /// Build CRI `PodSandboxStats` for a sandbox (feature 002 US3 / T023):
+    /// pod-level CPU/memory read from the pod cgroup (v2) via `runtime::cgroup`,
+    /// plus per-container stats for the sandbox's running containers. Network and
+    /// process usage are left unset (follow-up); missing cgroup files read as 0.
+    async fn pod_sandbox_stats_for(&self, sb: &SandboxRecord) -> v1::PodSandboxStats {
+        let ts = unix_nanos();
+        // Pod-level usage from the kubelet-delegated pod cgroup, when present.
+        let cg = if sb.cgroup_parent.is_empty() {
+            runtime::cgroup::CgroupStats::default()
+        } else {
+            let dir = std::path::Path::new("/sys/fs/cgroup")
+                .join(sb.cgroup_parent.trim_start_matches('/'));
+            runtime::cgroup::read_stats(&dir)
+        };
+
+        // Per-container stats for this sandbox's running containers.
+        let mut containers = Vec::new();
+        if let Ok(recs) = self
+            .ctx
+            .metadata
+            .list::<ContainerRecord>(Kind::Container, self.ns())
+        {
+            for rec in recs.iter().filter(|r| r.sandbox_id == sb.id) {
+                if let Some(s) = self.container_stats_for(rec).await {
+                    containers.push(s);
+                }
+            }
+        }
+
+        v1::PodSandboxStats {
+            attributes: Some(v1::PodSandboxAttributes {
+                id: sb.id.clone(),
+                metadata: Some(v1::PodSandboxMetadata {
+                    name: sb.name.clone(),
+                    uid: sb.uid.clone(),
+                    namespace: sb.k8s_namespace.clone(),
+                    attempt: sb.attempt,
+                }),
+                labels: sb.labels.clone(),
+                annotations: sb.annotations.clone(),
+            }),
+            linux: Some(v1::LinuxPodSandboxStats {
+                cpu: Some(v1::CpuUsage {
+                    timestamp: ts,
+                    usage_core_nano_seconds: Some(v1::UInt64Value {
+                        value: cg.cpu_usage_nanos,
+                    }),
+                    usage_nano_cores: None,
+                    psi: None,
+                }),
+                memory: Some(v1::MemoryUsage {
+                    timestamp: ts,
+                    working_set_bytes: Some(v1::UInt64Value {
+                        value: cg.memory_current_bytes,
+                    }),
+                    available_bytes: None,
+                    usage_bytes: Some(v1::UInt64Value {
+                        value: cg.memory_current_bytes,
+                    }),
+                    rss_bytes: Some(v1::UInt64Value {
+                        value: cg.memory_anon_bytes,
+                    }),
+                    page_faults: None,
+                    major_page_faults: None,
+                    psi: None,
+                }),
+                network: None,
+                process: None,
+                containers,
+                io: None,
+            }),
+            windows: None,
+        }
+    }
+
     /// Find an image record by reference, image id, repo tag, or name.
     fn find_image(&self, image_ref: &str) -> Result<Option<ImageRecord>, Status> {
         let all = self
@@ -1402,6 +1477,45 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(v1::ContainerStatsResponse { stats }))
     }
 
+    async fn pod_sandbox_stats(
+        &self,
+        request: Request<v1::PodSandboxStatsRequest>,
+    ) -> Result<Response<v1::PodSandboxStatsResponse>, Status> {
+        let id = request.into_inner().pod_sandbox_id;
+        let sb = self
+            .ctx
+            .metadata
+            .get::<SandboxRecord>(Kind::Sandbox, self.ns(), &id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("sandbox {id} not found")))?;
+        let stats = self.pod_sandbox_stats_for(&sb).await;
+        Ok(Response::new(v1::PodSandboxStatsResponse {
+            stats: Some(stats),
+        }))
+    }
+
+    async fn list_pod_sandbox_stats(
+        &self,
+        request: Request<v1::ListPodSandboxStatsRequest>,
+    ) -> Result<Response<v1::ListPodSandboxStatsResponse>, Status> {
+        let filter = request.into_inner().filter;
+        let sandboxes: Vec<SandboxRecord> = self
+            .ctx
+            .metadata
+            .list(Kind::Sandbox, self.ns())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut stats = Vec::new();
+        for sb in sandboxes {
+            let keep = filter
+                .as_ref()
+                .is_none_or(|f| f.id.is_empty() || f.id == sb.id);
+            if keep {
+                stats.push(self.pod_sandbox_stats_for(&sb).await);
+            }
+        }
+        Ok(Response::new(v1::ListPodSandboxStatsResponse { stats }))
+    }
+
     async fn list_container_stats(
         &self,
         request: Request<v1::ListContainerStatsRequest>,
@@ -1557,8 +1671,6 @@ impl RuntimeService for RuntimeSvc {
     }
 
     unary_unimpl! {
-        pod_sandbox_stats => PodSandboxStatsRequest / PodSandboxStatsResponse,
-        list_pod_sandbox_stats => ListPodSandboxStatsRequest / ListPodSandboxStatsResponse,
         checkpoint_container => CheckpointContainerRequest / CheckpointContainerResponse,
         list_metric_descriptors => ListMetricDescriptorsRequest / ListMetricDescriptorsResponse,
         list_pod_sandbox_metrics => ListPodSandboxMetricsRequest / ListPodSandboxMetricsResponse,
@@ -2406,12 +2518,29 @@ mod tests {
 
         // A still-unimplemented RPC returns the right gRPC code.
         let err = client
+            .checkpoint_container(v1::CheckpointContainerRequest {
+                container_id: "nope".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        // PodSandboxStats is now implemented: an unknown sandbox is NotFound
+        // (not Unimplemented), and ListPodSandboxStats returns an (empty) list.
+        let err = client
             .pod_sandbox_stats(v1::PodSandboxStatsRequest {
                 pod_sandbox_id: "nope".into(),
             })
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let lst = client
+            .list_pod_sandbox_stats(v1::ListPodSandboxStatsRequest { filter: None })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(lst.stats.is_empty());
 
         // ImageService is wired to the metadata store: empty list + missing
         // image status are real (no network needed).
