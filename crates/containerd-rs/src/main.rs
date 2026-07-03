@@ -116,6 +116,11 @@ async fn main() -> anyhow::Result<()> {
         ctx.streaming.clone(),
         std::future::pending::<()>(),
     );
+
+    // Notify systemd (Type=notify) that we are up (feature 002 US6 / T034).
+    // No-op when not run under systemd (NOTIFY_SOCKET unset).
+    sd_notify_ready();
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received"),
         r = grpc => r.map_err(|e| anyhow::anyhow!("CRI server error: {e}"))?,
@@ -124,9 +129,45 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Send `READY=1` to systemd's notify socket (`$NOTIFY_SOCKET`), the `sd_notify(3)`
+/// readiness protocol for `Type=notify` units. A no-op when the daemon is not run
+/// under systemd (env unset). Path sockets are supported; abstract-namespace
+/// sockets (`@`-prefixed) are skipped (not used by our unit files).
+fn sd_notify_ready() {
+    let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    if path.is_empty() || path.starts_with('@') {
+        if path.starts_with('@') {
+            tracing::debug!("NOTIFY_SOCKET is an abstract socket; sd_notify skipped");
+        }
+        return;
+    }
+    match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(sock) => {
+            if let Err(e) = sock.send_to(b"READY=1", &path) {
+                tracing::debug!(error = %e, "sd_notify READY=1 failed");
+            } else {
+                tracing::info!("notified systemd: READY=1");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "sd_notify socket create failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // sd_notify is a no-op without NOTIFY_SOCKET and must never panic.
+    #[test]
+    fn sd_notify_is_noop_without_socket() {
+        // SAFETY: single-threaded test; no other thread reads the env here.
+        unsafe {
+            std::env::remove_var("NOTIFY_SOCKET");
+        }
+        sd_notify_ready(); // must not panic
+    }
 
     #[test]
     fn check_mode_initializes_stores() -> anyhow::Result<()> {
