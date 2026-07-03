@@ -3,6 +3,7 @@
 //! byte-exact OCI algorithms a Rust reimplementation must match: chainID
 //! computation and platform matching.
 
+pub mod dockercfg;
 pub mod gc;
 pub mod identity;
 pub mod pull;

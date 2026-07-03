@@ -126,6 +126,25 @@ pub struct ContainerRecord {
     /// so the kubelet can verify a resize took effect.
     #[serde(default)]
     pub resources: Option<ResourcesRecord>,
+    /// Re-adoption handle for surviving a daemon restart (see
+    /// `specs/002-containerd-parity/data-model.md`). The OCI runtime `--root`
+    /// state dir; with `bundle_dir` and `pid` it lets `reconcile()` probe
+    /// `crun state <id>` and re-attach to a still-running container after a
+    /// daemon restart instead of marking it `Unknown`. `None` on records written
+    /// before restart-survival landed.
+    #[serde(default)]
+    pub crun_root: Option<String>,
+    /// OCI bundle directory for the container (for re-adoption + cleanup).
+    #[serde(default)]
+    pub bundle_dir: Option<String>,
+    /// Host pid of the container init process, used to re-attach an exit waiter
+    /// (via pidfd) after a daemon restart.
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// Kubelet-visible restart count. MUST be preserved across a daemon restart
+    /// (a runtime restart is not a container restart).
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 /// A container mount echoed in `ContainerStatus.mounts`.

@@ -40,6 +40,21 @@ async fn main() -> anyhow::Result<()> {
         "containerd-rs starting"
     );
 
+    // containerd-rs targets a unified cgroup v2 hierarchy only. Refuse a v1 /
+    // hybrid host up front with a clear error rather than misprogramming limits
+    // (feature 002 FR-015). Detection failure is non-fatal (assume v2).
+    match runtime::cgroup::detect_default() {
+        Ok(runtime::cgroup::CgroupVersion::V2) => {}
+        Ok(runtime::cgroup::CgroupVersion::V1OrHybrid) => {
+            anyhow::bail!(
+                "containerd-rs requires a unified cgroup v2 hierarchy at \
+                 /sys/fs/cgroup, but this host is cgroup v1 or hybrid. Boot with \
+                 systemd.unified_cgroup_hierarchy=1 (or the distro equivalent) and retry."
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "could not detect cgroup version; assuming v2"),
+    }
+
     // Initialize persistent subsystems. This validates the on-disk layout.
     std::fs::create_dir_all(&cfg.root)?;
     std::fs::create_dir_all(&cfg.state)?;
@@ -71,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
         Ok(r) => tracing::info!(
             sandboxes = r.sandboxes,
             containers = r.containers,
+            readopted = r.readopted,
+            reaped = r.reaped,
             marked_unknown = r.marked_unknown,
             "reconciled persisted state"
         ),
@@ -99,6 +116,11 @@ async fn main() -> anyhow::Result<()> {
         ctx.streaming.clone(),
         std::future::pending::<()>(),
     );
+
+    // Notify systemd (Type=notify) that we are up (feature 002 US6 / T034).
+    // No-op when not run under systemd (NOTIFY_SOCKET unset).
+    sd_notify_ready();
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received"),
         r = grpc => r.map_err(|e| anyhow::anyhow!("CRI server error: {e}"))?,
@@ -107,9 +129,45 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Send `READY=1` to systemd's notify socket (`$NOTIFY_SOCKET`), the `sd_notify(3)`
+/// readiness protocol for `Type=notify` units. A no-op when the daemon is not run
+/// under systemd (env unset). Path sockets are supported; abstract-namespace
+/// sockets (`@`-prefixed) are skipped (not used by our unit files).
+fn sd_notify_ready() {
+    let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    if path.is_empty() || path.starts_with('@') {
+        if path.starts_with('@') {
+            tracing::debug!("NOTIFY_SOCKET is an abstract socket; sd_notify skipped");
+        }
+        return;
+    }
+    match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(sock) => {
+            if let Err(e) = sock.send_to(b"READY=1", &path) {
+                tracing::debug!(error = %e, "sd_notify READY=1 failed");
+            } else {
+                tracing::info!("notified systemd: READY=1");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "sd_notify socket create failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // sd_notify is a no-op without NOTIFY_SOCKET and must never panic.
+    #[test]
+    fn sd_notify_is_noop_without_socket() {
+        // SAFETY: single-threaded test; no other thread reads the env here.
+        unsafe {
+            std::env::remove_var("NOTIFY_SOCKET");
+        }
+        sd_notify_ready(); // must not panic
+    }
 
     #[test]
     fn check_mode_initializes_stores() -> anyhow::Result<()> {

@@ -31,6 +31,8 @@ pub fn run(bin: &str, crun_root: &Path, bundle_dir: &Path, id: &str) -> std::io:
         .arg("--root")
         .arg(crun_root)
         .arg("run")
+        // M2a: avoid pivot_root(2) EINVAL on initramfs (same filesystem).
+        .arg("--no-pivot")
         .arg("--bundle")
         .arg(bundle_dir)
         .arg(id)
@@ -58,6 +60,8 @@ pub fn run_tty(
         .arg("--root")
         .arg(crun_root)
         .arg("run")
+        // M2a: same no-pivot workaround as supervise_container.
+        .arg("--no-pivot")
         .arg("--detach")
         .arg("--console-socket")
         .arg(console_sock)
@@ -108,6 +112,48 @@ pub fn state(bin: &str, crun_root: &Path, id: &str) -> std::io::Result<Output> {
         .arg("state")
         .arg(id)
         .output()
+}
+
+/// Parsed subset of the `crun state <id>` JSON, per the OCI runtime-spec state:
+/// `status` is one of `creating`/`created`/`running`/`stopped`, and `pid` is the
+/// container init pid (0/absent once stopped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeState {
+    pub status: String,
+    pub pid: Option<i32>,
+}
+
+impl RuntimeState {
+    /// Whether the container is currently running (init process alive).
+    pub fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
+/// Parse the JSON emitted by `crun state`. Returns `None` if it is not valid
+/// state JSON. Pure — separated for unit-testing without invoking crun.
+pub fn parse_state(json: &[u8]) -> Option<RuntimeState> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let status = v.get("status")?.as_str()?.to_string();
+    let pid = v
+        .get("pid")
+        .and_then(|p| p.as_i64())
+        .filter(|p| *p > 0)
+        .map(|p| p as i32);
+    Some(RuntimeState { status, pid })
+}
+
+/// Probe a container's live runtime state via `crun state <id>`. Returns
+/// `Ok(None)` when crun has no record of the container (e.g. never created, or
+/// already deleted), `Ok(Some(state))` otherwise. Used by restart reconcile to
+/// decide whether a previously-`Running` container is still alive (re-adopt) or
+/// has exited/vanished — instead of blindly marking it `Unknown`.
+pub fn probe(bin: &str, crun_root: &Path, id: &str) -> std::io::Result<Option<RuntimeState>> {
+    let out = state(bin, crun_root, id)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_state(&out.stdout))
 }
 
 /// Execute a command inside a running container: `crun exec <id> <cmd...>`.
@@ -269,6 +315,26 @@ mod tests {
     use super::*;
     use crate::bundle::{generate_spec, write_bundle, ContainerRequest, ImageConfig, Resources};
     use std::os::unix::fs::PermissionsExt;
+
+    // parse_state extracts status + pid from crun/OCI state JSON, and treats a
+    // stopped/absent pid as None. Underpins restart re-adoption (feature 002 US1).
+    #[test]
+    fn parse_state_reads_status_and_pid() {
+        let running = br#"{"ociVersion":"1.0.2","id":"c1","status":"running","pid":4242,"bundle":"/b"}"#;
+        let s = parse_state(running).expect("valid running state");
+        assert_eq!(s.status, "running");
+        assert_eq!(s.pid, Some(4242));
+        assert!(s.is_running());
+
+        let stopped = br#"{"id":"c1","status":"stopped","pid":0}"#;
+        let s = parse_state(stopped).expect("valid stopped state");
+        assert_eq!(s.status, "stopped");
+        assert_eq!(s.pid, None);
+        assert!(!s.is_running());
+
+        assert!(parse_state(b"not json").is_none());
+        assert!(parse_state(b"{}").is_none());
+    }
 
     // kill_args builds the correct CLI argv for SIGTERM and SIGKILL escalation.
     // This ensures stop_container sends the right signal to crun on both the

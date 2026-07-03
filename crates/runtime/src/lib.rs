@@ -8,6 +8,7 @@
 //! and bundle layout rather than reimplementing container execution.
 
 pub mod bundle;
+pub mod cgroup;
 pub mod crun;
 pub mod shim;
 

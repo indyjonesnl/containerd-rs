@@ -1154,6 +1154,7 @@ dependencies = [
 name = "images"
 version = "0.1.3"
 dependencies = [
+ "base64",
  "content",
  "core-types",
  "flate2",
@@ -1462,8 +1463,6 @@ dependencies = [
 [[package]]
 name = "oci-client"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5261a7fb43d9c53b8e63e6d5e86860719dad253d015d022066c72d585125aed8"
 dependencies = [
  "bytes",
  "chrono",
@@ -2040,6 +2039,7 @@ dependencies = [
  "core-types",
  "oci-spec 0.8.4",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

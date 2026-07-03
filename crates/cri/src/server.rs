@@ -46,6 +46,10 @@ pub struct Context {
     pub cni: sandbox::cni::Cni,
     /// Per-image-reference locks serializing concurrent duplicate pulls.
     pub pull_locks: crate::locks::KeyedLocks,
+    /// Broadcast bus for container lifecycle events (feature 002 US3 / T026),
+    /// consumed by the CRI `GetContainerEvents` stream (kubelet evented PLEG).
+    /// `send` is a no-op when there are no subscribers.
+    pub container_events: tokio::sync::broadcast::Sender<v1::ContainerEventResponse>,
 }
 
 impl Context {
@@ -61,6 +65,7 @@ impl Context {
         cni_bin_dir: PathBuf,
     ) -> Self {
         let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("crun")));
+        let (container_events, _) = tokio::sync::broadcast::channel(512);
         Self {
             content,
             metadata,
@@ -71,7 +76,20 @@ impl Context {
             stream_base_url: format!("http://{stream_addr}"),
             cni: sandbox::cni::Cni::new(cni_conf_dir, cni_bin_dir),
             pull_locks: crate::locks::KeyedLocks::default(),
+            container_events,
         }
+    }
+
+    /// Emit a container lifecycle event to `GetContainerEvents` subscribers
+    /// (feature 002 US3 / T026). No-op when there are no subscribers.
+    pub fn emit_container_event(&self, container_id: &str, event: v1::ContainerEventType) {
+        let _ = self.container_events.send(v1::ContainerEventResponse {
+            container_id: container_id.to_string(),
+            container_event_type: event as i32,
+            created_at: unix_nanos(),
+            pod_sandbox_status: None,
+            containers_statuses: Vec::new(),
+        });
     }
 }
 
@@ -299,6 +317,81 @@ impl RuntimeSvc {
         })
     }
 
+    /// Build CRI `PodSandboxStats` for a sandbox (feature 002 US3 / T023):
+    /// pod-level CPU/memory read from the pod cgroup (v2) via `runtime::cgroup`,
+    /// plus per-container stats for the sandbox's running containers. Network and
+    /// process usage are left unset (follow-up); missing cgroup files read as 0.
+    async fn pod_sandbox_stats_for(&self, sb: &SandboxRecord) -> v1::PodSandboxStats {
+        let ts = unix_nanos();
+        // Pod-level usage from the kubelet-delegated pod cgroup, when present.
+        let cg = if sb.cgroup_parent.is_empty() {
+            runtime::cgroup::CgroupStats::default()
+        } else {
+            let dir = std::path::Path::new("/sys/fs/cgroup")
+                .join(sb.cgroup_parent.trim_start_matches('/'));
+            runtime::cgroup::read_stats(&dir)
+        };
+
+        // Per-container stats for this sandbox's running containers.
+        let mut containers = Vec::new();
+        if let Ok(recs) = self
+            .ctx
+            .metadata
+            .list::<ContainerRecord>(Kind::Container, self.ns())
+        {
+            for rec in recs.iter().filter(|r| r.sandbox_id == sb.id) {
+                if let Some(s) = self.container_stats_for(rec).await {
+                    containers.push(s);
+                }
+            }
+        }
+
+        v1::PodSandboxStats {
+            attributes: Some(v1::PodSandboxAttributes {
+                id: sb.id.clone(),
+                metadata: Some(v1::PodSandboxMetadata {
+                    name: sb.name.clone(),
+                    uid: sb.uid.clone(),
+                    namespace: sb.k8s_namespace.clone(),
+                    attempt: sb.attempt,
+                }),
+                labels: sb.labels.clone(),
+                annotations: sb.annotations.clone(),
+            }),
+            linux: Some(v1::LinuxPodSandboxStats {
+                cpu: Some(v1::CpuUsage {
+                    timestamp: ts,
+                    usage_core_nano_seconds: Some(v1::UInt64Value {
+                        value: cg.cpu_usage_nanos,
+                    }),
+                    usage_nano_cores: None,
+                    psi: None,
+                }),
+                memory: Some(v1::MemoryUsage {
+                    timestamp: ts,
+                    working_set_bytes: Some(v1::UInt64Value {
+                        value: cg.memory_current_bytes,
+                    }),
+                    available_bytes: None,
+                    usage_bytes: Some(v1::UInt64Value {
+                        value: cg.memory_current_bytes,
+                    }),
+                    rss_bytes: Some(v1::UInt64Value {
+                        value: cg.memory_anon_bytes,
+                    }),
+                    page_faults: None,
+                    major_page_faults: None,
+                    psi: None,
+                }),
+                network: None,
+                process: None,
+                containers,
+                io: None,
+            }),
+            windows: None,
+        }
+    }
+
     /// Find an image record by reference, image id, repo tag, or name.
     fn find_image(&self, image_ref: &str) -> Result<Option<ImageRecord>, Status> {
         let all = self
@@ -505,9 +598,20 @@ impl RuntimeService for RuntimeSvc {
         &self,
         _request: Request<v1::GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "get_container_events not yet implemented",
-        ))
+        // Subscribe to the lifecycle bus and stream events until the client
+        // disconnects. Lagged subscribers skip missed events rather than error;
+        // a closed sender ends the stream (feature 002 US3 / T026).
+        let rx = self.ctx.container_events.subscribe();
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => return Some((Ok(ev), rx)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type StreamPodSandboxMetricsStream = BoxStream<v1::StreamPodSandboxMetricsResponse>;
@@ -924,6 +1028,19 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|sc| sc.capabilities.as_ref())
                 .map(|c| c.drop_capabilities.clone())
                 .unwrap_or_default(),
+            no_new_privileges: sec_ctx.map(|sc| sc.no_new_privs).unwrap_or(false),
+            apparmor_profile: map_apparmor(sec_ctx.and_then(|sc| sc.apparmor.as_ref())),
+            // Only emit a SELinux label when the host actually has SELinux
+            // enabled; otherwise the runtime's write to /proc/self/attr/* fails
+            // with EINVAL and crashes the container (see host_selinux_enabled).
+            selinux_label: host_selinux_enabled()
+                .then(|| map_selinux(sec_ctx.and_then(|sc| sc.selinux_options.as_ref())))
+                .flatten(),
+            masked_paths: sec_ctx.map(|sc| sc.masked_paths.clone()).unwrap_or_default(),
+            readonly_paths: sec_ctx
+                .map(|sc| sc.readonly_paths.clone())
+                .unwrap_or_default(),
+            seccomp: map_seccomp(sec_ctx.and_then(|sc| sc.seccomp.as_ref())),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -981,6 +1098,12 @@ impl RuntimeService for RuntimeSvc {
                 .as_ref()
                 .and_then(|l| l.resources.as_ref())
                 .map(resources_record),
+            // Re-adoption fields are populated when the container is started
+            // (see restart-survival wiring, feature 002 US1). Unset at creation.
+            crun_root: None,
+            bundle_dir: None,
+            pid: None,
+            restart_count: 0,
         };
 
         // Touch the CRI LogPath synchronously so the kubelet / crictl can
@@ -1006,6 +1129,8 @@ impl RuntimeService for RuntimeSvc {
             .put(Kind::Container, self.ns(), &id, &rec)
             .map_err(|e| Status::internal(e.to_string()))?;
         tracing::info!(container = %id, "CreateContainer wrote OCI bundle + record");
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerCreatedEvent);
         Ok(Response::new(v1::CreateContainerResponse {
             container_id: id,
         }))
@@ -1202,6 +1327,8 @@ impl RuntimeService for RuntimeSvc {
                 }
             }
         }
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerStoppedEvent);
         Ok(Response::new(v1::StopContainerResponse {}))
     }
 
@@ -1222,6 +1349,8 @@ impl RuntimeService for RuntimeSvc {
             .delete(Kind::Container, self.ns(), &id)
             .map_err(|e| Status::internal(e.to_string()))?;
         let _ = runtime::shim::Bundle::new(&self.ctx.state_dir, self.ns(), &id).remove();
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerDeletedEvent);
         Ok(Response::new(v1::RemoveContainerResponse {}))
     }
 
@@ -1258,6 +1387,11 @@ impl RuntimeService for RuntimeSvc {
         // Mark Running before launching; supervision flips it to Exited on exit.
         rec.state = ContainerState::Running;
         rec.started_at = Some(unix_nanos() as u64);
+        // Persist re-adoption handles (feature 002 US1 / T009) so that after a
+        // daemon restart `reconcile()` can probe `crun state <id>` and re-adopt a
+        // still-running container instead of tearing it down.
+        rec.crun_root = Some(crun_root.display().to_string());
+        rec.bundle_dir = Some(bundle.dir().display().to_string());
         self.ctx
             .metadata
             .put(Kind::Container, self.ns(), &id, &rec)
@@ -1286,6 +1420,7 @@ impl RuntimeService for RuntimeSvc {
                 r.reason = Some(if code == 0 { "Completed" } else { "Error" }.to_string());
                 let _ = ctx.metadata.put(Kind::Container, &ns, &cid, &r);
             }
+            ctx.emit_container_event(&cid, v1::ContainerEventType::ContainerStoppedEvent);
             ctx.streaming.close_live(&cid);
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
@@ -1310,6 +1445,8 @@ impl RuntimeService for RuntimeSvc {
         })
         .await;
 
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerStartedEvent);
         Ok(Response::new(v1::StartContainerResponse {}))
     }
 
@@ -1381,6 +1518,72 @@ impl RuntimeService for RuntimeSvc {
             .ok_or_else(|| Status::not_found(format!("container {id} not found")))?;
         let stats = self.container_stats_for(&rec).await;
         Ok(Response::new(v1::ContainerStatsResponse { stats }))
+    }
+
+    async fn pod_sandbox_stats(
+        &self,
+        request: Request<v1::PodSandboxStatsRequest>,
+    ) -> Result<Response<v1::PodSandboxStatsResponse>, Status> {
+        let id = request.into_inner().pod_sandbox_id;
+        let sb = self
+            .ctx
+            .metadata
+            .get::<SandboxRecord>(Kind::Sandbox, self.ns(), &id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("sandbox {id} not found")))?;
+        let stats = self.pod_sandbox_stats_for(&sb).await;
+        Ok(Response::new(v1::PodSandboxStatsResponse {
+            stats: Some(stats),
+        }))
+    }
+
+    async fn list_pod_sandbox_stats(
+        &self,
+        request: Request<v1::ListPodSandboxStatsRequest>,
+    ) -> Result<Response<v1::ListPodSandboxStatsResponse>, Status> {
+        let filter = request.into_inner().filter;
+        let sandboxes: Vec<SandboxRecord> = self
+            .ctx
+            .metadata
+            .list(Kind::Sandbox, self.ns())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut stats = Vec::new();
+        for sb in sandboxes {
+            let keep = filter
+                .as_ref()
+                .is_none_or(|f| f.id.is_empty() || f.id == sb.id);
+            if keep {
+                stats.push(self.pod_sandbox_stats_for(&sb).await);
+            }
+        }
+        Ok(Response::new(v1::ListPodSandboxStatsResponse { stats }))
+    }
+
+    async fn list_metric_descriptors(
+        &self,
+        _request: Request<v1::ListMetricDescriptorsRequest>,
+    ) -> Result<Response<v1::ListMetricDescriptorsResponse>, Status> {
+        Ok(Response::new(v1::ListMetricDescriptorsResponse {
+            descriptors: metric_descriptors(),
+        }))
+    }
+
+    async fn list_pod_sandbox_metrics(
+        &self,
+        _request: Request<v1::ListPodSandboxMetricsRequest>,
+    ) -> Result<Response<v1::ListPodSandboxMetricsResponse>, Status> {
+        let sandboxes: Vec<SandboxRecord> = self
+            .ctx
+            .metadata
+            .list(Kind::Sandbox, self.ns())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let pod_metrics = sandboxes
+            .iter()
+            .map(pod_sandbox_metrics_for)
+            .collect::<Vec<_>>();
+        Ok(Response::new(v1::ListPodSandboxMetricsResponse {
+            pod_metrics,
+        }))
     }
 
     async fn list_container_stats(
@@ -1538,11 +1741,7 @@ impl RuntimeService for RuntimeSvc {
     }
 
     unary_unimpl! {
-        pod_sandbox_stats => PodSandboxStatsRequest / PodSandboxStatsResponse,
-        list_pod_sandbox_stats => ListPodSandboxStatsRequest / ListPodSandboxStatsResponse,
         checkpoint_container => CheckpointContainerRequest / CheckpointContainerResponse,
-        list_metric_descriptors => ListMetricDescriptorsRequest / ListMetricDescriptorsResponse,
-        list_pod_sandbox_metrics => ListPodSandboxMetricsRequest / ListPodSandboxMetricsResponse,
         update_pod_sandbox_resources => UpdatePodSandboxResourcesRequest / UpdatePodSandboxResourcesResponse,
     }
 }
@@ -1611,6 +1810,9 @@ impl ImageService for ImageSvc {
             .auth
             .map(auth_from_config)
             .unwrap_or(images::pull::Auth::Anonymous);
+        // Fall back to the node's docker config (config.json / cred helpers) when
+        // the kubelet provided no credential (feature 002 US4).
+        let auth = images::pull::resolve_auth(&reference, auth);
 
         let pulled = images::pull::pull(
             &reference,
@@ -1785,6 +1987,116 @@ fn record_to_cri_resources(rec: &ResourcesRecord) -> v1::ContainerResources {
 
 /// Map CRI `LinuxContainerResources` to the runtime's `Resources` (used by both
 /// CreateContainer's initial limits and UpdateContainerResources' live resize).
+/// Map a CRI seccomp `SecurityProfile` to the bundle's `SeccompProfile`
+/// (feature 002 US2). RuntimeDefault is carried through but its profile content
+/// is not yet emitted (T002); Localhost carries the node-local profile path.
+fn map_seccomp(sp: Option<&v1::SecurityProfile>) -> runtime::bundle::SeccompProfile {
+    use runtime::bundle::SeccompProfile;
+    use v1::security_profile::ProfileType;
+    match sp {
+        None => SeccompProfile::Unconfined,
+        Some(p) => match ProfileType::try_from(p.profile_type) {
+            Ok(ProfileType::RuntimeDefault) => SeccompProfile::RuntimeDefault,
+            Ok(ProfileType::Localhost) => SeccompProfile::Localhost(p.localhost_ref.clone()),
+            _ => SeccompProfile::Unconfined,
+        },
+    }
+}
+
+/// Map a CRI AppArmor `SecurityProfile` to an OCI apparmor profile name. Only an
+/// explicit Localhost (named) profile — or Unconfined — is emitted; RuntimeDefault
+/// apparmor is deferred (feature 002 T016) since naming an unloaded profile would
+/// fail the container. `None` leaves the host default.
+fn map_apparmor(sp: Option<&v1::SecurityProfile>) -> Option<String> {
+    use v1::security_profile::ProfileType;
+    let p = sp?;
+    match ProfileType::try_from(p.profile_type) {
+        Ok(ProfileType::Localhost) if !p.localhost_ref.is_empty() => Some(p.localhost_ref.clone()),
+        Ok(ProfileType::Unconfined) => Some("unconfined".to_string()),
+        _ => None,
+    }
+}
+
+/// Compose an OCI SELinux process label from CRI `SeLinuxOption` (feature 002
+/// US2). `None` when unset (the common case on non-SELinux hosts).
+fn map_selinux(opt: Option<&v1::SeLinuxOption>) -> Option<String> {
+    let o = opt?;
+    if o.user.is_empty() && o.role.is_empty() && o.r#type.is_empty() && o.level.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{}:{}:{}", o.user, o.role, o.r#type, o.level))
+}
+
+/// Whether SELinux is enabled on the host (selinuxfs mounted at
+/// `/sys/fs/selinux`). Emitting an OCI `process.selinuxLabel` on a host WITHOUT
+/// SELinux makes the runtime write to `/proc/self/attr/*`, which fails with
+/// `EINVAL` and crashes the container — so labels are only emitted when SELinux
+/// is actually enabled (matching containerd). Regression guard: the sig-storage
+/// EmptyDir/Subpath conformance tests pass `seLinuxOptions`, and emitting the
+/// label unconditionally broke them on the (non-SELinux) CI runner.
+fn host_selinux_enabled() -> bool {
+    std::path::Path::new("/sys/fs/selinux/enforce").exists()
+}
+
+/// The metric families containerd-rs exports via `ListMetricDescriptors` /
+/// `ListPodSandboxMetrics` (feature 002 US3 / T024). A minimal cadvisor-style
+/// set — pod-level CPU and memory read from the pod cgroup. (Full metric-family
+/// parity with containerd needs the reference set; see feature 002 SC-004.)
+fn metric_descriptors() -> Vec<v1::MetricDescriptor> {
+    vec![
+        v1::MetricDescriptor {
+            name: "container_cpu_usage_seconds_total".to_string(),
+            help: "Cumulative CPU time consumed, in nanoseconds.".to_string(),
+            label_keys: Vec::new(),
+        },
+        v1::MetricDescriptor {
+            name: "container_memory_working_set_bytes".to_string(),
+            help: "Current memory working set, in bytes.".to_string(),
+            label_keys: Vec::new(),
+        },
+    ]
+}
+
+fn metric(name: &str, ty: v1::MetricType, value: u64, ts: i64) -> v1::Metric {
+    v1::Metric {
+        name: name.to_string(),
+        timestamp: ts,
+        metric_type: ty as i32,
+        label_values: Vec::new(),
+        value: Some(v1::UInt64Value { value }),
+    }
+}
+
+/// Build `PodSandboxMetrics` for a sandbox from its pod cgroup (feature 002 T024).
+fn pod_sandbox_metrics_for(sb: &SandboxRecord) -> v1::PodSandboxMetrics {
+    let ts = unix_nanos();
+    let cg = if sb.cgroup_parent.is_empty() {
+        runtime::cgroup::CgroupStats::default()
+    } else {
+        let dir =
+            std::path::Path::new("/sys/fs/cgroup").join(sb.cgroup_parent.trim_start_matches('/'));
+        runtime::cgroup::read_stats(&dir)
+    };
+    v1::PodSandboxMetrics {
+        pod_sandbox_id: sb.id.clone(),
+        metrics: vec![
+            metric(
+                "container_cpu_usage_seconds_total",
+                v1::MetricType::Counter,
+                cg.cpu_usage_nanos,
+                ts,
+            ),
+            metric(
+                "container_memory_working_set_bytes",
+                v1::MetricType::Gauge,
+                cg.memory_current_bytes,
+                ts,
+            ),
+        ],
+        container_metrics: Vec::new(),
+    }
+}
+
 fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources {
     runtime::bundle::Resources {
         cpu_shares: (r.cpu_shares > 0).then_some(r.cpu_shares as u64),
@@ -1793,6 +2105,14 @@ fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources 
         memory_limit: (r.memory_limit_in_bytes > 0).then_some(r.memory_limit_in_bytes),
         cpuset_cpus: (!r.cpuset_cpus.is_empty()).then(|| r.cpuset_cpus.clone()),
         cpuset_mems: (!r.cpuset_mems.is_empty()).then(|| r.cpuset_mems.clone()),
+        // HugeTLB limits + cgroup-v2 unified passthrough (pids/blkio) — feature 002 US5.
+        hugepage_limits: r
+            .hugepage_limits
+            .iter()
+            .filter(|h| h.limit > 0 && !h.page_size.is_empty())
+            .map(|h| (h.page_size.clone(), h.limit))
+            .collect(),
+        unified: r.unified.clone(),
     }
 }
 
@@ -1936,6 +2256,12 @@ async fn supervise_container(
     cmd.arg("--root")
         .arg(crun_root)
         .arg("run")
+        // M2a: the container rootfs lives inside the initramfs ramfs (state =
+        // /run/containerd-rs). pivot_root(2) requires the new root and the
+        // put-old dir to be on different filesystems — it fails with EINVAL
+        // when both are on the same ramfs mount. --no-pivot uses MS_MOVE +
+        // chroot instead and works regardless of filesystem boundaries.
+        .arg("--no-pivot")
         .arg("--bundle")
         .arg(bundle_dir)
         .arg(cid)
@@ -1992,6 +2318,15 @@ async fn supervise_container(
     if let Ok(s) = &status {
         use std::os::unix::process::ExitStatusExt;
         tracing::info!(container = %cid, code = ?s.code(), signal = ?s.signal(), "crun run returned");
+        // M2a debug: on non-zero exit, tee the CRI log (crun's stderr) to the
+        // tracing output so it surfaces on the serial console. Remove once the
+        // systemic crun exit-1 root cause is identified.
+        if s.code() != Some(0) {
+            if let Ok(bytes) = tokio::fs::read(log_path).await {
+                let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+                tracing::error!(container = %cid, log = %snippet, "crun stderr (debug)");
+            }
+        }
     }
     status.ok().and_then(|s| s.code()).unwrap_or(-1)
 }
@@ -2098,17 +2433,35 @@ fn dir_size(path: &Path) -> u64 {
 pub struct ReconcileReport {
     pub sandboxes: usize,
     pub containers: usize,
+    /// Previously-`Running` containers still alive under crun — re-adopted
+    /// (kept `Running`, not torn down). These are the pods that survive a
+    /// daemon restart (feature 002 US1 / FR-001).
+    pub readopted: usize,
+    /// Previously-`Running` containers found already exited/created under crun
+    /// while the daemon was down — reaped and recorded as `Exited`.
+    pub reaped: usize,
+    /// Previously-`Running` containers crun no longer knows about — marked
+    /// `Unknown` for the kubelet to reconcile.
     pub marked_unknown: usize,
 }
 
 /// Reconcile persisted state after a daemon restart.
 ///
 /// The metadata DB survives restarts, so sandboxes and containers are
-/// re-discovered (not orphaned or duplicated). Because task supervision
-/// (T015–T016) is not yet wired, there is no live shim to confirm a previously
-/// `Running` container is still alive — such containers are conservatively
-/// marked `Unknown` so the kubelet reconciles them, rather than being falsely
-/// reported as `Running`.
+/// re-discovered. For each previously-`Running` container we probe
+/// `crun state <id>` (feature 002 US1):
+///  - **running** → **re-adopt**: keep it `Running` and refresh its re-adoption
+///    handles. Crucially we do NOT `crun delete --force` it (the old behavior,
+///    which killed every running container's process tree on restart and churned
+///    every pod on the node).
+///  - **created/stopped** → it exited or never fully started while we were down:
+///    reap it (`crun delete --force`) and record `Exited` (exit code unknown for
+///    a container whose init we did not parent — this generation's exit fidelity
+///    is degraded; see feature 002 US1 notes / deferred T008/T012).
+///  - **unknown to crun** → mark `Unknown` for the kubelet to reconcile.
+///
+/// Idempotent and crash-safe (T013): re-running it converges; a container that
+/// exits between probe and write is caught on the next status query or pass.
 pub fn reconcile(ctx: &Context) -> Result<ReconcileReport, metadata::Error> {
     let ns = &ctx.namespace;
     let mut report = ReconcileReport::default();
@@ -2120,15 +2473,40 @@ pub fn reconcile(ctx: &Context) -> Result<ReconcileReport, metadata::Error> {
     report.containers = containers.len();
     let crun_root = ctx.state_dir.join("crun");
     for mut c in containers {
-        if c.state == ContainerState::Running {
-            // Best-effort force-delete to reap any process trees that were
-            // left behind by the previous daemon instance. This is safe to
-            // call even if the container is already gone (crun delete --force
-            // is idempotent on unknown containers).
-            let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
-            c.state = ContainerState::Unknown;
-            ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
-            report.marked_unknown += 1;
+        if c.state != ContainerState::Running {
+            continue;
+        }
+        match runtime::crun::probe(runtime::crun::DEFAULT_BIN, &crun_root, &c.id) {
+            Ok(Some(st)) if st.is_running() => {
+                // Still alive — re-adopt. Refresh handles; leave state Running.
+                c.crun_root = Some(crun_root.display().to_string());
+                if st.pid.is_some() {
+                    c.pid = st.pid;
+                }
+                ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
+                report.readopted += 1;
+            }
+            Ok(Some(_)) => {
+                // created/stopped while we were down: reap and record exit.
+                let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
+                c.state = ContainerState::Exited;
+                if c.finished_at.is_none() {
+                    c.finished_at = Some(unix_nanos() as u64);
+                }
+                if c.exit_code.is_none() {
+                    c.exit_code = Some(-1);
+                    c.reason = Some("Unknown".to_string());
+                }
+                ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
+                report.reaped += 1;
+            }
+            Ok(None) | Err(_) => {
+                // crun has no record — idempotent cleanup, then mark Unknown.
+                let _ = runtime::crun::delete(runtime::crun::DEFAULT_BIN, &crun_root, &c.id);
+                c.state = ContainerState::Unknown;
+                ctx.metadata.put(Kind::Container, ns, &c.id, &c)?;
+                report.marked_unknown += 1;
+            }
         }
     }
     Ok(report)
@@ -2213,6 +2591,38 @@ mod tests {
         ))
     }
 
+    // Feature 002 US3 / T024: the exported metric descriptors are stable and the
+    // per-metric builder tags type/value correctly.
+    #[test]
+    fn metric_descriptors_and_builder() {
+        let d = metric_descriptors();
+        let names: Vec<&str> = d.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"container_cpu_usage_seconds_total"));
+        assert!(names.contains(&"container_memory_working_set_bytes"));
+        let m = metric("container_memory_working_set_bytes", v1::MetricType::Gauge, 4096, 1);
+        assert_eq!(m.metric_type, v1::MetricType::Gauge as i32);
+        assert_eq!(m.value.unwrap().value, 4096);
+    }
+
+    // Feature 002 US3 / T026: the container-event bus delivers lifecycle events
+    // to subscribers (GetContainerEvents streams from this bus).
+    #[tokio::test]
+    async fn container_event_bus_delivers_to_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let mut rx = ctx.container_events.subscribe();
+        ctx.emit_container_event("c1", v1::ContainerEventType::ContainerStartedEvent);
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.container_id, "c1");
+        assert_eq!(
+            ev.container_event_type,
+            v1::ContainerEventType::ContainerStartedEvent as i32
+        );
+        // No subscriber-less panic: emit with the receiver dropped is a no-op.
+        drop(rx);
+        ctx.emit_container_event("c2", v1::ContainerEventType::ContainerDeletedEvent);
+    }
+
     #[tokio::test]
     async fn version_and_status_over_unix_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -2289,12 +2699,29 @@ mod tests {
 
         // A still-unimplemented RPC returns the right gRPC code.
         let err = client
+            .checkpoint_container(v1::CheckpointContainerRequest {
+                container_id: "nope".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        // PodSandboxStats is now implemented: an unknown sandbox is NotFound
+        // (not Unimplemented), and ListPodSandboxStats returns an (empty) list.
+        let err = client
             .pod_sandbox_stats(v1::PodSandboxStatsRequest {
                 pod_sandbox_id: "nope".into(),
             })
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let lst = client
+            .list_pod_sandbox_stats(v1::ListPodSandboxStatsRequest { filter: None })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(lst.stats.is_empty());
 
         // ImageService is wired to the metadata store: empty list + missing
         // image status are real (no network needed).
@@ -2373,6 +2800,10 @@ mod tests {
                 annotations: Default::default(),
                 mounts: Vec::new(),
                 resources: None,
+                crun_root: None,
+                bundle_dir: None,
+                pid: None,
+                restart_count: 0,
             }
         }
 
@@ -2977,6 +3408,10 @@ mod tests {
                     annotations: Default::default(),
                     mounts: Vec::new(),
                     resources: None,
+                    crun_root: None,
+                    bundle_dir: None,
+                    pid: None,
+                    restart_count: 0,
                 },
             )
             .unwrap();
