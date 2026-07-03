@@ -924,6 +924,14 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|sc| sc.capabilities.as_ref())
                 .map(|c| c.drop_capabilities.clone())
                 .unwrap_or_default(),
+            no_new_privileges: sec_ctx.map(|sc| sc.no_new_privs).unwrap_or(false),
+            apparmor_profile: map_apparmor(sec_ctx.and_then(|sc| sc.apparmor.as_ref())),
+            selinux_label: map_selinux(sec_ctx.and_then(|sc| sc.selinux_options.as_ref())),
+            masked_paths: sec_ctx.map(|sc| sc.masked_paths.clone()).unwrap_or_default(),
+            readonly_paths: sec_ctx
+                .map(|sc| sc.readonly_paths.clone())
+                .unwrap_or_default(),
+            seccomp: map_seccomp(sec_ctx.and_then(|sc| sc.seccomp.as_ref())),
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -1796,6 +1804,46 @@ fn record_to_cri_resources(rec: &ResourcesRecord) -> v1::ContainerResources {
 
 /// Map CRI `LinuxContainerResources` to the runtime's `Resources` (used by both
 /// CreateContainer's initial limits and UpdateContainerResources' live resize).
+/// Map a CRI seccomp `SecurityProfile` to the bundle's `SeccompProfile`
+/// (feature 002 US2). RuntimeDefault is carried through but its profile content
+/// is not yet emitted (T002); Localhost carries the node-local profile path.
+fn map_seccomp(sp: Option<&v1::SecurityProfile>) -> runtime::bundle::SeccompProfile {
+    use runtime::bundle::SeccompProfile;
+    use v1::security_profile::ProfileType;
+    match sp {
+        None => SeccompProfile::Unconfined,
+        Some(p) => match ProfileType::try_from(p.profile_type) {
+            Ok(ProfileType::RuntimeDefault) => SeccompProfile::RuntimeDefault,
+            Ok(ProfileType::Localhost) => SeccompProfile::Localhost(p.localhost_ref.clone()),
+            _ => SeccompProfile::Unconfined,
+        },
+    }
+}
+
+/// Map a CRI AppArmor `SecurityProfile` to an OCI apparmor profile name. Only an
+/// explicit Localhost (named) profile — or Unconfined — is emitted; RuntimeDefault
+/// apparmor is deferred (feature 002 T016) since naming an unloaded profile would
+/// fail the container. `None` leaves the host default.
+fn map_apparmor(sp: Option<&v1::SecurityProfile>) -> Option<String> {
+    use v1::security_profile::ProfileType;
+    let p = sp?;
+    match ProfileType::try_from(p.profile_type) {
+        Ok(ProfileType::Localhost) if !p.localhost_ref.is_empty() => Some(p.localhost_ref.clone()),
+        Ok(ProfileType::Unconfined) => Some("unconfined".to_string()),
+        _ => None,
+    }
+}
+
+/// Compose an OCI SELinux process label from CRI `SeLinuxOption` (feature 002
+/// US2). `None` when unset (the common case on non-SELinux hosts).
+fn map_selinux(opt: Option<&v1::SeLinuxOption>) -> Option<String> {
+    let o = opt?;
+    if o.user.is_empty() && o.role.is_empty() && o.r#type.is_empty() && o.level.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{}:{}:{}", o.user, o.role, o.r#type, o.level))
+}
+
 fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources {
     runtime::bundle::Resources {
         cpu_shares: (r.cpu_shares > 0).then_some(r.cpu_shares as u64),

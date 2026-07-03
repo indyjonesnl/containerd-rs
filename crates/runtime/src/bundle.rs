@@ -110,6 +110,41 @@ pub struct ContainerRequest {
     /// `add_capabilities`. `"ALL"` drops every capability. Ignored for privileged
     /// containers.
     pub drop_capabilities: Vec<String>,
+    /// CRI `security_context.no_new_privs` — when true, set OCI
+    /// `process.noNewPrivileges` so the process (and its children) cannot gain
+    /// privileges via setuid/setgid/file caps on `execve`. Ignored for privileged.
+    pub no_new_privileges: bool,
+    /// AppArmor profile name to apply (OCI `process.apparmorProfile`), e.g. a
+    /// `localhost/<profile>` name. `None` leaves it unset (host default). Ignored
+    /// for privileged containers.
+    pub apparmor_profile: Option<String>,
+    /// SELinux process label to apply (OCI `process.selinuxLabel`), from the CRI
+    /// `selinux_options`. `None` leaves it unset. Ignored for privileged.
+    pub selinux_label: Option<String>,
+    /// CRI `security_context.masked_paths` override. When non-empty, replaces the
+    /// base spec's `linux.maskedPaths`. Empty keeps the runtime defaults.
+    pub masked_paths: Vec<String>,
+    /// CRI `security_context.readonly_paths` override. When non-empty, replaces the
+    /// base spec's `linux.readonlyPaths`. Empty keeps the runtime defaults.
+    pub readonly_paths: Vec<String>,
+    /// Requested seccomp confinement. Ignored for privileged containers.
+    pub seccomp: SeccompProfile,
+}
+
+/// Requested seccomp confinement, mapped from the CRI `SecurityProfile`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SeccompProfile {
+    /// No seccomp filter (CRI `Unconfined`). Nothing is emitted.
+    #[default]
+    Unconfined,
+    /// The runtime's default profile (CRI `RuntimeDefault`). Enforcement of the
+    /// profile *content* is gated on provisioning the real containerd default
+    /// profile (feature 002 T002) — until then this variant is recorded but not
+    /// emitted (emitting a wrong allowlist would break workloads).
+    RuntimeDefault,
+    /// A profile loaded from a node-local JSON file (CRI `Localhost`). The path is
+    /// resolved and its OCI seccomp JSON emitted verbatim.
+    Localhost(String),
 }
 
 /// CRI container resource limits/requests mapped to OCI `linux.resources`.
@@ -395,6 +430,57 @@ fn parse_user(user: &Option<String>) -> (u32, u32) {
 }
 
 /// Generate an OCI runtime spec for a container.
+/// Apply the pod security context to a non-privileged spec: no-new-privileges,
+/// AppArmor profile, SELinux label, masked/readonly-path overrides, and seccomp.
+/// Emits OCI-spec fields and lets crun enforce them (matching containerd). Returns
+/// an error (fail-closed, feature 002 FR-016) when a requested Localhost seccomp
+/// profile cannot be read/parsed — never silently runs the container unconfined.
+fn apply_security(spec: &mut Spec, req: &ContainerRequest) -> Result<()> {
+    if let Some(mut process) = spec.process().clone() {
+        if req.no_new_privileges {
+            process.set_no_new_privileges(Some(true));
+        }
+        if let Some(ap) = &req.apparmor_profile {
+            process.set_apparmor_profile(Some(ap.clone()));
+        }
+        if let Some(label) = &req.selinux_label {
+            process.set_selinux_label(Some(label.clone()));
+        }
+        spec.set_process(Some(process));
+    }
+    if let Some(mut linux) = spec.linux().clone() {
+        if !req.masked_paths.is_empty() {
+            linux.set_masked_paths(Some(req.masked_paths.clone()));
+        }
+        if !req.readonly_paths.is_empty() {
+            linux.set_readonly_paths(Some(req.readonly_paths.clone()));
+        }
+        match &req.seccomp {
+            SeccompProfile::Unconfined => {}
+            SeccompProfile::RuntimeDefault => {
+                // Deferred (feature 002 T002): a hand-rolled default allowlist
+                // would risk blocking syscalls real workloads need and breaking
+                // conformance. Recorded, not emitted, until the real containerd
+                // default profile is provisioned.
+                tracing::warn!(
+                    container_seccomp = "RuntimeDefault",
+                    "seccomp RuntimeDefault requested but the default profile is not \
+                     provisioned; running without a seccomp filter (feature 002 T002)"
+                );
+            }
+            SeccompProfile::Localhost(path) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| Error::Builder(format!("read seccomp profile {path}: {e}")))?;
+                let seccomp: oci_spec::runtime::LinuxSeccomp = serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Builder(format!("parse seccomp profile {path}: {e}")))?;
+                linux.set_seccomp(Some(seccomp));
+            }
+        }
+        spec.set_linux(Some(linux));
+    }
+    Ok(())
+}
+
 pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path) -> Result<Spec> {
     let argv = resolve_argv(image, req);
     let env = merge_env(image, req);
@@ -469,6 +555,7 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
         apply_privileged(&mut spec);
     } else {
         apply_capabilities(&mut spec, &req.add_capabilities, &req.drop_capabilities);
+        apply_security(&mut spec, req)?;
     }
     apply_sysctls(&mut spec, &req.sysctls);
     Ok(spec)
@@ -1090,5 +1177,77 @@ mod tests {
             .unwrap();
         assert!(eff.contains(&Capability::Chown));
         assert!(eff.contains(&Capability::SysAdmin));
+    }
+
+    // Feature 002 US2: security-context fields are emitted into the OCI spec for a
+    // non-privileged container (no-new-privs, AppArmor, SELinux, masked/readonly
+    // overrides). Asserted against the serialized OCI JSON (stable field names).
+    #[test]
+    fn security_context_fields_emitted_for_nonprivileged() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            no_new_privileges: true,
+            apparmor_profile: Some("my-profile".into()),
+            selinux_label: Some("system_u:system_r:container_t:s0".into()),
+            masked_paths: vec!["/proc/keys".into()],
+            readonly_paths: vec!["/proc/sys".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("r")).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["process"]["noNewPrivileges"], serde_json::json!(true));
+        assert_eq!(v["process"]["apparmorProfile"], serde_json::json!("my-profile"));
+        assert_eq!(
+            v["process"]["selinuxLabel"],
+            serde_json::json!("system_u:system_r:container_t:s0")
+        );
+        assert_eq!(v["linux"]["maskedPaths"], serde_json::json!(["/proc/keys"]));
+        assert_eq!(v["linux"]["readonlyPaths"], serde_json::json!(["/proc/sys"]));
+    }
+
+    // Localhost seccomp loads and emits the profile; a missing profile fails closed
+    // (feature 002 FR-016) — the container is never silently run unconfined.
+    #[test]
+    fn seccomp_localhost_loads_and_missing_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let prof = dir.path().join("p.json");
+        std::fs::write(
+            &prof,
+            r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["read"],"action":"SCMP_ACT_ALLOW"}]}"#,
+        )
+        .unwrap();
+        let ok = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            seccomp: SeccompProfile::Localhost(prof.display().to_string()),
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &ok, &dir.path().join("r")).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v["linux"]["seccomp"].is_object());
+
+        let missing = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            seccomp: SeccompProfile::Localhost("/no/such/profile.json".into()),
+            ..Default::default()
+        };
+        assert!(generate_spec(&img(), &missing, &dir.path().join("r2")).is_err());
+    }
+
+    // Security context (incl. a bad seccomp path) is ignored for privileged
+    // containers — they are intentionally unconfined, so no error and no seccomp.
+    #[test]
+    fn security_context_skipped_for_privileged() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            privileged: true,
+            no_new_privileges: true,
+            seccomp: SeccompProfile::Localhost("/no/such.json".into()),
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("r")).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v["linux"]["seccomp"].is_null());
     }
 }
