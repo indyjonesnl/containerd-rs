@@ -14,7 +14,8 @@ RESULTS_DIR ?= conformance-results
 CGROUPS_PER_QOS ?= true
 
 .PHONY: all build release test lint fmt fmt-check check ci \
-        cluster-up cluster-down conformance conformance-docker conformance-smoke crictl-validate clean
+        cluster-up cluster-down conformance conformance-docker conformance-smoke \
+        crictl-validate critest critest-docker clean
 
 all: check
 
@@ -66,6 +67,15 @@ conformance-docker:
 
 crictl-validate:
 	sudo CRI_SOCKET=$(CRI_SOCKET) ./ci/crictl-validate.sh
+
+# CRI-conformance suite (cri-tools critest) — the suite Go containerd/CRI-O use.
+# critest: against an already-running daemon + CNI. critest-docker: self-contained
+# privileged container, no host sudo / CI minutes (needs the conformance image).
+critest:
+	CRI_SOCKET=$(CRI_SOCKET) FOCUS='$(FOCUS)' SKIP='$(SKIP)' RESULTS_DIR=$(RESULTS_DIR) ./ci/critest.sh
+
+critest-docker:
+	FOCUS='$(FOCUS)' SKIP='$(SKIP)' ./ci/critest-docker.sh
 
 cluster-down:
 	-sudo kubeadm reset -f

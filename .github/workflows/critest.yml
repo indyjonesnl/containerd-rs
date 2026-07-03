@@ -1,0 +1,62 @@
+name: critest
+
+# CRI-conformance suite (kubernetes-sigs/cri-tools `critest`) — the same suite
+# Go containerd / CRI-O gate CRI compliance on. Runs the daemon standalone
+# (no kubelet/cluster) inside a privileged container via ci/critest-docker.sh.
+# Manual for now while the skip-list is triaged.
+on:
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "ginkgo focus regex (empty = whole CRI suite)"
+        required: false
+        type: string
+        default: ""
+      skip:
+        description: "ginkgo skip regex (known-deferred behaviors)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CRICTL_VERSION: "v1.35.0"
+  CRUN_VERSION: "1.28"
+  CNI_PLUGINS_VERSION: "v1.5.1"
+
+jobs:
+  critest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release daemon
+        run: make release
+
+      - name: Build conformance image (crun + CNI + crictl/critest)
+        run: docker build -f ci/conformance.Dockerfile -t containerd-rs-conformance:latest .
+
+      - name: Run critest
+        env:
+          FOCUS: ${{ inputs.focus }}
+          SKIP: ${{ inputs.skip }}
+        run: RESULTS_DIR="$PWD/critest-results" bash ci/critest-docker.sh
+
+      - name: Upload critest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critest-results
+          path: critest-results/
+          if-no-files-found: warn

@@ -18,6 +18,10 @@ for b in kubeadm kubelet kubectl; do
 done
 curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
   | tar -xz -C /usr/local/bin
+# critest ships in the same cri-tools release — the CRI-conformance suite (see
+# ci/critest.sh). Bundling it here means the conformance image carries it too.
+curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/critest-${CRICTL_VERSION}-linux-amd64.tar.gz" \
+  | tar -xz -C /usr/local/bin
 # crun is a drop-in OCI runtime (CLI-compatible with runc) but faster and
 # lighter. The daemon execs "crun" from PATH.
 curl -fsSLo /usr/local/bin/crun \
