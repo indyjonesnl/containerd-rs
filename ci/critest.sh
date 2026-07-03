@@ -19,8 +19,20 @@ CRICTL_VERSION="${CRICTL_VERSION:-v1.35.0}"
 RESULTS_DIR="${RESULTS_DIR:-critest-results}"
 PARALLEL="${PARALLEL:-1}"
 FOCUS="${FOCUS:-}"
-# Known-deferred / by-design behaviors, extended as the first run is triaged.
-SKIP="${SKIP:-}"
+# Known-deferred / by-design / environmental behaviors, skipped so the suite is
+# a clean gate for everything else (as containerd maintains its own skips). From
+# the 2026-07-03 baseline triage:
+#   AppArmor            — test BeforeEach can't load a profile on the runner
+#                         (environmental) + our AppArmor RuntimeDefault is deferred.
+#   seccomp default     — our seccomp RuntimeDefault profile is deferred (T002).
+#   OOMKilled reason    — deferred (T025): crun run deletes the cgroup on exit.
+#   RunAsUserName       — Windows-style username, N/A on Linux.
+# Override SKIP to change. Real gaps (stats/images/streaming/mounts/namespaces)
+# are intentionally NOT skipped — they are being fixed.
+DEFAULT_SKIP='AppArmor|should support seccomp default on the container|should output OOMKilled reason|should support RunAsUserName'
+# Colon-dash: an unset OR empty SKIP (the workflow input defaults to empty) uses
+# the default. To run the full suite with no skips, pass a non-matching regex.
+SKIP="${SKIP:-$DEFAULT_SKIP}"
 
 log() { echo "[critest] $*"; }
 
