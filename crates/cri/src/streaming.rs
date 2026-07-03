@@ -59,6 +59,12 @@ pub struct ExecSession {
 #[derive(Debug, Clone)]
 pub struct PortForwardSession {
     pub pod_sandbox_id: String,
+    /// Address to dial the forwarded port on. For a CNI pod-network sandbox this
+    /// is the pod IP (routable from the host via the CNI bridge); for a
+    /// host-network sandbox (or when unknown) it falls back to `127.0.0.1`.
+    /// Fixes port-forward to pod-network pods, whose ports live in the pod netns
+    /// and are NOT reachable at the host's `127.0.0.1` (critest portforward).
+    pub host: String,
 }
 
 /// A pending attach session, consumed when its URL is dialed.
@@ -552,16 +558,17 @@ async fn portforward_entry(
 /// Proxy the Kubernetes port-forward WebSocket protocol to a localhost TCP
 /// connection. Channels come in pairs per forwarded port: data = `2*i`,
 /// error = `2*i + 1`; the first frame on each carries the port as 2 LE bytes.
-/// Because pods are host-network, the container's port is reachable at
-/// `127.0.0.1:<port>`.
+/// The forwarded port is dialed at `session.host` — the pod IP (routable from
+/// the host via the CNI bridge) for a pod-network sandbox, else `127.0.0.1`.
 async fn handle_portforward(socket: WebSocket, sessions: Arc<Sessions>, token: String) {
     use futures_util::{SinkExt, StreamExt};
     use std::collections::HashMap as Map;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    if sessions.take_portforward(&token).is_none() {
+    let Some(session) = sessions.take_portforward(&token) else {
         return;
-    }
+    };
+    let host = session.host;
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(tokio::sync::Mutex::new(sink));
     // data channel -> TCP write half
@@ -585,7 +592,7 @@ async fn handle_portforward(socket: WebSocket, sessions: Arc<Sessions>, token: S
                 continue;
             }
             let port = u16::from_le_bytes([payload[0], payload[1]]);
-            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(tcp) => {
                     let (mut rd, wr) = tokio::io::split(tcp);
                     e.insert(wr);
@@ -833,10 +840,11 @@ async fn spdy_portforward<W>(
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let writer = server.writer.clone();
-    if sessions.take_portforward(&token).is_none() {
+    let Some(session) = sessions.take_portforward(&token) else {
         let _ = writer.goaway(0).await;
         return;
-    }
+    };
+    let host = session.host;
     // Per forwarded port the client opens an `error` stream and a `data` stream,
     // both carrying a `port` header. Connect localhost TCP on the data stream
     // (pods are host-network) and pump bidirectionally.
@@ -855,7 +863,7 @@ async fn spdy_portforward<W>(
         let mut rx = stream.data;
         let w = writer.clone();
         let err_id = error_ids.get(&port).copied().unwrap_or(data_id);
-        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        match tokio::net::TcpStream::connect((host.as_str(), port)).await {
             Ok(tcp) => {
                 let (mut rd, mut wr) = tokio::io::split(tcp);
                 // client -> TCP
