@@ -266,24 +266,41 @@ impl RuntimeSvc {
         }
     }
 
-    /// Sample cgroup stats for a Running container via `crun events --stats`.
-    /// Returns `None` for non-running containers (no live cgroup).
+    /// Best-effort CPU/memory sample for a container via `crun events --stats`.
+    /// Returns `(cpu_total_nanos, mem_working_set_bytes)`, zeros if the sample is
+    /// unavailable (crun error / non-JSON / missing fields). A failed sample MUST
+    /// NOT drop the whole stats entry — see [`container_stats_for`].
+    async fn sample_usage(&self, id: &str) -> (u64, u64) {
+        let crun_root = self.ctx.state_dir.join("crun");
+        let id = id.to_string();
+        let out = match tokio::task::spawn_blocking(move || {
+            runtime::crun::stats(runtime::crun::DEFAULT_BIN, &crun_root, &id)
+        })
+        .await
+        {
+            Ok(Ok(o)) if o.status.success() => o,
+            _ => return (0, 0),
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+            return (0, 0);
+        };
+        let data = &v["data"];
+        (
+            data["cpu"]["usage"]["total"].as_u64().unwrap_or(0),
+            data["memory"]["usage"]["usage"].as_u64().unwrap_or(0),
+        )
+    }
+
+    /// Build CRI `ContainerStats` for a container. Returns `None` only for a
+    /// non-running container (no live cgroup). Usage is best-effort (a failed
+    /// sample yields zeros, never a nil entry), so the returned stats ALWAYS
+    /// carry the container id + labels/annotations — which `ListContainerStats`
+    /// enumeration and label filtering depend on (critest container.go:187+).
     async fn container_stats_for(&self, rec: &ContainerRecord) -> Option<v1::ContainerStats> {
         if rec.state != ContainerState::Running {
             return None;
         }
-        let crun_root = self.ctx.state_dir.join("crun");
-        let id = rec.id.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            runtime::crun::stats(runtime::crun::DEFAULT_BIN, &crun_root, &id)
-        })
-        .await
-        .ok()?
-        .ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-        let data = &v["data"];
-        let cpu_total = data["cpu"]["usage"]["total"].as_u64().unwrap_or(0);
-        let mem_usage = data["memory"]["usage"]["usage"].as_u64().unwrap_or(0);
+        let (cpu_total, mem_usage) = self.sample_usage(&rec.id).await;
         let ts = unix_nanos();
         Some(v1::ContainerStats {
             attributes: Some(v1::ContainerAttributes {
@@ -292,8 +309,8 @@ impl RuntimeSvc {
                     name: rec.name.clone(),
                     attempt: rec.attempt,
                 }),
-                labels: std::collections::HashMap::new(),
-                annotations: std::collections::HashMap::new(),
+                labels: rec.labels.clone(),
+                annotations: rec.annotations.clone(),
             }),
             cpu: Some(v1::CpuUsage {
                 timestamp: ts,
