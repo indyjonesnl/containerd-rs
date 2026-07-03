@@ -1618,6 +1618,11 @@ impl RuntimeService for RuntimeSvc {
             let keep = filter.as_ref().is_none_or(|f| {
                 (f.id.is_empty() || f.id == rec.id)
                     && (f.pod_sandbox_id.is_empty() || f.pod_sandbox_id == rec.sandbox_id)
+                    // label_selector: keep only containers whose labels are a
+                    // superset of every selector entry (critest filter-by-labels).
+                    && f.label_selector
+                        .iter()
+                        .all(|(k, v)| rec.labels.get(k).is_some_and(|rv| rv == v))
             });
             if !keep {
                 continue;
