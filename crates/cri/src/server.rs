@@ -1001,7 +1001,12 @@ impl RuntimeService for RuntimeSvc {
                 .unwrap_or_default(),
             no_new_privileges: sec_ctx.map(|sc| sc.no_new_privs).unwrap_or(false),
             apparmor_profile: map_apparmor(sec_ctx.and_then(|sc| sc.apparmor.as_ref())),
-            selinux_label: map_selinux(sec_ctx.and_then(|sc| sc.selinux_options.as_ref())),
+            // Only emit a SELinux label when the host actually has SELinux
+            // enabled; otherwise the runtime's write to /proc/self/attr/* fails
+            // with EINVAL and crashes the container (see host_selinux_enabled).
+            selinux_label: host_selinux_enabled()
+                .then(|| map_selinux(sec_ctx.and_then(|sc| sc.selinux_options.as_ref())))
+                .flatten(),
             masked_paths: sec_ctx.map(|sc| sc.masked_paths.clone()).unwrap_or_default(),
             readonly_paths: sec_ctx
                 .map(|sc| sc.readonly_paths.clone())
@@ -1954,6 +1959,17 @@ fn map_selinux(opt: Option<&v1::SeLinuxOption>) -> Option<String> {
         return None;
     }
     Some(format!("{}:{}:{}:{}", o.user, o.role, o.r#type, o.level))
+}
+
+/// Whether SELinux is enabled on the host (selinuxfs mounted at
+/// `/sys/fs/selinux`). Emitting an OCI `process.selinuxLabel` on a host WITHOUT
+/// SELinux makes the runtime write to `/proc/self/attr/*`, which fails with
+/// `EINVAL` and crashes the container — so labels are only emitted when SELinux
+/// is actually enabled (matching containerd). Regression guard: the sig-storage
+/// EmptyDir/Subpath conformance tests pass `seLinuxOptions`, and emitting the
+/// label unconditionally broke them on the (non-SELinux) CI runner.
+fn host_selinux_enabled() -> bool {
+    std::path::Path::new("/sys/fs/selinux/enforce").exists()
 }
 
 fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources {
