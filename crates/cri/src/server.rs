@@ -46,6 +46,10 @@ pub struct Context {
     pub cni: sandbox::cni::Cni,
     /// Per-image-reference locks serializing concurrent duplicate pulls.
     pub pull_locks: crate::locks::KeyedLocks,
+    /// Broadcast bus for container lifecycle events (feature 002 US3 / T026),
+    /// consumed by the CRI `GetContainerEvents` stream (kubelet evented PLEG).
+    /// `send` is a no-op when there are no subscribers.
+    pub container_events: tokio::sync::broadcast::Sender<v1::ContainerEventResponse>,
 }
 
 impl Context {
@@ -61,6 +65,7 @@ impl Context {
         cni_bin_dir: PathBuf,
     ) -> Self {
         let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("crun")));
+        let (container_events, _) = tokio::sync::broadcast::channel(512);
         Self {
             content,
             metadata,
@@ -71,7 +76,20 @@ impl Context {
             stream_base_url: format!("http://{stream_addr}"),
             cni: sandbox::cni::Cni::new(cni_conf_dir, cni_bin_dir),
             pull_locks: crate::locks::KeyedLocks::default(),
+            container_events,
         }
+    }
+
+    /// Emit a container lifecycle event to `GetContainerEvents` subscribers
+    /// (feature 002 US3 / T026). No-op when there are no subscribers.
+    pub fn emit_container_event(&self, container_id: &str, event: v1::ContainerEventType) {
+        let _ = self.container_events.send(v1::ContainerEventResponse {
+            container_id: container_id.to_string(),
+            container_event_type: event as i32,
+            created_at: unix_nanos(),
+            pod_sandbox_status: None,
+            containers_statuses: Vec::new(),
+        });
     }
 }
 
@@ -580,9 +598,20 @@ impl RuntimeService for RuntimeSvc {
         &self,
         _request: Request<v1::GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "get_container_events not yet implemented",
-        ))
+        // Subscribe to the lifecycle bus and stream events until the client
+        // disconnects. Lagged subscribers skip missed events rather than error;
+        // a closed sender ends the stream (feature 002 US3 / T026).
+        let rx = self.ctx.container_events.subscribe();
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => return Some((Ok(ev), rx)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type StreamPodSandboxMetricsStream = BoxStream<v1::StreamPodSandboxMetricsResponse>;
@@ -1100,6 +1129,8 @@ impl RuntimeService for RuntimeSvc {
             .put(Kind::Container, self.ns(), &id, &rec)
             .map_err(|e| Status::internal(e.to_string()))?;
         tracing::info!(container = %id, "CreateContainer wrote OCI bundle + record");
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerCreatedEvent);
         Ok(Response::new(v1::CreateContainerResponse {
             container_id: id,
         }))
@@ -1296,6 +1327,8 @@ impl RuntimeService for RuntimeSvc {
                 }
             }
         }
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerStoppedEvent);
         Ok(Response::new(v1::StopContainerResponse {}))
     }
 
@@ -1316,6 +1349,8 @@ impl RuntimeService for RuntimeSvc {
             .delete(Kind::Container, self.ns(), &id)
             .map_err(|e| Status::internal(e.to_string()))?;
         let _ = runtime::shim::Bundle::new(&self.ctx.state_dir, self.ns(), &id).remove();
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerDeletedEvent);
         Ok(Response::new(v1::RemoveContainerResponse {}))
     }
 
@@ -1385,6 +1420,7 @@ impl RuntimeService for RuntimeSvc {
                 r.reason = Some(if code == 0 { "Completed" } else { "Error" }.to_string());
                 let _ = ctx.metadata.put(Kind::Container, &ns, &cid, &r);
             }
+            ctx.emit_container_event(&cid, v1::ContainerEventType::ContainerStoppedEvent);
             ctx.streaming.close_live(&cid);
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
@@ -1409,6 +1445,8 @@ impl RuntimeService for RuntimeSvc {
         })
         .await;
 
+        self.ctx
+            .emit_container_event(&id, v1::ContainerEventType::ContainerStartedEvent);
         Ok(Response::new(v1::StartContainerResponse {}))
     }
 
@@ -2456,6 +2494,25 @@ mod tests {
             dir.join("cni/net.d"),
             dir.join("cni/bin"),
         ))
+    }
+
+    // Feature 002 US3 / T026: the container-event bus delivers lifecycle events
+    // to subscribers (GetContainerEvents streams from this bus).
+    #[tokio::test]
+    async fn container_event_bus_delivers_to_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let mut rx = ctx.container_events.subscribe();
+        ctx.emit_container_event("c1", v1::ContainerEventType::ContainerStartedEvent);
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.container_id, "c1");
+        assert_eq!(
+            ev.container_event_type,
+            v1::ContainerEventType::ContainerStartedEvent as i32
+        );
+        // No subscriber-less panic: emit with the receiver dropped is a no-op.
+        drop(rx);
+        ctx.emit_container_event("c2", v1::ContainerEventType::ContainerDeletedEvent);
     }
 
     #[tokio::test]
