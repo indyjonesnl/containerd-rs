@@ -31,7 +31,11 @@ if ! command -v critest >/dev/null 2>&1; then
 fi
 
 mkdir -p "${RESULTS_DIR}"
-args=(-runtime-endpoint "${CRI_SOCKET}" -image-endpoint "${CRI_SOCKET}" -parallel "${PARALLEL}")
+# NB: critest embeds Ginkgo v2, which rejects go-test's `-parallel` ("use -p /
+# -procs"). Run serial by default; only parallelize via the Ginkgo flag when
+# asked (PARALLEL>1).
+args=(-runtime-endpoint "${CRI_SOCKET}" -image-endpoint "${CRI_SOCKET}")
+[[ -n "${PARALLEL}" && "${PARALLEL}" != "1" ]] && args+=(-ginkgo.procs "${PARALLEL}")
 [[ -n "${FOCUS}" ]] && args+=(-ginkgo.focus "${FOCUS}")
 [[ -n "${SKIP}" ]] && args+=(-ginkgo.skip "${SKIP}")
 # shellcheck disable=SC2206
