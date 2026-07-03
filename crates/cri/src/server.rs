@@ -1677,18 +1677,27 @@ impl RuntimeService for RuntimeSvc {
     ) -> Result<Response<v1::PortForwardResponse>, Status> {
         let req = request.into_inner();
         // Sandbox must exist; ports are carried over the stream by the client.
-        self.ctx
+        let sandbox = self
+            .ctx
             .metadata
             .get::<SandboxRecord>(Kind::Sandbox, self.ns(), &req.pod_sandbox_id)
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| {
                 Status::not_found(format!("sandbox {} not found", req.pod_sandbox_id))
             })?;
+        // Dial the pod IP (routable from the host via the CNI bridge); a
+        // pod-network pod's ports are NOT at the host's 127.0.0.1. Host-network
+        // pods (no distinct IP) fall back to 127.0.0.1.
+        let host = sandbox
+            .ip
+            .filter(|ip| !ip.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         let token = self
             .ctx
             .streaming
             .register_portforward(crate::streaming::PortForwardSession {
                 pod_sandbox_id: req.pod_sandbox_id,
+                host,
             });
         Ok(Response::new(v1::PortForwardResponse {
             url: format!("{}/portforward/{}", self.ctx.stream_base_url, token),
@@ -1887,10 +1896,17 @@ impl ImageService for ImageSvc {
 
         let image_id = pulled.image_id.to_string();
         // A digest ref (name@sha256:..) is a repoDigest; a tag ref is a repoTag
-        // (normalized so a bare name carries an implicit :latest).
-        let digest_ref = match &pulled.manifest_digest {
-            Some(d) => Some(format!("{}@{}", repo_name(&reference), d)),
-            None => is_digest_ref(&reference).then(|| reference.clone()),
+        // (normalized so a bare name carries an implicit :latest). NB: `repo_name`
+        // strips at the last ':' after the final '/', which corrupts a digest ref
+        // (it would cut inside `sha256:...`) — so a digest ref is stored as-is;
+        // only a tag ref derives its repoDigest as `name@<manifest_digest>`.
+        let digest_ref = if is_digest_ref(&reference) {
+            Some(reference.clone())
+        } else {
+            pulled
+                .manifest_digest
+                .as_ref()
+                .map(|d| format!("{}@{}", repo_name(&reference), d))
         };
         let tag_ref = (!is_digest_ref(&reference)).then(|| normalize_image_ref(&reference));
 
@@ -3054,6 +3070,7 @@ mod tests {
             .streaming
             .register_portforward(crate::streaming::PortForwardSession {
                 pod_sandbox_id: "p".into(),
+                host: "127.0.0.1".into(),
             });
 
         let (mut ws, _) =
