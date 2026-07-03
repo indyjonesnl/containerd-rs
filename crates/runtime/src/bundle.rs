@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
     Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder,
-    LinuxDeviceCgroupBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    LinuxResourcesBuilder, MountBuilder, ProcessBuilder, RootBuilder, Spec, UserBuilder,
+    LinuxDeviceCgroupBuilder, LinuxHugepageLimitBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder,
+    LinuxNamespaceType, LinuxResourcesBuilder, MountBuilder, ProcessBuilder, RootBuilder, Spec,
+    UserBuilder,
 };
 
 /// A bind mount to inject into the container (from a CRI mount).
@@ -157,6 +158,13 @@ pub struct Resources {
     pub memory_limit: Option<i64>,
     pub cpuset_cpus: Option<String>,
     pub cpuset_mems: Option<String>,
+    /// HugeTLB limits per page size (CRI `hugepage_limits`) → OCI
+    /// `linux.resources.hugepageLimits` (feature 002 US5 / T030).
+    pub hugepage_limits: Vec<(String, u64)>,
+    /// Raw cgroup-v2 key/values (CRI `unified`) → OCI `linux.resources.unified`.
+    /// This is how the kubelet passes controllers OCI has no typed field for,
+    /// e.g. `pids.max`, `io.max`, `io.weight`.
+    pub unified: std::collections::HashMap<String, String>,
 }
 
 impl Resources {
@@ -167,6 +175,8 @@ impl Resources {
             && self.memory_limit.is_none()
             && self.cpuset_cpus.is_none()
             && self.cpuset_mems.is_none()
+            && self.hugepage_limits.is_empty()
+            && self.unified.is_empty()
     }
 }
 
@@ -600,6 +610,30 @@ fn apply_resources(spec: &mut Spec, res: &Resources) {
         }
     }
 
+    if !res.hugepage_limits.is_empty() {
+        let hp: Vec<_> = res
+            .hugepage_limits
+            .iter()
+            .filter_map(|(page, limit)| {
+                LinuxHugepageLimitBuilder::default()
+                    .page_size(page.clone())
+                    .limit(*limit as i64)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        if !hp.is_empty() {
+            resources.set_hugepage_limits(Some(hp));
+        }
+    }
+
+    // cgroup-v2 passthrough (pids.max, io.max, io.weight, ...).
+    if !res.unified.is_empty() {
+        let mut u = resources.unified().clone().unwrap_or_default();
+        u.extend(res.unified.iter().map(|(k, v)| (k.clone(), v.clone())));
+        resources.set_unified(Some(u));
+    }
+
     linux.set_resources(Some(resources));
     spec.set_linux(Some(linux));
 }
@@ -775,6 +809,35 @@ mod tests {
             no_limits,
             "resources must NOT be applied without a cgroup_path"
         );
+    }
+
+    // Feature 002 US5 / T030: HugeTLB limits + cgroup-v2 unified passthrough
+    // (pids.max, io.max, ...) are emitted into linux.resources.
+    #[test]
+    fn hugepage_and_unified_resources_emitted() {
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            resources: Resources {
+                hugepage_limits: vec![("2MB".into(), 2_097_152)],
+                unified: std::collections::HashMap::from([
+                    ("pids.max".to_string(), "128".to_string()),
+                    ("io.weight".to_string(), "default 200".to_string()),
+                ]),
+                ..Default::default()
+            },
+            cgroup_path: Some("/kubepods/pod9/x".into()),
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["linux"]["resources"]["unified"]["pids.max"], serde_json::json!("128"));
+        assert_eq!(
+            v["linux"]["resources"]["unified"]["io.weight"],
+            serde_json::json!("default 200")
+        );
+        let hp = &v["linux"]["resources"]["hugepageLimits"];
+        assert_eq!(hp[0]["pageSize"], serde_json::json!("2MB"));
+        assert_eq!(hp[0]["limit"], serde_json::json!(2_097_152));
     }
 
     #[test]

@@ -2105,6 +2105,14 @@ fn cri_resources(r: &v1::LinuxContainerResources) -> runtime::bundle::Resources 
         memory_limit: (r.memory_limit_in_bytes > 0).then_some(r.memory_limit_in_bytes),
         cpuset_cpus: (!r.cpuset_cpus.is_empty()).then(|| r.cpuset_cpus.clone()),
         cpuset_mems: (!r.cpuset_mems.is_empty()).then(|| r.cpuset_mems.clone()),
+        // HugeTLB limits + cgroup-v2 unified passthrough (pids/blkio) — feature 002 US5.
+        hugepage_limits: r
+            .hugepage_limits
+            .iter()
+            .filter(|h| h.limit > 0 && !h.page_size.is_empty())
+            .map(|h| (h.page_size.clone(), h.limit))
+            .collect(),
+        unified: r.unified.clone(),
     }
 }
 
