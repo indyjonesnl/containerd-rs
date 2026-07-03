@@ -103,6 +103,24 @@ fn repo_name(reference: &str) -> &str {
     }
 }
 
+/// Whether `reference` is a digest reference (`name@sha256:...`).
+fn is_digest_ref(reference: &str) -> bool {
+    reference.contains('@')
+}
+
+/// Normalize an image reference for storage/lookup: a bare name with no tag and
+/// no digest gets an implicit `:latest` (as containerd/docker do), so a pull of
+/// `busybox` and a status query for `busybox` both resolve to `busybox:latest`.
+/// Digest refs and already-tagged refs are returned unchanged. `repo_name`
+/// stripping nothing (and no `@`) means there is no tag → append `:latest`.
+fn normalize_image_ref(reference: &str) -> String {
+    if is_digest_ref(reference) || repo_name(reference) != reference {
+        reference.to_string()
+    } else {
+        format!("{reference}:latest")
+    }
+}
+
 /// Build pull credentials from the CRI `AuthConfig`, in priority order: a bearer
 /// identity/registry token, explicit username/password, or a base64-encoded
 /// `auth` (`"username:password"`, as found in docker config / pull secrets);
@@ -1789,6 +1807,7 @@ impl ImageSvc {
         {
             return Ok(Some(rec));
         }
+        let nkey = normalize_image_ref(key);
         let all = self
             .ctx
             .metadata
@@ -1796,9 +1815,21 @@ impl ImageSvc {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(all.into_iter().find(|r| {
             r.image_id == key
-                || r.repo_tags.iter().any(|t| t == key)
+                // match the raw key AND its :latest-normalized form, so a bare
+                // `busybox` query resolves the stored `busybox:latest` repoTag.
+                || r.repo_tags.iter().any(|t| t == key || t == &nkey)
                 || r.repo_digests.iter().any(|d| d == key)
         }))
+    }
+
+    /// Find an image record by its content id (digest). Used by pull to dedup +
+    /// aggregate repoTags/repoDigests for the same image across tag/digest pulls.
+    fn find_image_by_id(&self, image_id: &str) -> Result<Option<ImageRecord>, Status> {
+        // Records are keyed by image_id, so a direct get suffices.
+        self.ctx
+            .metadata
+            .get::<ImageRecord>(Kind::Image, self.ns(), image_id)
+            .map_err(|e| Status::internal(e.to_string()))
     }
 }
 
@@ -1854,28 +1885,48 @@ impl ImageService for ImageSvc {
             }
         })?;
 
-        let repo_digests = match &pulled.manifest_digest {
-            Some(d) => vec![format!("{}@{}", repo_name(&reference), d)],
-            None => Vec::new(),
+        let image_id = pulled.image_id.to_string();
+        // A digest ref (name@sha256:..) is a repoDigest; a tag ref is a repoTag
+        // (normalized so a bare name carries an implicit :latest).
+        let digest_ref = match &pulled.manifest_digest {
+            Some(d) => Some(format!("{}@{}", repo_name(&reference), d)),
+            None => is_digest_ref(&reference).then(|| reference.clone()),
         };
-        let record = ImageRecord {
-            name: reference.clone(),
-            target_digest: pulled
-                .manifest_digest
-                .as_ref()
-                .map(|d| d.to_string())
-                .unwrap_or_default(),
-            image_id: pulled.image_id.to_string(),
-            repo_tags: vec![reference.clone()],
-            repo_digests,
-            size: pulled.size,
-            layer_digests: pulled.layer_digests.iter().map(|d| d.to_string()).collect(),
-            chain_ids: pulled.chain_ids.iter().map(|d| d.to_string()).collect(),
-            user: pulled.user.clone(),
-        };
+        let tag_ref = (!is_digest_ref(&reference)).then(|| normalize_image_ref(&reference));
+
+        // Dedup + aggregate by image_id: multiple tags/digests of the SAME image
+        // collapse to one record carrying all repoTags/repoDigests (critest
+        // "3 repoTags in single image"). Keyed by image_id, not the reference.
+        let mut record = self
+            .find_image_by_id(&image_id)?
+            .unwrap_or_else(|| ImageRecord {
+                name: tag_ref.clone().unwrap_or_else(|| reference.clone()),
+                target_digest: pulled
+                    .manifest_digest
+                    .as_ref()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default(),
+                image_id: image_id.clone(),
+                repo_tags: Vec::new(),
+                repo_digests: Vec::new(),
+                size: pulled.size,
+                layer_digests: pulled.layer_digests.iter().map(|d| d.to_string()).collect(),
+                chain_ids: pulled.chain_ids.iter().map(|d| d.to_string()).collect(),
+                user: pulled.user.clone(),
+            });
+        if let Some(t) = &tag_ref {
+            if !record.repo_tags.contains(t) {
+                record.repo_tags.push(t.clone());
+            }
+        }
+        if let Some(d) = &digest_ref {
+            if !record.repo_digests.contains(d) {
+                record.repo_digests.push(d.clone());
+            }
+        }
         self.ctx
             .metadata
-            .put(Kind::Image, self.ns(), &reference, &record)
+            .put(Kind::Image, self.ns(), &image_id, &record)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(v1::PullImageResponse {
@@ -1923,9 +1974,10 @@ impl ImageService for ImageSvc {
             .map(|s| s.image)
             .unwrap_or_default();
         if let Some(rec) = self.find_image(&key)? {
+            // Records are keyed by image_id (see pull_image dedup/aggregate).
             self.ctx
                 .metadata
-                .delete(Kind::Image, self.ns(), &rec.name)
+                .delete(Kind::Image, self.ns(), &rec.image_id)
                 .map_err(|e| Status::internal(e.to_string()))?;
             // Reclaim blobs/snapshots no longer referenced by any remaining image.
             let live = self
@@ -3852,6 +3904,22 @@ mod tests {
         assert!(log.contains("CRI_E2E_MARKER"), "container log: {log:?}");
     }
 
+    // Feature: image reference normalization (critest Image Manager). A bare
+    // name gets an implicit :latest; tagged and digest refs are unchanged; a
+    // registry port colon is not mistaken for a tag.
+    #[test]
+    fn normalize_image_ref_adds_latest() {
+        assert_eq!(normalize_image_ref("busybox"), "busybox:latest");
+        assert_eq!(normalize_image_ref("gcr.io/foo/bar"), "gcr.io/foo/bar:latest");
+        assert_eq!(normalize_image_ref("busybox:1.29"), "busybox:1.29");
+        assert_eq!(normalize_image_ref("host:5000/img"), "host:5000/img:latest");
+        assert_eq!(normalize_image_ref("host:5000/img:v2"), "host:5000/img:v2");
+        let dg = "img@sha256:9700f9a2f5bf2c45f2f605a0bd3bce7cf37420ec9d3ed50ac2758413308766bf";
+        assert_eq!(normalize_image_ref(dg), dg);
+        assert!(is_digest_ref(dg));
+        assert!(!is_digest_ref("busybox:1.29"));
+    }
+
     #[tokio::test]
     async fn remove_image_reclaims_and_fs_info() {
         use core_types::Digest;
@@ -3873,7 +3941,8 @@ mod tests {
             .put(
                 Kind::Image,
                 ctx.namespace.as_str(),
-                "img",
+                // Images are keyed by image_id (see pull_image dedup/aggregate).
+                &config.to_string(),
                 &ImageRecord {
                     name: "img".into(),
                     target_digest: String::new(),
