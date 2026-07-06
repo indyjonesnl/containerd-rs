@@ -688,14 +688,17 @@ impl RuntimeService for RuntimeSvc {
             }
         }
 
-        // Host network if the pod requests NODE network mode; otherwise try CNI.
-        let host_network = config
+        // Namespace modes from the pod sandbox (NODE == share host). Network
+        // drives CNI vs host-net; pid/ipc are applied per-container (HostPID/HostIPC).
+        let ns_opts = config
             .linux
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
-            .and_then(|sc| sc.namespace_options.as_ref())
-            .map(|ns| ns.network == v1::NamespaceMode::Node as i32)
-            .unwrap_or(false);
+            .and_then(|sc| sc.namespace_options.as_ref());
+        let node = v1::NamespaceMode::Node as i32;
+        let host_network = ns_opts.map(|ns| ns.network == node).unwrap_or(false);
+        let host_pid = ns_opts.map(|ns| ns.pid == node).unwrap_or(false);
+        let host_ipc = ns_opts.map(|ns| ns.ipc == node).unwrap_or(false);
 
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
         // plugin chain; if CNI is unavailable/fails we tear down best-effort and
@@ -770,6 +773,8 @@ impl RuntimeService for RuntimeSvc {
             annotations: config.annotations,
             log_directory: config.log_directory,
             host_network,
+            host_pid,
+            host_ipc,
             resolv_conf_path,
             sysctls: config
                 .linux
@@ -844,8 +849,16 @@ impl RuntimeService for RuntimeSvc {
                         } else {
                             v1::NamespaceMode::Pod as i32
                         },
-                        pid: v1::NamespaceMode::Container as i32,
-                        ipc: v1::NamespaceMode::Pod as i32,
+                        pid: if rec.host_pid {
+                            v1::NamespaceMode::Node as i32
+                        } else {
+                            v1::NamespaceMode::Container as i32
+                        },
+                        ipc: if rec.host_ipc {
+                            v1::NamespaceMode::Node as i32
+                        } else {
+                            v1::NamespaceMode::Pod as i32
+                        },
                         target_id: String::new(),
                         userns_options: None,
                     }),
@@ -1078,6 +1091,9 @@ impl RuntimeService for RuntimeSvc {
                 .map(|sc| sc.readonly_paths.clone())
                 .unwrap_or_default(),
             seccomp: map_seccomp(sec_ctx.and_then(|sc| sc.seccomp.as_ref())),
+            // HostPID/HostIPC come from the pod sandbox's namespace options.
+            host_pid: sandbox.host_pid,
+            host_ipc: sandbox.host_ipc,
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -2930,6 +2946,8 @@ mod tests {
                         annotations: Default::default(),
                         log_directory: String::new(),
                         host_network: false,
+                        host_pid: false,
+                        host_ipc: false,
                         resolv_conf_path: None,
                         sysctls: Default::default(),
                         cgroup_parent: String::new(),

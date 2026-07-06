@@ -130,6 +130,11 @@ pub struct ContainerRequest {
     pub readonly_paths: Vec<String>,
     /// Requested seccomp confinement. Ignored for privileged containers.
     pub seccomp: SeccompProfile,
+    /// CRI `NamespaceOption.pid == NODE` — share the host PID namespace (HostPID).
+    /// Drops the container's private PID namespace so it sees host processes.
+    pub host_pid: bool,
+    /// CRI `NamespaceOption.ipc == NODE` — share the host IPC namespace (HostIPC).
+    pub host_ipc: bool,
 }
 
 /// Requested seccomp confinement, mapped from the CRI `SecurityProfile`.
@@ -552,6 +557,7 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     // sandbox/host UTS instead.
     spec.set_hostname(req.hostname.clone());
     set_network_namespace(&mut spec, req.netns_path.as_deref());
+    apply_host_namespaces(&mut spec, req.host_pid, req.host_ipc);
     add_bind_mounts(&mut spec, &req.mounts);
     // Resource limits require a delegated cgroup (cgroupsPath under the kubelet's
     // cgroup_parent); applying them with crun's default root-level path fails
@@ -698,6 +704,29 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
         }
     }
     spec.set_mounts(Some(all));
+}
+
+/// Share the host PID / IPC namespaces when requested (CRI HostPID / HostIPC):
+/// drop the corresponding private namespace from the spec so the container joins
+/// the host's. `Spec::default()` includes private pid+ipc namespaces, so sharing
+/// the host is a removal. (Pod-shared PID/IPC across containers is not supported
+/// without a pause/sandbox namespace holder — see GAPS §1.)
+fn apply_host_namespaces(spec: &mut Spec, host_pid: bool, host_ipc: bool) {
+    if !host_pid && !host_ipc {
+        return;
+    }
+    let Some(mut linux) = spec.linux().clone() else {
+        return;
+    };
+    let mut namespaces = linux.namespaces().clone().unwrap_or_default();
+    if host_pid {
+        namespaces.retain(|n| n.typ() != LinuxNamespaceType::Pid);
+    }
+    if host_ipc {
+        namespaces.retain(|n| n.typ() != LinuxNamespaceType::Ipc);
+    }
+    linux.set_namespaces(Some(namespaces));
+    spec.set_linux(Some(linux));
 }
 
 /// Point the container's network namespace at the pod's (CNI), or drop it for
@@ -1268,6 +1297,29 @@ mod tests {
             .unwrap();
         assert!(eff.contains(&Capability::Chown));
         assert!(eff.contains(&Capability::SysAdmin));
+    }
+
+    // Feature 003 US1: HostPID/HostIPC drop the container's private pid/ipc
+    // namespaces so it shares the host's (critest namespace options).
+    #[test]
+    fn host_pid_ipc_drop_private_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            host_pid: true,
+            host_ipc: true,
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("r")).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        let types: Vec<String> = v["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(!types.contains(&"pid".to_string()), "HostPID drops pid ns");
+        assert!(!types.contains(&"ipc".to_string()), "HostIPC drops ipc ns");
     }
 
     // Feature 002 US2: security-context fields are emitted into the OCI spec for a
