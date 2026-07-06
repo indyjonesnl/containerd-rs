@@ -60,7 +60,7 @@ zstd = "0.13"
 bytes = "1"
 hyper = { version = "1", features = ["server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-rustix = { version = "1", features = ["fs", "mount", "net", "process"] }
+rustix = { version = "1", features = ["fs", "mount", "net", "process", "thread"] }
 # internal crates
 core-types = { path = "crates/core-types" }
 content = { path = "crates/content" }
