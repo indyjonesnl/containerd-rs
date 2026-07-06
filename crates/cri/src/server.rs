@@ -1007,6 +1007,18 @@ impl RuntimeService for RuntimeSvc {
         let run_as_group = sec_ctx
             .and_then(|sc| sc.run_as_group.as_ref())
             .map(|v| v.value as u32);
+        // CRI: RunAsGroup set without a user (RunAsUser or RunAsUsername) must be
+        // rejected at CreateContainer — the runtime has no uid to pair with the
+        // requested gid. Mirrors containerd's validation; cri-tools asserts it.
+        let has_run_as_user = run_as_user.is_some()
+            || sec_ctx
+                .map(|sc| !sc.run_as_username.is_empty())
+                .unwrap_or(false);
+        if run_as_group.is_some() && !has_run_as_user {
+            return Err(Status::invalid_argument(
+                "RunAsGroup is specified without RunAsUser",
+            ));
+        }
         let container_req = runtime::bundle::ContainerRequest {
             command: config.command.clone(),
             args: config.args.clone(),
@@ -1037,6 +1049,16 @@ impl RuntimeService for RuntimeSvc {
                         source: m.host_path.clone(),
                         destination: m.container_path.clone(),
                         readonly: m.readonly,
+                        propagation: match m.propagation {
+                            x if x == v1::MountPropagation::PropagationHostToContainer as i32 => {
+                                runtime::bundle::Propagation::HostToContainer
+                            }
+                            x if x == v1::MountPropagation::PropagationBidirectional as i32 => {
+                                runtime::bundle::Propagation::Bidirectional
+                            }
+                            _ => runtime::bundle::Propagation::Private,
+                        },
+                        recursive_read_only: m.recursive_read_only,
                     })
                     .collect();
                 // Bind the pod's generated resolv.conf at /etc/resolv.conf unless the
@@ -1048,6 +1070,8 @@ impl RuntimeService for RuntimeSvc {
                             source: rc.clone(),
                             destination: "/etc/resolv.conf".to_string(),
                             readonly: true,
+                            propagation: runtime::bundle::Propagation::Private,
+                            recursive_read_only: false,
                         });
                     }
                 }
@@ -1137,12 +1161,16 @@ impl RuntimeService for RuntimeSvc {
             reason: None,
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
-            mounts: container_req
+            // Echo only the CRI-requested mounts in ContainerStatus.Mounts — NOT
+            // the internally-injected ones (e.g. the pod's resolv.conf bind). The
+            // kubelet/critest assert this list matches exactly what they asked for
+            // (critest non-recursive-readonly expects len == requested).
+            mounts: config
                 .mounts
                 .iter()
                 .map(|m| MountRecord {
-                    host_path: m.source.clone(),
-                    container_path: m.destination.clone(),
+                    host_path: m.host_path.clone(),
+                    container_path: m.container_path.clone(),
                     readonly: m.readonly,
                 })
                 .collect(),
@@ -1458,9 +1486,18 @@ impl RuntimeService for RuntimeSvc {
         let cid = id.clone();
         let bundle_dir = bundle.dir().to_path_buf();
         let live = self.ctx.streaming.live_channel(&id);
+        let sessions = self.ctx.streaming.clone();
         tokio::spawn(async move {
-            let code =
-                supervise_container(&crun_root, &bundle_dir, &cid, &log_path, live, terminal).await;
+            let code = supervise_container(
+                &crun_root,
+                &bundle_dir,
+                &cid,
+                &log_path,
+                live,
+                terminal,
+                sessions,
+            )
+            .await;
             if let Ok(Some(mut r)) = ctx
                 .metadata
                 .get::<ContainerRecord>(Kind::Container, &ns, &cid)
@@ -1475,6 +1512,7 @@ impl RuntimeService for RuntimeSvc {
             }
             ctx.emit_container_event(&cid, v1::ContainerEventType::ContainerStoppedEvent);
             ctx.streaming.close_live(&cid);
+            ctx.streaming.close_log(&cid);
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
 
@@ -1518,12 +1556,73 @@ impl RuntimeService for RuntimeSvc {
         let crun_root = self.ctx.state_dir.join("crun");
         let id = req.container_id.clone();
         let cmd = req.cmd.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            runtime::crun::exec(runtime::crun::DEFAULT_BIN, &crun_root, &id, &cmd)
-        })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| Status::internal(format!("crun exec: {e}")))?;
+        // Have crun write the exec'd process's host-visible PID here. On timeout
+        // we must SIGKILL *that* process: killing our `crun exec` host process is
+        // not enough, because crun puts the exec'd process in its own session, so
+        // it survives (and the container's `pgrep` still finds it).
+        let pid_file = self
+            .ctx
+            .state_dir
+            .join(format!("exec-{id}-{}.pid", unix_nanos()));
+
+        let mut command = tokio::process::Command::new(runtime::crun::DEFAULT_BIN);
+        command
+            .arg("--root")
+            .arg(&crun_root)
+            .arg("exec")
+            .arg("--pid-file")
+            .arg(&pid_file)
+            .arg(&id)
+            .args(&cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|e| Status::internal(format!("crun exec: {e}")))?;
+        // With process_group(0), the child is its own group leader, so pgid == pid.
+        let pgid = child.id();
+        let waiter = tokio::spawn(async move { child.wait_with_output().await });
+
+        let out = if req.timeout > 0 {
+            let dur = std::time::Duration::from_secs(req.timeout as u64);
+            match tokio::time::timeout(dur, waiter).await {
+                Ok(joined) => {
+                    let _ = std::fs::remove_file(&pid_file);
+                    joined
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(|e| Status::internal(format!("crun exec: {e}")))?
+                }
+                Err(_) => {
+                    // Timed out: SIGKILL the exec'd process by its host PID (from
+                    // the pid-file), then the crun-exec process group as a backstop.
+                    if let Some(pid) = std::fs::read_to_string(&pid_file)
+                        .ok()
+                        .and_then(|t| t.trim().parse::<i32>().ok())
+                        .and_then(rustix::process::Pid::from_raw)
+                    {
+                        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    }
+                    if let Some(p) = pgid.and_then(|g| rustix::process::Pid::from_raw(g as i32)) {
+                        let _ =
+                            rustix::process::kill_process_group(p, rustix::process::Signal::KILL);
+                    }
+                    let _ = std::fs::remove_file(&pid_file);
+                    return Err(Status::deadline_exceeded(format!(
+                        "exec timed out after {}s",
+                        req.timeout
+                    )));
+                }
+            }
+        } else {
+            let out = waiter
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(|e| Status::internal(format!("crun exec: {e}")))?;
+            let _ = std::fs::remove_file(&pid_file);
+            out
+        };
 
         Ok(Response::new(v1::ExecSyncResponse {
             stdout: out.stdout,
@@ -1742,10 +1841,23 @@ impl RuntimeService for RuntimeSvc {
         let rec = self
             .get_container(&id)?
             .ok_or_else(|| Status::not_found(format!("container {id} not found")))?;
+        // Match containerd: reopen is only valid for a running container.
+        if rec.state != ContainerState::Running {
+            return Err(Status::failed_precondition("container is not running"));
+        }
         let bundle = runtime::shim::Bundle::new(&self.ctx.state_dir, self.ns(), &id);
         let log_path = container_log_path(&bundle, &rec.log_path);
-        // Recreate the log file (kubelet calls this after rotating it away).
-        std::fs::File::create(&log_path).map_err(|e| Status::internal(e.to_string()))?;
+        // Open a fresh file at the ORIGINAL path (the kubelet has just renamed the
+        // old one away for rotation).
+        let new_file = tokio::fs::File::create(&log_path)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        // Swap it into the running supervisor's shared log handle so the
+        // stdout/stderr pumps write here from now on — the moved (old) file stops
+        // growing. Mirrors containerd's ContainerIO.AddOutput log-writer swap.
+        if let Some(handle) = self.ctx.streaming.log_handle(&id) {
+            *handle.lock().await = Some(new_file);
+        }
         Ok(Response::new(v1::ReopenContainerLogResponse {}))
     }
 
@@ -2356,6 +2468,7 @@ async fn supervise_container(
     log_path: &Path,
     live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
     terminal: bool,
+    sessions: Arc<crate::streaming::Sessions>,
 ) -> i32 {
     if terminal {
         return supervise_tty(crun_root, bundle_dir, cid, log_path, live).await;
@@ -2398,6 +2511,9 @@ async fn supervise_container(
     let log = Arc::new(tokio::sync::Mutex::new(
         tokio::fs::File::create(log_path).await.ok(),
     ));
+    // Publish the log handle so ReopenContainerLog can swap the file in place
+    // when the kubelet rotates it (mirrors containerd's ContainerIO.AddOutput).
+    sessions.register_log(cid, log.clone());
     let so = child.stdout.take();
     let se = child.stderr.take();
     let mut tasks = Vec::new();
