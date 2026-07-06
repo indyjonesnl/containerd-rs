@@ -3,7 +3,7 @@
 //! Matches what upstream containerd's CRI plugin does for a non-host-network
 //! pod:
 //!
-//! 1. Create a network namespace (`ip netns add`).
+//! 1. Create a network namespace (via `unshare(CLONE_NEWNET)` + bind-mount; no `ip`).
 //! 2. **Loopback ADD** — invoke the CNI `loopback` plugin (ADD) with
 //!    `CNI_IFNAME=lo`.  This brings `lo` up and assigns `127.0.0.1/8` +
 //!    `::1/128`, exactly as upstream's `github.com/containernetworking/plugins`
@@ -12,7 +12,7 @@
 //!    (Flannel/Calico/etc.) to wire `eth0` and assign a pod IP.
 //!
 //! Teardown reverses the sequence: cluster DEL (reverse plugin order), then
-//! loopback DEL, then `ip netns del`.
+//! loopback DEL, then netns teardown (unmount the anchor + remove it).
 //!
 //! Plugin invocation follows the CNI spec: exec `<bin_dir>/<type>` with the
 //! `CNI_*` environment and the per-plugin network config (plus the previous
@@ -128,25 +128,78 @@ impl Cni {
         self.netns_dir.join(netns)
     }
 
-    /// Create a named network namespace (`ip netns add`).
+    /// Create a named network namespace without shelling out to `ip`.
+    ///
+    /// Mirrors what `ip netns add` (and containerd's `pkg/netns` via
+    /// cni-plugins `pkg/ns`) does internally:
+    /// 1. Ensure `/run/netns/` exists.
+    /// 2. Create a bind-mount anchor at `/run/netns/<name>`.
+    /// 3. In a throwaway OS thread, `unshare(CLONE_NEWNET)` then bind-mount that
+    ///    thread's `/proc/thread-self/ns/net` onto the anchor.
+    ///
+    /// The anchor keeps the namespace alive after the thread exits. See
+    /// [`create_netns_linux`] for why a dedicated thread (not the caller) does
+    /// the unshare.
+    ///
+    /// M2a: `ip` is not present on the initramfs root filesystem — the only
+    /// binaries available are those in `/boot/bin` and the initramfs itself.
+    /// `ip netns add` would fail with ENOENT. This implementation uses
+    /// direct syscalls (`unshare` + `mount`) to avoid that dependency.
     ///
     /// Loopback setup (`lo` UP + `127.0.0.1/8` + `::1/128`) is handled
     /// separately by [`Cni::setup`], which invokes the CNI `loopback` plugin
     /// (ADD) before the cluster conflist — matching upstream containerd's
     /// two-phase CNI sequence.
     pub fn create_netns(&self, netns: &str) -> Result<PathBuf> {
-        let out = Command::new("ip").args(["netns", "add", netns]).output()?;
-        if !out.status.success() {
-            return Err(Error::Netns(
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            ));
+        let mount_path = self.netns_path(netns);
+
+        // Ensure /run/netns exists.
+        if let Some(parent) = mount_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        Ok(self.netns_path(netns))
+
+        // Create the anchor file (empty regular file) — the bind-mount target.
+        // If it already exists that's fine — a leftover from a prior run.
+        if !mount_path.exists() {
+            std::fs::File::create(&mount_path)?;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            create_netns_linux(&mount_path)?;
+            Ok(mount_path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let out = Command::new("ip").args(["netns", "add", netns]).output()?;
+            if !out.status.success() {
+                return Err(Error::Netns(
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ));
+            }
+            Ok(mount_path)
+        }
     }
 
-    /// Delete a named network namespace (`ip netns del`); ignores absence.
+    /// Delete a named network namespace; best-effort, ignores absence.
+    ///
+    /// Unmounts the bind-mount anchor and removes the file. Mirrors `ip netns del`.
+    /// M2a: avoids `ip` binary dependency (not present on initramfs).
     pub fn delete_netns(&self, netns: &str) -> Result<()> {
-        let _ = Command::new("ip").args(["netns", "del", netns]).output()?;
+        let mount_path = self.netns_path(netns);
+        if !mount_path.exists() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Detach the bind-mount (best-effort, lazy) — mirrors `ip netns del`.
+            let _ = rustix::mount::unmount(&mount_path, rustix::mount::UnmountFlags::DETACH);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = Command::new("ip").args(["netns", "del", netns]).output()?;
+        }
+        let _ = std::fs::remove_file(&mount_path);
         Ok(())
     }
 
@@ -197,7 +250,7 @@ impl Cni {
     /// Run the DEL chain (reverse order) for `container_id`; best-effort.
     ///
     /// Mirrors upstream's teardown sequence: cluster conflist DEL (reverse plugin
-    /// order), then loopback DEL, then `ip netns del`.
+    /// order), then loopback DEL, then netns teardown (unmount + remove).
     pub fn teardown(&self, container_id: &str, netns: &str) -> Result<()> {
         if let Ok(conflist) = self.load_conflist() {
             let netns_path = self.netns_path(netns);
@@ -277,6 +330,40 @@ impl Cni {
         }
         Ok(serde_json::from_slice(&out.stdout)?)
     }
+}
+
+/// Create a network namespace and pin it with a bind-mount, in a throwaway thread.
+///
+/// Mirrors containerd's `pkg/netns` (via cni-plugins `pkg/ns` `newNS`): a
+/// dedicated OS thread calls `unshare(CLONE_NEWNET)` — which affects only the
+/// calling thread — then bind-mounts that thread's own `/proc/thread-self/ns/net`
+/// onto `anchor`. The bind-mount is what keeps the namespace alive after the
+/// thread exits, so the `unshare` never leaks into the tokio worker pool.
+///
+/// Upstream abandons a `runtime.LockOSThread`ed goroutine for the same reason;
+/// a `std::thread` that simply returns is the Rust equivalent (its OS thread is
+/// torn down on join, taking the now-anchored netns handle with it).
+///
+/// The source MUST be the calling thread's ns (`/proc/thread-self/ns/net`), not
+/// `/proc/self/ns/net`: the latter is the thread-group leader's netns, which did
+/// not unshare.
+#[cfg(target_os = "linux")]
+fn create_netns_linux(anchor: &Path) -> Result<()> {
+    use rustix::mount::mount_bind;
+    use rustix::thread::{unshare_unsafe, UnshareFlags};
+
+    let anchor = anchor.to_path_buf();
+    std::thread::spawn(move || -> std::io::Result<()> {
+        // Safety: NEWNET only unshares the network namespace of THIS thread. It
+        // touches no shared fd table or address space, and the thread does no
+        // further work after anchoring the ns, so there is nothing to corrupt.
+        unsafe { unshare_unsafe(UnshareFlags::NEWNET) }.map_err(std::io::Error::from)?;
+        mount_bind("/proc/thread-self/ns/net", &anchor).map_err(std::io::Error::from)?;
+        Ok(())
+    })
+    .join()
+    .map_err(|_| Error::Netns("netns setup thread panicked".into()))??;
+    Ok(())
 }
 
 /// Build the minimal netconf for the CNI `loopback` plugin.
