@@ -97,6 +97,12 @@ pub fn apply_layer(
 ) -> Result<(), Error> {
     let decoded = decompress(blob, compression)?;
     let mut archive = tar::Archive::new(decoded);
+    // Preserve the full file mode including setuid/setgid/sticky bits. Without
+    // this the `tar` crate masks the mode with `& 0o777`, stripping the setuid
+    // bit off binaries like `su`/`ping`/the cri-tools nonewprivs helper — which
+    // then cannot escalate privileges (breaks NoNewPrivs=false conformance and
+    // any image relying on setuid binaries). Mirrors containerd's layer applier.
+    archive.set_preserve_permissions(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.to_path_buf();
@@ -241,6 +247,37 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("usr/bin/hello")).unwrap(),
             "hi"
+        );
+    }
+
+    #[test]
+    fn apply_layer_preserves_setuid_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Build a tar with a setuid-root binary (mode 04755).
+        let mut b = tar::Builder::new(Vec::new());
+        let data = b"#!/bin/true";
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o4755);
+        h.set_entry_type(tar::EntryType::Regular);
+        b.append_data(&mut h, "usr/bin/suidbin", &data[..]).unwrap();
+        let blob = b.into_inner().unwrap();
+
+        apply_layer(
+            dir.path(),
+            Box::new(std::io::Cursor::new(blob)),
+            Compression::None,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(dir.path().join("usr/bin/suidbin"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o4000,
+            0o4000,
+            "setuid bit must survive layer extraction (got mode {mode:o})"
         );
     }
 

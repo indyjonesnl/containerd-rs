@@ -15,12 +15,29 @@ use oci_spec::runtime::{
     UserBuilder,
 };
 
+/// Mount propagation, mirroring CRI `MountPropagation` → OCI rbind option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Propagation {
+    /// `rprivate` — no propagation in either direction (CRI default).
+    #[default]
+    Private,
+    /// `rslave` — host→container propagation only.
+    HostToContainer,
+    /// `rshared` — bidirectional; also sets the rootfs propagation to `rshared`.
+    Bidirectional,
+}
+
 /// A bind mount to inject into the container (from a CRI mount).
 #[derive(Debug, Clone)]
 pub struct MountSpec {
     pub source: String,
     pub destination: String,
     pub readonly: bool,
+    /// CRI `Mount.propagation`.
+    pub propagation: Propagation,
+    /// CRI `Mount.recursive_read_only` — with `readonly`, emit `rro` (recursive)
+    /// instead of `ro` (top-level only).
+    pub recursive_read_only: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -531,9 +548,14 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     if let Some(caps) = build_caps(default_capabilities(), std::collections::HashSet::new()) {
         process_builder = process_builder.capabilities(caps);
     }
-    let process = process_builder
+    let mut process = process_builder
         .build()
         .map_err(|e| Error::Builder(e.to_string()))?;
+    // oci-spec's Process::default() sets noNewPrivileges=true; containerd leaves
+    // it false unless the CRI requests it. Set it explicitly from the request so
+    // a container with no_new_privs=false can actually escalate (setuid), rather
+    // than inheriting the spec default. apply_security re-affirms true when asked.
+    process.set_no_new_privileges(Some(req.no_new_privileges));
 
     let root = RootBuilder::default()
         .path(rootfs.to_path_buf())
@@ -677,6 +699,7 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
         return;
     }
     let mut all = spec.mounts().clone().unwrap_or_default();
+    let mut needs_rshared_rootfs = false;
     for m in mounts {
         let src = Path::new(&m.source);
         if !src.exists() {
@@ -688,11 +711,26 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
                 );
             }
         }
-        let opts = vec![
-            "rbind".to_string(),
-            "rprivate".to_string(),
-            if m.readonly { "ro" } else { "rw" }.to_string(),
-        ];
+        // Mirror containerd's withMounts: rbind + a propagation option + ro/rro/rw.
+        let mut opts = vec!["rbind".to_string()];
+        match m.propagation {
+            Propagation::Private => opts.push("rprivate".to_string()),
+            Propagation::HostToContainer => opts.push("rslave".to_string()),
+            Propagation::Bidirectional => {
+                opts.push("rshared".to_string());
+                // A bidirectional (rshared) mount needs the container rootfs itself
+                // to propagate mounts back to the host — set rootfsPropagation, as
+                // containerd does (s.Linux.RootfsPropagation = "rshared").
+                needs_rshared_rootfs = true;
+            }
+        }
+        if m.readonly {
+            // ro = only the top mount is readonly (non-recursive); rro = recursive
+            // (submounts readonly too, via mount_setattr AT_RECURSIVE).
+            opts.push(if m.recursive_read_only { "rro" } else { "ro" }.to_string());
+        } else {
+            opts.push("rw".to_string());
+        }
         if let Ok(mount) = MountBuilder::default()
             .destination(PathBuf::from(&m.destination))
             .typ("bind".to_string())
@@ -704,6 +742,12 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
         }
     }
     spec.set_mounts(Some(all));
+    if needs_rshared_rootfs {
+        if let Some(mut linux) = spec.linux().clone() {
+            linux.set_rootfs_propagation(Some("rshared".to_string()));
+            spec.set_linux(Some(linux));
+        }
+    }
 }
 
 /// Share the host PID / IPC namespaces when requested (CRI HostPID / HostIPC):
@@ -1200,6 +1244,8 @@ mod tests {
                 source: missing_src.to_string_lossy().into_owned(),
                 destination: "/etc/cni/net.d".into(),
                 readonly: false,
+                propagation: Propagation::Private,
+                recursive_read_only: false,
             }],
             ..Default::default()
         };
@@ -1224,6 +1270,83 @@ mod tests {
         assert!(
             found,
             "spec must contain the bind mount for the created dir"
+        );
+    }
+
+    // Regression: with no_new_privs=false the OCI process must have
+    // noNewPrivileges=false, NOT oci-spec's default of true — otherwise a setuid
+    // binary can never escalate (critest "allow privilege escalation when false").
+    #[test]
+    fn no_new_privileges_defaults_false_from_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            no_new_privileges: false,
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &dir.path().join("a")).unwrap();
+        assert_eq!(
+            spec.process().as_ref().unwrap().no_new_privileges(),
+            Some(false),
+            "no_new_privs=false must yield noNewPrivileges=false, not the spec default true"
+        );
+
+        let req_true = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            no_new_privileges: true,
+            ..Default::default()
+        };
+        let spec_true = generate_spec(&img(), &req_true, &dir.path().join("b")).unwrap();
+        assert_eq!(
+            spec_true.process().as_ref().unwrap().no_new_privileges(),
+            Some(true)
+        );
+    }
+
+    // Mirror containerd's withMounts option mapping: propagation → rprivate /
+    // rslave / rshared, and readonly → ro (non-recursive) vs rro (recursive).
+    // A bidirectional mount also sets rootfsPropagation=rshared.
+    #[test]
+    fn mount_options_map_propagation_and_readonly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |dest: &str, ro, rro, prop| MountSpec {
+            source: tmp.path().to_string_lossy().into_owned(),
+            destination: dest.into(),
+            readonly: ro,
+            recursive_read_only: rro,
+            propagation: prop,
+        };
+        let req = ContainerRequest {
+            mounts: vec![
+                mk("/a", true, false, Propagation::Private), // rbind, rprivate, ro
+                mk("/b", true, true, Propagation::Private),  // rbind, rprivate, rro
+                mk("/c", false, false, Propagation::HostToContainer), // rbind, rslave, rw
+                mk("/d", false, false, Propagation::Bidirectional), // rbind, rshared, rw
+            ],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, &tmp.path().join("rootfs")).unwrap();
+        let opts = |dest: &str| -> Vec<String> {
+            spec.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.destination() == &PathBuf::from(dest))
+                .and_then(|m| m.options().clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(opts("/a"), vec!["rbind", "rprivate", "ro"]);
+        assert_eq!(opts("/b"), vec!["rbind", "rprivate", "rro"]);
+        assert_eq!(opts("/c"), vec!["rbind", "rslave", "rw"]);
+        assert_eq!(opts("/d"), vec!["rbind", "rshared", "rw"]);
+        // The bidirectional mount forces rshared rootfs propagation.
+        assert_eq!(
+            spec.linux()
+                .as_ref()
+                .unwrap()
+                .rootfs_propagation()
+                .as_deref(),
+            Some("rshared")
         );
     }
 

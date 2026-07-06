@@ -35,8 +35,8 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 # tests work nested (same setup as ci/conformance-docker.sh). No kubelet/kubeadm.
 docker run --rm --privileged \
   --cgroupns=private \
-  --tmpfs /run --tmpfs /var/run \
-  --tmpfs /var/lib/containerd-rs \
+  --tmpfs /run:rw,exec,suid,dev --tmpfs /var/run:rw,exec,suid,dev \
+  --tmpfs /var/lib/containerd-rs:rw,exec,suid,dev \
   -v /lib/modules:/lib/modules:ro \
   -v "$REPO":/work:ro \
   -v "$DAEMON_BIN":/usr/local/bin/containerd-rs:ro \
@@ -53,6 +53,11 @@ docker run --rm --privileged \
       done
       echo "+cpu +cpuset +memory +pids +hugetlb" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
     fi
+
+    # Mount-propagation tests need a shared mount tree for bidirectional (rshared)
+    # mounts to propagate container<->host. Real nodes run with shared mounts
+    # (systemd mounts / rshared); make this container'\''s root shared to match.
+    mount --make-rshared / 2>/dev/null || true
 
     EP=unix:///run/containerd-rs.sock
     mkdir -p /etc/containerd-rs /run/containerd-rs /var/lib/containerd-rs /etc/cni/net.d /run/flannel

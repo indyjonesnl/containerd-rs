@@ -77,6 +77,13 @@ pub struct AttachSession {
 /// 2=stderr (matching the v4 streaming channels).
 pub type LiveFrame = (u8, Vec<u8>);
 
+/// A shared handle to a running container's CRI log file. The supervisor's
+/// stdout/stderr pumps hold a clone and write through it under the mutex;
+/// `ReopenContainerLog` swaps the inner `File` in place (mirroring containerd's
+/// `ContainerIO.AddOutput` log-writer swap) so subsequent lines land in the
+/// freshly opened file after the kubelet rotates the old one away.
+pub type LogHandle = std::sync::Arc<tokio::sync::Mutex<Option<tokio::fs::File>>>;
+
 /// One-time-token registry for streaming sessions, shared between the CRI
 /// service (which registers) and the HTTP server (which consumes).
 pub struct Sessions {
@@ -85,6 +92,8 @@ pub struct Sessions {
     attach: Mutex<HashMap<String, AttachSession>>,
     /// Per-running-container live-output broadcast buses (for Attach / log follow).
     live: Mutex<HashMap<String, tokio::sync::broadcast::Sender<LiveFrame>>>,
+    /// Per-running-container CRI log-file handles, for `ReopenContainerLog`.
+    logs: Mutex<HashMap<String, LogHandle>>,
     crun_root: PathBuf,
     crun_bin: String,
     counter: AtomicU64,
@@ -97,6 +106,7 @@ impl Sessions {
             portforward: Mutex::new(HashMap::new()),
             attach: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            logs: Mutex::new(HashMap::new()),
             crun_root,
             crun_bin: runtime::crun::DEFAULT_BIN.to_string(),
             counter: AtomicU64::new(0),
@@ -128,6 +138,24 @@ impl Sessions {
     /// Drop a container's live bus (on exit); subscribers then see `Closed`.
     pub fn close_live(&self, container_id: &str) {
         self.live.lock().unwrap().remove(container_id);
+    }
+
+    /// Register a running container's log-file handle (for `ReopenContainerLog`).
+    pub fn register_log(&self, container_id: &str, handle: LogHandle) {
+        self.logs
+            .lock()
+            .unwrap()
+            .insert(container_id.to_string(), handle);
+    }
+
+    /// Get a running container's log-file handle, if supervised.
+    pub fn log_handle(&self, container_id: &str) -> Option<LogHandle> {
+        self.logs.lock().unwrap().get(container_id).cloned()
+    }
+
+    /// Drop a container's log-file handle (on exit).
+    pub fn close_log(&self, container_id: &str) {
+        self.logs.lock().unwrap().remove(container_id);
     }
 
     /// Register an attach session, returning its one-time token.
