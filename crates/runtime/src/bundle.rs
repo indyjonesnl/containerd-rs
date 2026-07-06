@@ -833,7 +833,10 @@ mod tests {
         };
         let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
         let v = serde_json::to_value(&spec).unwrap();
-        assert_eq!(v["linux"]["resources"]["unified"]["pids.max"], serde_json::json!("128"));
+        assert_eq!(
+            v["linux"]["resources"]["unified"]["pids.max"],
+            serde_json::json!("128")
+        );
         assert_eq!(
             v["linux"]["resources"]["unified"]["io.weight"],
             serde_json::json!("default 200")
@@ -1285,13 +1288,19 @@ mod tests {
         let spec = generate_spec(&img(), &req, &dir.path().join("r")).unwrap();
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["process"]["noNewPrivileges"], serde_json::json!(true));
-        assert_eq!(v["process"]["apparmorProfile"], serde_json::json!("my-profile"));
+        assert_eq!(
+            v["process"]["apparmorProfile"],
+            serde_json::json!("my-profile")
+        );
         assert_eq!(
             v["process"]["selinuxLabel"],
             serde_json::json!("system_u:system_r:container_t:s0")
         );
         assert_eq!(v["linux"]["maskedPaths"], serde_json::json!(["/proc/keys"]));
-        assert_eq!(v["linux"]["readonlyPaths"], serde_json::json!(["/proc/sys"]));
+        assert_eq!(
+            v["linux"]["readonlyPaths"],
+            serde_json::json!(["/proc/sys"])
+        );
     }
 
     // Localhost seccomp loads and emits the profile; a missing profile fails closed
