@@ -71,6 +71,11 @@ pub struct PortForwardSession {
 #[derive(Debug, Clone)]
 pub struct AttachSession {
     pub container_id: String,
+    /// Which streams the client requested (from the CRI `AttachRequest`).
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub tty: bool,
 }
 
 /// A live container-output frame: `(channel, bytes)` where channel 1=stdout,
@@ -84,6 +89,11 @@ pub type LiveFrame = (u8, Vec<u8>);
 /// freshly opened file after the kubelet rotates the old one away.
 pub type LogHandle = std::sync::Arc<tokio::sync::Mutex<Option<tokio::fs::File>>>;
 
+/// A shared handle to a running (interactive) container's stdin pipe. The
+/// supervisor holds the write end open so the container process stays alive
+/// waiting for input; `Attach` sessions forward the client's stdin through it.
+pub type StdinHandle = std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>;
+
 /// One-time-token registry for streaming sessions, shared between the CRI
 /// service (which registers) and the HTTP server (which consumes).
 pub struct Sessions {
@@ -94,6 +104,8 @@ pub struct Sessions {
     live: Mutex<HashMap<String, tokio::sync::broadcast::Sender<LiveFrame>>>,
     /// Per-running-container CRI log-file handles, for `ReopenContainerLog`.
     logs: Mutex<HashMap<String, LogHandle>>,
+    /// Per-interactive-container stdin pipe handles, for `Attach` stdin.
+    stdins: Mutex<HashMap<String, StdinHandle>>,
     crun_root: PathBuf,
     crun_bin: String,
     counter: AtomicU64,
@@ -107,6 +119,7 @@ impl Sessions {
             attach: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             logs: Mutex::new(HashMap::new()),
+            stdins: Mutex::new(HashMap::new()),
             crun_root,
             crun_bin: runtime::crun::DEFAULT_BIN.to_string(),
             counter: AtomicU64::new(0),
@@ -156,6 +169,24 @@ impl Sessions {
     /// Drop a container's log-file handle (on exit).
     pub fn close_log(&self, container_id: &str) {
         self.logs.lock().unwrap().remove(container_id);
+    }
+
+    /// Register an interactive container's stdin pipe (for `Attach` stdin).
+    pub fn register_stdin(&self, container_id: &str, handle: StdinHandle) {
+        self.stdins
+            .lock()
+            .unwrap()
+            .insert(container_id.to_string(), handle);
+    }
+
+    /// Get a container's stdin pipe handle, if it was started interactive.
+    pub fn stdin_handle(&self, container_id: &str) -> Option<StdinHandle> {
+        self.stdins.lock().unwrap().get(container_id).cloned()
+    }
+
+    /// Drop a container's stdin handle (on exit).
+    pub fn close_stdin(&self, container_id: &str) {
+        self.stdins.lock().unwrap().remove(container_id);
     }
 
     /// Register an attach session, returning its one-time token.
@@ -731,6 +762,78 @@ where
     let (error_id, stdout_id, stderr_id, stdin_rx) =
         collect_rc_streams(&mut server, session.stdin, session.stdout, want_stderr).await;
 
+    // TTY exec needs a real pseudo-terminal (crun exec -t refuses piped stdio):
+    // run it through a console socket, then pump the pty master ↔ the client.
+    if session.tty {
+        let console_sock = sessions
+            .crun_root
+            .join(format!("xc{}.sock", &token[..token.len().min(12)]));
+        let (mut child, master) = match runtime::crun::exec_tty(
+            &sessions.crun_bin,
+            &sessions.crun_root,
+            &session.container_id,
+            &session.cmd,
+            &console_sock,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(eid) = error_id {
+                    let _ = writer
+                        .send_data(
+                            eid,
+                            true,
+                            &spdy::status_failure(&format!("crun exec -t: {e}")),
+                        )
+                        .await;
+                }
+                let _ = writer.goaway(0).await;
+                return;
+            }
+        };
+        // The pty master is bidirectional; wrap it as async and split for the
+        // stdin (client -> pty) and stdout (pty -> client) pumps.
+        let master = tokio::fs::File::from_std(std::fs::File::from(master));
+        let (mut rd, mut wr) = tokio::io::split(master);
+        if let Some(mut rx) = stdin_rx {
+            tokio::spawn(async move {
+                while let Some(chunk) = rx.recv().await {
+                    if wr.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let pump = stdout_id.map(|oid| {
+            let w = writer.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match rd.read(&mut buf).await {
+                        // pty master read returns EIO once the slave closes (exit).
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if w.send_data(oid, false, &buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        if let Some(p) = pump {
+            let _ = p.await;
+        }
+        let _ = tokio::fs::remove_file(&console_sock).await;
+        if let Some(eid) = error_id {
+            let _ = writer.send_data(eid, true, &spdy::status_exit(code)).await;
+        }
+        let _ = writer.goaway(0).await;
+        return;
+    }
+
     let handle = match runtime::crun::exec_streaming(
         &sessions.crun_bin,
         &sessions.crun_root,
@@ -823,9 +926,11 @@ where
         let _ = writer.goaway(0).await;
         return;
     };
-    // Attach streams the container's live stdout/stderr (no stdin).
-    let (error_id, stdout_id, stderr_id, _) =
-        collect_rc_streams(&mut server, false, true, true).await;
+    // Collect exactly the streams the client requested. TTY merges stderr into
+    // stdout, so there is no separate stderr stream then.
+    let want_stderr = session.stderr && !session.tty;
+    let (error_id, stdout_id, stderr_id, stdin_rx) =
+        collect_rc_streams(&mut server, session.stdin, session.stdout, want_stderr).await;
 
     let Some(mut rx) = sessions.subscribe_live(&session.container_id) else {
         if let Some(eid) = error_id {
@@ -836,6 +941,22 @@ where
         let _ = writer.goaway(0).await;
         return;
     };
+
+    // stdin: client -> the container's (interactive) stdin pipe. Held open for
+    // the container's lifetime, so we do NOT close it when this attach ends.
+    if let (Some(mut srx), Some(handle)) = (stdin_rx, sessions.stdin_handle(&session.container_id))
+    {
+        tokio::spawn(async move {
+            while let Some(chunk) = srx.recv().await {
+                let mut guard = handle.lock().await;
+                let Some(w) = guard.as_mut() else { break };
+                if w.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                let _ = w.flush().await;
+            }
+        });
+    }
     loop {
         match rx.recv().await {
             Ok((channel, data)) => {

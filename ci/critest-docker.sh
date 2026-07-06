@@ -21,6 +21,7 @@ FOCUS="${FOCUS:-}"
 SKIP="${SKIP:-}"
 PARALLEL="${PARALLEL:-1}"
 CRICTL_VERSION="${CRICTL_VERSION:-v1.35.0}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [[ -z "${DAEMON_BIN:-}" ]]; then
   target_dir="$(cd "$REPO" && cargo metadata --no-deps --format-version 1 \
@@ -42,6 +43,7 @@ docker run --rm --privileged \
   -v "$DAEMON_BIN":/usr/local/bin/containerd-rs:ro \
   -v "$RESULTS_DIR":/work/critest-results:rw \
   -e FOCUS="$FOCUS" -e SKIP="$SKIP" -e PARALLEL="$PARALLEL" -e CRICTL_VERSION="$CRICTL_VERSION" \
+  -e EXTRA_ARGS="$EXTRA_ARGS" \
   "$IMAGE" bash -euxc '
     # cgroup-v2 delegation (kind-style): move our procs into a leaf scope and
     # enable controllers in the root subtree so critest cgroup/resource tests
@@ -79,6 +81,9 @@ EOF
 
     CRI_SOCKET=$EP RESULTS_DIR=/work/critest-results \
     FOCUS="$FOCUS" SKIP="$SKIP" PARALLEL="$PARALLEL" CRICTL_VERSION="$CRICTL_VERSION" \
-      bash /work/ci/critest.sh
+    EXTRA_ARGS="$EXTRA_ARGS" \
+      bash /work/ci/critest.sh || CRITEST_RC=$?
+    echo "=== crs.log (tail) ==="; tail -n 200 /var/log/crs.log || true
+    exit ${CRITEST_RC:-0}
   '
 echo "[critest-docker] results in $RESULTS_DIR"

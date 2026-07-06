@@ -153,6 +153,11 @@ pub struct ContainerRecord {
     /// (a runtime restart is not a container restart).
     #[serde(default)]
     pub restart_count: u32,
+    /// CRI `ContainerConfig.stdin` — the container keeps an open stdin (a pipe)
+    /// so an interactive process (e.g. a shell) stays alive waiting for input
+    /// that `Attach` forwards. Without it the process reads EOF and exits.
+    #[serde(default)]
+    pub stdin: bool,
 }
 
 /// A container mount echoed in `ContainerStatus.mounts`.
