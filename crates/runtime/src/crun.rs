@@ -320,7 +320,8 @@ mod tests {
     // stopped/absent pid as None. Underpins restart re-adoption (feature 002 US1).
     #[test]
     fn parse_state_reads_status_and_pid() {
-        let running = br#"{"ociVersion":"1.0.2","id":"c1","status":"running","pid":4242,"bundle":"/b"}"#;
+        let running =
+            br#"{"ociVersion":"1.0.2","id":"c1","status":"running","pid":4242,"bundle":"/b"}"#;
         let s = parse_state(running).expect("valid running state");
         assert_eq!(s.status, "running");
         assert_eq!(s.pid, Some(4242));

@@ -191,8 +191,14 @@ mod tests {
     fn norm_host_collapses_hub_and_strips_scheme() {
         assert_eq!(norm_host("https://index.docker.io/v1/"), "docker.io");
         assert_eq!(norm_host("registry-1.docker.io"), "docker.io");
-        assert_eq!(norm_host("https://myreg.example.com/foo"), "myreg.example.com");
-        assert_eq!(norm_host("myreg.example.com:5000"), "myreg.example.com:5000");
+        assert_eq!(
+            norm_host("https://myreg.example.com/foo"),
+            "myreg.example.com"
+        );
+        assert_eq!(
+            norm_host("myreg.example.com:5000"),
+            "myreg.example.com:5000"
+        );
     }
 
     #[test]
@@ -214,10 +220,7 @@ mod tests {
         let json = br#"{"auths":{"https://index.docker.io/v1/":{"username":"u","password":"p"}}}"#;
         let cfg: DockerConfig = serde_json::from_slice(json).unwrap();
         // A docker.io image reference matches the index.docker.io key.
-        assert!(matches!(
-            cfg.resolve("docker.io"),
-            Some(Auth::Basic { .. })
-        ));
+        assert!(matches!(cfg.resolve("docker.io"), Some(Auth::Basic { .. })));
     }
 
     #[test]
@@ -225,7 +228,10 @@ mod tests {
         let tok = br#"{"ServerURL":"r","Username":"<token>","Secret":"abc"}"#;
         assert!(matches!(parse_helper_output(tok), Some(Auth::Bearer(t)) if t == "abc"));
         let basic = br#"{"ServerURL":"r","Username":"u","Secret":"s"}"#;
-        assert!(matches!(parse_helper_output(basic), Some(Auth::Basic { .. })));
+        assert!(matches!(
+            parse_helper_output(basic),
+            Some(Auth::Basic { .. })
+        ));
         assert!(parse_helper_output(br#"{"Username":"u","Secret":""}"#).is_none());
     }
 }

@@ -1071,7 +1071,9 @@ impl RuntimeService for RuntimeSvc {
             selinux_label: host_selinux_enabled()
                 .then(|| map_selinux(sec_ctx.and_then(|sc| sc.selinux_options.as_ref())))
                 .flatten(),
-            masked_paths: sec_ctx.map(|sc| sc.masked_paths.clone()).unwrap_or_default(),
+            masked_paths: sec_ctx
+                .map(|sc| sc.masked_paths.clone())
+                .unwrap_or_default(),
             readonly_paths: sec_ctx
                 .map(|sc| sc.readonly_paths.clone())
                 .unwrap_or_default(),
@@ -2689,7 +2691,12 @@ mod tests {
         let names: Vec<&str> = d.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"container_cpu_usage_seconds_total"));
         assert!(names.contains(&"container_memory_working_set_bytes"));
-        let m = metric("container_memory_working_set_bytes", v1::MetricType::Gauge, 4096, 1);
+        let m = metric(
+            "container_memory_working_set_bytes",
+            v1::MetricType::Gauge,
+            4096,
+            1,
+        );
         assert_eq!(m.metric_type, v1::MetricType::Gauge as i32);
         assert_eq!(m.value.unwrap().value, 4096);
     }
@@ -3927,7 +3934,10 @@ mod tests {
     #[test]
     fn normalize_image_ref_adds_latest() {
         assert_eq!(normalize_image_ref("busybox"), "busybox:latest");
-        assert_eq!(normalize_image_ref("gcr.io/foo/bar"), "gcr.io/foo/bar:latest");
+        assert_eq!(
+            normalize_image_ref("gcr.io/foo/bar"),
+            "gcr.io/foo/bar:latest"
+        );
         assert_eq!(normalize_image_ref("busybox:1.29"), "busybox:1.29");
         assert_eq!(normalize_image_ref("host:5000/img"), "host:5000/img:latest");
         assert_eq!(normalize_image_ref("host:5000/img:v2"), "host:5000/img:v2");
