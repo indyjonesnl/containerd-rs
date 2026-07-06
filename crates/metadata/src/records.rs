@@ -69,6 +69,14 @@ pub struct SandboxRecord {
     /// not recreate the sandbox every sync.
     #[serde(default)]
     pub host_network: bool,
+    /// Whether the sandbox shares the host PID namespace (CRI `namespaceOptions.pid
+    /// == NODE`, HostPID). Applied per-container (no pause holder). `#[serde(default)]`
+    /// so records written before this field deserialize.
+    #[serde(default)]
+    pub host_pid: bool,
+    /// Whether the sandbox shares the host IPC namespace (HostIPC).
+    #[serde(default)]
+    pub host_ipc: bool,
     /// Path to the generated `resolv.conf` for this sandbox (from the CRI
     /// `DNSConfig`), bind-mounted at `/etc/resolv.conf` in each container so DNS
     /// works (e.g. CoreDNS's `forward . /etc/resolv.conf`). `None` when no DNS
