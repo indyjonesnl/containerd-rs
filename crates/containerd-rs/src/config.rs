@@ -42,6 +42,12 @@ pub struct CriConfig {
     pub cni_conf_dir: PathBuf,
     /// CNI plugin binary directory.
     pub cni_bin_dir: PathBuf,
+    /// Pass `--no-pivot` to crun instead of using pivot_root. Default false
+    /// (pivot_root, like containerd) — pivot_root is required for mount
+    /// propagation (rshared/rslave). Set true ONLY on a ramdisk/initramfs root
+    /// (M2a), where pivot_root(2) fails because the new root and put-old are on
+    /// the same ramfs mount.
+    pub no_pivot_root: bool,
 }
 
 impl Default for Config {
@@ -67,6 +73,7 @@ impl Default for CriConfig {
             registry_config_path: PathBuf::from("/etc/containerd-rs/certs.d"),
             cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
             cni_bin_dir: PathBuf::from("/opt/cni/bin"),
+            no_pivot_root: false,
         }
     }
 }

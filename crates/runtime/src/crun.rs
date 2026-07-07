@@ -50,18 +50,21 @@ pub fn run_tty(
     bundle_dir: &Path,
     id: &str,
     console_sock: &Path,
+    no_pivot: bool,
 ) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(console_sock);
     let listener = UnixListener::bind(console_sock)?;
     // Detached, so this returns once the container is created+started; crun
     // connects to the console socket during setup to hand over the pty master.
-    let mut child = Command::new(bin)
-        .arg("--root")
-        .arg(crun_root)
-        .arg("run")
-        // M2a: same no-pivot workaround as supervise_container.
-        .arg("--no-pivot")
+    let mut command = Command::new(bin);
+    command.arg("--root").arg(crun_root).arg("run");
+    // pivot_root by default (mount propagation); `--no-pivot` only on M2a
+    // ramdisk/initramfs. Same policy as supervise_container.
+    if no_pivot {
+        command.arg("--no-pivot");
+    }
+    let mut child = command
         .arg("--detach")
         .arg("--console-socket")
         .arg(console_sock)
