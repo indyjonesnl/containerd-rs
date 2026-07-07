@@ -179,6 +179,13 @@ pub struct MountRecord {
     pub host_path: String,
     pub container_path: String,
     pub readonly: bool,
+    /// CRI `MountPropagation` enum value (0=PRIVATE, 1=HOST_TO_CONTAINER,
+    /// 2=BIDIRECTIONAL); echoed in `ContainerStatus.mounts[].propagation`.
+    #[serde(default)]
+    pub propagation: i32,
+    /// CRI `Mount.recursive_read_only`; echoed in `ContainerStatus.mounts`.
+    #[serde(default)]
+    pub recursive_read_only: bool,
 }
 
 /// Current CRI `LinuxContainerResources` values, echoed in `ContainerStatus.resources`.

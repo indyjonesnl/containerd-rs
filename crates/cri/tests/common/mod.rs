@@ -45,6 +45,7 @@ pub async fn start() -> Harness {
         "127.0.0.1:10010",
         dir.path().join("cni/net.d"),
         dir.path().join("cni/bin"),
+        false,
     ));
 
     let sock_server = sock.clone();

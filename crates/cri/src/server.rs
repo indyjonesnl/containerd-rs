@@ -46,6 +46,11 @@ pub struct Context {
     pub cni: sandbox::cni::Cni,
     /// Per-image-reference locks serializing concurrent duplicate pulls.
     pub pull_locks: crate::locks::KeyedLocks,
+    /// Pass `--no-pivot` to crun (MS_MOVE + chroot instead of pivot_root).
+    /// Default false (pivot_root, like containerd) — required for mount
+    /// propagation (rshared/rslave). Set true ONLY on a ramdisk/initramfs root
+    /// (M2a) where pivot_root(2) fails (new root + put-old on the same ramfs).
+    pub no_pivot_root: bool,
     /// Broadcast bus for container lifecycle events (feature 002 US3 / T026),
     /// consumed by the CRI `GetContainerEvents` stream (kubelet evented PLEG).
     /// `send` is a no-op when there are no subscribers.
@@ -55,6 +60,7 @@ pub struct Context {
 impl Context {
     /// Build a context using the CRI runtime namespace (`k8s.io`). `stream_addr`
     /// is the streaming server's listen address (e.g. `127.0.0.1:10010`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         content: content::Store,
         metadata: metadata::Store,
@@ -63,6 +69,7 @@ impl Context {
         stream_addr: &str,
         cni_conf_dir: PathBuf,
         cni_bin_dir: PathBuf,
+        no_pivot_root: bool,
     ) -> Self {
         let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("crun")));
         let (container_events, _) = tokio::sync::broadcast::channel(512);
@@ -76,6 +83,7 @@ impl Context {
             stream_base_url: format!("http://{stream_addr}"),
             cni: sandbox::cni::Cni::new(cni_conf_dir, cni_bin_dir),
             pull_locks: crate::locks::KeyedLocks::default(),
+            no_pivot_root,
             container_events,
         }
     }
@@ -1226,6 +1234,8 @@ impl RuntimeService for RuntimeSvc {
                     host_path: m.host_path.clone(),
                     container_path: m.container_path.clone(),
                     readonly: m.readonly,
+                    propagation: m.propagation,
+                    recursive_read_only: m.recursive_read_only,
                 })
                 .collect(),
             resources: config
@@ -1307,6 +1317,8 @@ impl RuntimeService for RuntimeSvc {
                     host_path: m.host_path.clone(),
                     container_path: m.container_path.clone(),
                     readonly: m.readonly,
+                    propagation: m.propagation,
+                    recursive_read_only: m.recursive_read_only,
                     ..Default::default()
                 })
                 .collect(),
@@ -1543,6 +1555,7 @@ impl RuntimeService for RuntimeSvc {
         let live = self.ctx.streaming.live_channel(&id);
         let sessions = self.ctx.streaming.clone();
         let stdin_open = rec.stdin;
+        let no_pivot = self.ctx.no_pivot_root;
         tokio::spawn(async move {
             let code = supervise_container(
                 &crun_root,
@@ -1552,6 +1565,7 @@ impl RuntimeService for RuntimeSvc {
                 live,
                 terminal,
                 stdin_open,
+                no_pivot,
                 sessions,
             )
             .await;
@@ -2539,22 +2553,23 @@ async fn supervise_container(
     live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
     terminal: bool,
     stdin_open: bool,
+    no_pivot: bool,
     sessions: Arc<crate::streaming::Sessions>,
 ) -> i32 {
     if terminal {
-        return supervise_tty(crun_root, bundle_dir, cid, log_path, live).await;
+        return supervise_tty(crun_root, bundle_dir, cid, log_path, live, no_pivot).await;
     }
     let mut cmd = tokio::process::Command::new(runtime::crun::DEFAULT_BIN);
-    cmd.arg("--root")
-        .arg(crun_root)
-        .arg("run")
-        // M2a: the container rootfs lives inside the initramfs ramfs (state =
-        // /run/containerd-rs). pivot_root(2) requires the new root and the
-        // put-old dir to be on different filesystems — it fails with EINVAL
-        // when both are on the same ramfs mount. --no-pivot uses MS_MOVE +
-        // chroot instead and works regardless of filesystem boundaries.
-        .arg("--no-pivot")
-        .arg("--bundle")
+    cmd.arg("--root").arg(crun_root).arg("run");
+    // Default: pivot_root (like containerd) — required for mount propagation
+    // (rshared/rslave). `--no-pivot` (MS_MOVE + chroot) is the opt-in for a
+    // ramdisk/initramfs root (M2a), where pivot_root(2) fails because the new
+    // root and put-old are on the same ramfs mount; it cannot preserve shared
+    // mount peer groups, so propagation does not work under it.
+    if no_pivot {
+        cmd.arg("--no-pivot");
+    }
+    cmd.arg("--bundle")
         .arg(bundle_dir)
         .arg(cid)
         // An interactive container (CRI stdin=true) keeps an open stdin pipe so
@@ -2652,6 +2667,7 @@ async fn supervise_tty(
     cid: &str,
     log_path: &Path,
     live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
+    no_pivot: bool,
 ) -> i32 {
     if let Some(parent) = log_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -2669,6 +2685,7 @@ async fn supervise_tty(
             &bundle_dir,
             &cid,
             &console_sock,
+            no_pivot,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -2897,6 +2914,7 @@ mod tests {
             "127.0.0.1:10010",
             dir.join("cni/net.d"),
             dir.join("cni/bin"),
+            false,
         ))
     }
 

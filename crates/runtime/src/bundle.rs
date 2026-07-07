@@ -717,7 +717,12 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
         return;
     }
     let mut all = spec.mounts().clone().unwrap_or_default();
-    let mut needs_rshared_rootfs = false;
+    // The container rootfs propagation must allow the requested mount propagation
+    // to flow: `rshared` for a bidirectional mount (also lets container mounts
+    // propagate back to the host), `rslave` for host→container so the container
+    // receives host mount events. crun/runc otherwise leave the rootfs at a
+    // propagation that can block the slave/shared link.
+    let mut rootfs_prop: Option<&str> = None;
     for m in mounts {
         let src = Path::new(&m.source);
         if !src.exists() {
@@ -733,13 +738,15 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
         let mut opts = vec!["rbind".to_string()];
         match m.propagation {
             Propagation::Private => opts.push("rprivate".to_string()),
-            Propagation::HostToContainer => opts.push("rslave".to_string()),
+            Propagation::HostToContainer => {
+                opts.push("rslave".to_string());
+                if rootfs_prop.is_none() {
+                    rootfs_prop = Some("rslave");
+                }
+            }
             Propagation::Bidirectional => {
                 opts.push("rshared".to_string());
-                // A bidirectional (rshared) mount needs the container rootfs itself
-                // to propagate mounts back to the host — set rootfsPropagation, as
-                // containerd does (s.Linux.RootfsPropagation = "rshared").
-                needs_rshared_rootfs = true;
+                rootfs_prop = Some("rshared"); // bidirectional wins over slave
             }
         }
         if m.readonly {
@@ -760,9 +767,9 @@ fn add_bind_mounts(spec: &mut Spec, mounts: &[MountSpec]) {
         }
     }
     spec.set_mounts(Some(all));
-    if needs_rshared_rootfs {
+    if let Some(prop) = rootfs_prop {
         if let Some(mut linux) = spec.linux().clone() {
-            linux.set_rootfs_propagation(Some("rshared".to_string()));
+            linux.set_rootfs_propagation(Some(prop.to_string()));
             spec.set_linux(Some(linux));
         }
     }
