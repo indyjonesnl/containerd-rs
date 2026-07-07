@@ -77,6 +77,19 @@ pub struct SandboxRecord {
     /// Whether the sandbox shares the host IPC namespace (HostIPC).
     #[serde(default)]
     pub host_ipc: bool,
+    /// Whether containers share a pod-level PID namespace (CRI `namespaceOptions.pid
+    /// == POD`, i.e. `shareProcessNamespace`). We run no pause container, so a
+    /// dedicated holder process owns the shared namespace; see [[pid_holder]].
+    #[serde(default)]
+    pub shared_pid: bool,
+    /// Whether containers share a pod-level IPC namespace (`namespaceOptions.ipc == POD`).
+    #[serde(default)]
+    pub shared_ipc: bool,
+    /// Host pid of the PID/IPC namespace holder (its PID 1), when `shared_pid` or
+    /// `shared_ipc`. Containers join `/proc/<pid>/ns/{pid,ipc}`; killed on sandbox
+    /// teardown. `None` when the sandbox shares no pod-level PID/IPC namespace.
+    #[serde(default)]
+    pub pid_holder_pid: Option<i32>,
     /// Path to the generated `resolv.conf` for this sandbox (from the CRI
     /// `DNSConfig`), bind-mounted at `/etc/resolv.conf` in each container so DNS
     /// works (e.g. CoreDNS's `forward . /etc/resolv.conf`). `None` when no DNS

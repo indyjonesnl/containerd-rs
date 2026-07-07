@@ -702,9 +702,16 @@ impl RuntimeService for RuntimeSvc {
             .and_then(|l| l.security_context.as_ref())
             .and_then(|sc| sc.namespace_options.as_ref());
         let node = v1::NamespaceMode::Node as i32;
+        let pod = v1::NamespaceMode::Pod as i32;
         let host_network = ns_opts.map(|ns| ns.network == node).unwrap_or(false);
         let host_pid = ns_opts.map(|ns| ns.pid == node).unwrap_or(false);
         let host_ipc = ns_opts.map(|ns| ns.ipc == node).unwrap_or(false);
+        // Pod-level PID/IPC sharing (shareProcessNamespace): containers join a
+        // shared namespace owned by a holder process (we run no pause container).
+        // Only when namespace_options is explicitly present — a pod with no
+        // options keeps per-container namespaces. Not when sharing the host's.
+        let shared_pid = !host_pid && ns_opts.map(|ns| ns.pid == pod).unwrap_or(false);
+        let shared_ipc = !host_ipc && ns_opts.map(|ns| ns.ipc == pod).unwrap_or(false);
 
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
         // plugin chain; if CNI is unavailable/fails we tear down best-effort and
@@ -762,6 +769,23 @@ impl RuntimeService for RuntimeSvc {
         // Falls back to the node's /etc/resolv.conf when no DNS config is supplied.
         let resolv_conf_path = self.write_sandbox_resolv_conf(&id, config.dns_config.as_ref());
 
+        // Pod-shared PID/IPC namespace holder (shareProcessNamespace): a PID-1
+        // process owning the shared namespace that workload containers join.
+        let pid_holder_pid = if shared_pid || shared_ipc {
+            match sandbox::pid_holder::spawn_holder(&self.ctx.state_dir, &id) {
+                Ok(h) => {
+                    tracing::info!(sandbox = %id, holder = h.pid, shared_pid, shared_ipc, "spawned pod PID/IPC namespace holder");
+                    Some(h.pid)
+                }
+                Err(e) => {
+                    tracing::warn!(sandbox = %id, error = %e, "failed to spawn pod PID/IPC namespace holder; containers will not share it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let rec = SandboxRecord {
             id: id.clone(),
             name: meta.name,
@@ -781,6 +805,9 @@ impl RuntimeService for RuntimeSvc {
             host_network,
             host_pid,
             host_ipc,
+            shared_pid,
+            shared_ipc,
+            pid_holder_pid,
             resolv_conf_path,
             sysctls: config
                 .linux
@@ -930,6 +957,11 @@ impl RuntimeService for RuntimeSvc {
             .map_err(|e| Status::internal(e.to_string()))?
         {
             rec.state = SandboxState::NotReady;
+            // The pod's containers are stopping; tear down the shared PID/IPC
+            // namespace holder (its PID 1 exiting frees the namespace).
+            if let Some(holder) = rec.pid_holder_pid.take() {
+                sandbox::pid_holder::kill_holder(holder);
+            }
             self.ctx
                 .metadata
                 .put(Kind::Sandbox, self.ns(), &id, &rec)
@@ -951,6 +983,10 @@ impl RuntimeService for RuntimeSvc {
         {
             if rec.netns_path.as_deref().is_some_and(|p| p != "host") {
                 let _ = self.ctx.cni.teardown(&id, &id);
+            }
+            // Belt-and-suspenders: reap the ns holder if StopPodSandbox didn't.
+            if let Some(holder) = rec.pid_holder_pid {
+                sandbox::pid_holder::kill_holder(holder);
             }
         }
         self.ctx
@@ -1047,6 +1083,18 @@ impl RuntimeService for RuntimeSvc {
             readonly_rootfs: sec_ctx.map(|sc| sc.readonly_rootfs).unwrap_or(false),
             rootless_host_ids: host_ids,
             netns_path: sandbox.netns_path.clone(),
+            // Join the sandbox's shared PID/IPC namespace holder when the pod
+            // requested shareProcessNamespace (pod-level PID/IPC).
+            pid_ns_path: sandbox
+                .shared_pid
+                .then_some(sandbox.pid_holder_pid)
+                .flatten()
+                .map(|p| format!("/proc/{p}/ns/pid")),
+            ipc_ns_path: sandbox
+                .shared_ipc
+                .then_some(sandbox.pid_holder_pid)
+                .flatten()
+                .map(|p| format!("/proc/{p}/ns/ipc")),
             mounts: {
                 let mut mounts: Vec<runtime::bundle::MountSpec> = config
                     .mounts
@@ -3102,6 +3150,9 @@ mod tests {
                         host_network: false,
                         host_pid: false,
                         host_ipc: false,
+                        shared_pid: false,
+                        shared_ipc: false,
+                        pid_holder_pid: None,
                         resolv_conf_path: None,
                         sysctls: Default::default(),
                         cgroup_parent: String::new(),

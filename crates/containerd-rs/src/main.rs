@@ -27,8 +27,35 @@ struct Args {
     check: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Intercept the PID-namespace holder helper BEFORE any logging/tokio/thread
+    // setup — it `fork`s, so it must run in a single-threaded process (see
+    // `sandbox::pid_holder`). It is re-exec'd by RunPodSandbox for pods that
+    // request a shared PID namespace (shareProcessNamespace).
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("__pid-holder") {
+        let pidfile = raw
+            .get(2)
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("__pid-holder requires a <pidfile> argument"))?;
+        #[cfg(target_os = "linux")]
+        {
+            sandbox::pid_holder::run_holder(&pidfile)?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pidfile;
+            anyhow::bail!("__pid-holder is Linux-only");
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(daemon_main())
+}
+
+async fn daemon_main() -> anyhow::Result<()> {
     logging::init();
     let args = Args::parse();
     let cfg = Config::load(&args.config)?;
