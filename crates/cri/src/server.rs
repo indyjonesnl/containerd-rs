@@ -427,16 +427,22 @@ impl RuntimeSvc {
         }
     }
 
-    /// Find an image record by reference, image id, repo tag, or name.
+    /// Find an image record by reference, image id, repo tag, repo digest, or
+    /// name. Matches the raw ref AND its `:latest`-normalized form, so a bare
+    /// `repo/img` (no tag) resolves the stored `repo/img:latest` repoTag — the
+    /// kubelet/critest create containers from untagged image refs (e.g. the
+    /// host-net web-server image). Mirrors ImageSvc::find_image.
     fn find_image(&self, image_ref: &str) -> Result<Option<ImageRecord>, Status> {
         let all = self
             .ctx
             .metadata
             .list::<ImageRecord>(Kind::Image, self.ns())
             .map_err(|e| Status::internal(e.to_string()))?;
+        let nref = normalize_image_ref(image_ref);
         Ok(all.into_iter().find(|r| {
             r.image_id == image_ref
-                || r.repo_tags.iter().any(|t| t == image_ref)
+                || r.repo_tags.iter().any(|t| t == image_ref || t == &nref)
+                || r.repo_digests.iter().any(|d| d == image_ref)
                 || r.name == image_ref
         }))
     }
@@ -1810,13 +1816,20 @@ impl RuntimeService for RuntimeSvc {
             .ok_or_else(|| {
                 Status::not_found(format!("sandbox {} not found", req.pod_sandbox_id))
             })?;
-        // Dial the pod IP (routable from the host via the CNI bridge); a
-        // pod-network pod's ports are NOT at the host's 127.0.0.1. Host-network
-        // pods (no distinct IP) fall back to 127.0.0.1.
-        let host = sandbox
-            .ip
-            .filter(|ip| !ip.is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+        // Where to dial the forwarded port:
+        // * host-network pod: its ports live in the (shared) host netns, reachable
+        //   at localhost from the daemon — NOT necessarily at the node's external
+        //   IP (the server may bind 127.0.0.1). Dial 127.0.0.1.
+        // * pod-network pod: dial the pod IP (routable from the host via the CNI
+        //   bridge); the port is NOT at the host's 127.0.0.1.
+        let host = if sandbox.host_network {
+            "127.0.0.1".to_string()
+        } else {
+            sandbox
+                .ip
+                .filter(|ip| !ip.is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+        };
         let token = self
             .ctx
             .streaming
