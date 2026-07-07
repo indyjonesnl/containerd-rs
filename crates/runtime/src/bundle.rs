@@ -82,6 +82,12 @@ pub struct ContainerRequest {
     /// * `None` / `Some("host")` -> no network namespace (share host/sandbox-host net)
     /// * `Some(path)` -> join the pod's network namespace at `path` (CNI sandbox)
     pub netns_path: Option<String>,
+    /// Pod-shared PID namespace to join (`/proc/<holder>/ns/pid`), for
+    /// `shareProcessNamespace`. `None` keeps the container's private PID ns.
+    pub pid_ns_path: Option<String>,
+    /// Pod-shared IPC namespace to join (`/proc/<holder>/ns/ipc`). `None` keeps
+    /// the container's private IPC ns.
+    pub ipc_ns_path: Option<String>,
     /// Host-path bind mounts to inject (from the CRI container config).
     pub mounts: Vec<MountSpec>,
     /// Privileged mode (CRI `security_context.privileged`): grant the full
@@ -580,6 +586,18 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     spec.set_hostname(req.hostname.clone());
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     apply_host_namespaces(&mut spec, req.host_pid, req.host_ipc);
+    // Pod-shared PID/IPC namespaces (shareProcessNamespace): join the sandbox
+    // holder's namespace so the container is not PID 1 and sees its pod peers.
+    join_namespace(
+        &mut spec,
+        LinuxNamespaceType::Pid,
+        req.pid_ns_path.as_deref(),
+    );
+    join_namespace(
+        &mut spec,
+        LinuxNamespaceType::Ipc,
+        req.ipc_ns_path.as_deref(),
+    );
     add_bind_mounts(&mut spec, &req.mounts);
     // Resource limits require a delegated cgroup (cgroupsPath under the kubelet's
     // cgroup_parent); applying them with crun's default root-level path fails
@@ -792,6 +810,29 @@ fn set_network_namespace(spec: &mut Spec, netns_path: Option<&str>) {
                 namespaces.push(ns);
             }
         }
+    }
+    linux.set_namespaces(Some(namespaces));
+    spec.set_linux(Some(linux));
+}
+
+/// Join an existing namespace of `typ` at `path` (pod-shared PID/IPC). Replaces
+/// the container's private namespace of that type with a path reference so crun
+/// `setns`es into the sandbox holder's namespace; `None` leaves it private.
+fn join_namespace(spec: &mut Spec, typ: LinuxNamespaceType, path: Option<&str>) {
+    let Some(path) = path else {
+        return;
+    };
+    let Some(mut linux) = spec.linux().clone() else {
+        return;
+    };
+    let mut namespaces = linux.namespaces().clone().unwrap_or_default();
+    namespaces.retain(|n| n.typ() != typ);
+    if let Ok(ns) = LinuxNamespaceBuilder::default()
+        .typ(typ)
+        .path(PathBuf::from(path))
+        .build()
+    {
+        namespaces.push(ns);
     }
     linux.set_namespaces(Some(namespaces));
     spec.set_linux(Some(linux));

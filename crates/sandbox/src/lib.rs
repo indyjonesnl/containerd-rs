@@ -7,6 +7,7 @@
 
 pub mod cni;
 pub mod net;
+pub mod pid_holder;
 
 /// Default pause image used to anchor a pod sandbox's namespaces.
 pub const DEFAULT_PAUSE_IMAGE: &str = "registry.k8s.io/pause:3.10";
