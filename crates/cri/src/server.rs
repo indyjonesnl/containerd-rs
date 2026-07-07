@@ -1185,6 +1185,7 @@ impl RuntimeService for RuntimeSvc {
             bundle_dir: None,
             pid: None,
             restart_count: 0,
+            stdin: config.stdin,
         };
 
         // Touch the CRI LogPath synchronously so the kubelet / crictl can
@@ -1487,6 +1488,7 @@ impl RuntimeService for RuntimeSvc {
         let bundle_dir = bundle.dir().to_path_buf();
         let live = self.ctx.streaming.live_channel(&id);
         let sessions = self.ctx.streaming.clone();
+        let stdin_open = rec.stdin;
         tokio::spawn(async move {
             let code = supervise_container(
                 &crun_root,
@@ -1495,6 +1497,7 @@ impl RuntimeService for RuntimeSvc {
                 &log_path,
                 live,
                 terminal,
+                stdin_open,
                 sessions,
             )
             .await;
@@ -1513,6 +1516,7 @@ impl RuntimeService for RuntimeSvc {
             ctx.emit_container_event(&cid, v1::ContainerEventType::ContainerStoppedEvent);
             ctx.streaming.close_live(&cid);
             ctx.streaming.close_log(&cid);
+            ctx.streaming.close_stdin(&cid);
             tracing::info!(container = %cid, exit_code = code, "container exited");
         });
 
@@ -1782,6 +1786,10 @@ impl RuntimeService for RuntimeSvc {
             .streaming
             .register_attach(crate::streaming::AttachSession {
                 container_id: req.container_id,
+                stdin: req.stdin,
+                stdout: req.stdout,
+                stderr: req.stderr,
+                tty: req.tty,
             });
         Ok(Response::new(v1::AttachResponse {
             url: format!("{}/attach/{}", self.ctx.stream_base_url, token),
@@ -2461,6 +2469,7 @@ async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
 
 /// Run `crun run` with piped stdio, streaming output live; returns the exit code.
 /// A `terminal` container is supervised over a PTY instead (see [`supervise_tty`]).
+#[allow(clippy::too_many_arguments)]
 async fn supervise_container(
     crun_root: &Path,
     bundle_dir: &Path,
@@ -2468,6 +2477,7 @@ async fn supervise_container(
     log_path: &Path,
     live: tokio::sync::broadcast::Sender<crate::streaming::LiveFrame>,
     terminal: bool,
+    stdin_open: bool,
     sessions: Arc<crate::streaming::Sessions>,
 ) -> i32 {
     if terminal {
@@ -2486,7 +2496,14 @@ async fn supervise_container(
         .arg("--bundle")
         .arg(bundle_dir)
         .arg(cid)
-        .stdin(std::process::Stdio::null())
+        // An interactive container (CRI stdin=true) keeps an open stdin pipe so
+        // its process (e.g. a shell) blocks for input instead of reading EOF and
+        // exiting; Attach forwards the client's stdin through it.
+        .stdin(if stdin_open {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Place crun and the container init in their own process group so that
@@ -2514,6 +2531,13 @@ async fn supervise_container(
     // Publish the log handle so ReopenContainerLog can swap the file in place
     // when the kubelet rotates it (mirrors containerd's ContainerIO.AddOutput).
     sessions.register_log(cid, log.clone());
+    // Publish the stdin pipe so Attach can forward the client's input. Held open
+    // for the container's lifetime (closed in the exit handler via close_stdin).
+    if stdin_open {
+        if let Some(stdin) = child.stdin.take() {
+            sessions.register_stdin(cid, Arc::new(tokio::sync::Mutex::new(Some(stdin))));
+        }
+    }
     let so = child.stdout.take();
     let se = child.stderr.take();
     let mut tasks = Vec::new();
@@ -3033,6 +3057,7 @@ mod tests {
                 bundle_dir: None,
                 pid: None,
                 restart_count: 0,
+                stdin: false,
             }
         }
 
@@ -3644,6 +3669,7 @@ mod tests {
                     bundle_dir: None,
                     pid: None,
                     restart_count: 0,
+                    stdin: false,
                 },
             )
             .unwrap();
@@ -3852,7 +3878,13 @@ mod tests {
         });
         let token = ctx
             .streaming
-            .register_attach(crate::streaming::AttachSession { container_id: cid });
+            .register_attach(crate::streaming::AttachSession {
+                container_id: cid,
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            });
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/attach/{token}"))
             .await

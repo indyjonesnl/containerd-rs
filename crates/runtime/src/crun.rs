@@ -212,6 +212,46 @@ pub fn exec_streaming(
     })
 }
 
+/// Start a TTY exec: `crun exec -t --console-socket <sock> <id> <cmd...>`.
+///
+/// crun allocates a pseudo-terminal for the exec'd process and passes the master
+/// end back over `console_sock` (SCM_RIGHTS), exactly like [`run_tty`] does for
+/// `run`. Returns the still-running `crun exec` child (await it for the exit
+/// code) and the pty master (pump it ↔ the client's stdin/stdout).
+///
+/// A plain `crun exec -t` with piped stdio fails ("exec -t requires a
+/// terminal"), which is why a TTY exec must go through a console socket rather
+/// than [`exec_streaming`].
+pub async fn exec_tty(
+    bin: &str,
+    crun_root: &Path,
+    id: &str,
+    cmd: &[String],
+    console_sock: &Path,
+) -> std::io::Result<(tokio::process::Child, std::os::fd::OwnedFd)> {
+    let _ = tokio::fs::remove_file(console_sock).await;
+    let listener = tokio::net::UnixListener::bind(console_sock)?;
+    let mut command = tokio::process::Command::new(bin);
+    command
+        .arg("--root")
+        .arg(crun_root)
+        .arg("exec")
+        .arg("-t")
+        .arg("--console-socket")
+        .arg(console_sock)
+        .arg(id)
+        .args(cmd)
+        // crun's own stdio is unused — the pty carries the process I/O.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = command.spawn()?;
+    // crun connects to the console socket during setup to hand over the master.
+    let (conn, _) = listener.accept().await?;
+    let master = recv_console_fd(&conn.into_std()?)?;
+    Ok((child, master))
+}
+
 /// Sample one-shot cgroup stats for a container: `crun events --stats <id>`.
 /// Emits a single JSON `{"type":"stats","data":{...}}` line.
 pub fn stats(bin: &str, crun_root: &Path, id: &str) -> std::io::Result<Output> {
