@@ -76,6 +76,10 @@ pub struct AttachSession {
     pub stdout: bool,
     pub stderr: bool,
     pub tty: bool,
+    /// The container's `ContainerConfig.stdin_once`. When set (and not a TTY),
+    /// closing the client's stdin stream closes the container's stdin (EOF),
+    /// matching containerd's `ContainerIO.Attach` semantics.
+    pub stdin_once: bool,
 }
 
 /// A live container-output frame: `(channel, bytes)` where channel 1=stdout,
@@ -942,10 +946,17 @@ where
         return;
     };
 
-    // stdin: client -> the container's (interactive) stdin pipe. Held open for
-    // the container's lifetime, so we do NOT close it when this attach ends.
+    // stdin: client -> the container's (interactive) stdin pipe. When the client
+    // closes its stdin stream, containerd's `ContainerIO.Attach` closes the
+    // container's stdin (EOF) iff `StdinOnce && !Tty`; otherwise it stays open for
+    // the container's lifetime (so a later attach can write again). Matching this
+    // is load-bearing: a client that keeps the streams open until the process
+    // exits (critest `should support attach`, `kubectl attach -i` w/ stdinOnce)
+    // hangs forever if we never deliver EOF. TTY containers have no stdin pipe
+    // handle at all (see `supervise_tty`), so this path is inherently `!Tty`.
     if let (Some(mut srx), Some(handle)) = (stdin_rx, sessions.stdin_handle(&session.container_id))
     {
+        let stdin_once = session.stdin_once;
         tokio::spawn(async move {
             while let Some(chunk) = srx.recv().await {
                 let mut guard = handle.lock().await;
@@ -954,6 +965,12 @@ where
                     break;
                 }
                 let _ = w.flush().await;
+            }
+            // Client closed its stdin stream. For StdinOnce, close the container's
+            // stdin by dropping the write end (EOF to the process) so it can exit
+            // and the output streams can close.
+            if stdin_once {
+                handle.lock().await.take();
             }
         });
     }

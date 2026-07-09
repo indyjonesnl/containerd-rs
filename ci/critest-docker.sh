@@ -43,7 +43,7 @@ docker run --rm --privileged \
   -v "$DAEMON_BIN":/usr/local/bin/containerd-rs:ro \
   -v "$RESULTS_DIR":/work/critest-results:rw \
   -e FOCUS="$FOCUS" -e SKIP="$SKIP" -e PARALLEL="$PARALLEL" -e CRICTL_VERSION="$CRICTL_VERSION" \
-  -e EXTRA_ARGS="$EXTRA_ARGS" \
+  -e EXTRA_ARGS="$EXTRA_ARGS" -e DEBUG="${DEBUG:-}" \
   "$IMAGE" bash -euxc '
     # cgroup-v2 delegation (kind-style): move our procs into a leaf scope and
     # enable controllers in the root subtree so critest cgroup/resource tests
