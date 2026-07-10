@@ -131,11 +131,13 @@ mod tests {
             [cri]
             systemd_cgroup = true
             sandbox_image = "registry.k8s.io/pause:3.9"
+            registry_config_path = "/tmp/certs.d"
         "#;
         let c = Config::from_toml(toml).unwrap();
         assert_eq!(c.cri_socket, PathBuf::from("/run/custom.sock"));
         assert!(c.cri.systemd_cgroup);
         assert_eq!(c.cri.sandbox_image, "registry.k8s.io/pause:3.9");
+        assert_eq!(c.cri.registry_config_path, PathBuf::from("/tmp/certs.d"));
         // Untouched fields keep defaults.
         assert_eq!(c.cri.runtime_type, "io.containerd.crun.v2");
     }

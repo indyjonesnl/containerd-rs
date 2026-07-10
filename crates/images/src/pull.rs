@@ -10,7 +10,7 @@
 //! distribution-spec HTTP API and bearer-token auth lives there.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use core_types::Digest;
 use futures_util::StreamExt;
@@ -50,6 +50,13 @@ pub enum Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// Image pull behavior supplied by the daemon configuration.
+#[derive(Debug, Clone, Default)]
+pub struct PullOptions {
+    /// Directory of containerd-compatible per-registry `hosts.toml` files.
+    pub registry_config_path: Option<PathBuf>,
+}
 
 /// Registry credentials for a pull (from the CRI `AuthConfig`).
 #[derive(Debug, Clone)]
@@ -146,34 +153,39 @@ pub async fn pull(
     snapshots_root: &Path,
     auth: &Auth,
 ) -> Result<PulledImage> {
+    pull_with_options(
+        reference,
+        content,
+        snapshots_root,
+        auth,
+        &PullOptions::default(),
+    )
+    .await
+}
+
+/// Pull `reference` using explicit daemon pull options.
+pub async fn pull_with_options(
+    reference: &str,
+    content: &content::Store,
+    snapshots_root: &Path,
+    auth: &Auth,
+    options: &PullOptions,
+) -> Result<PulledImage> {
     let parsed: Reference = reference.parse().map_err(|e: oci_client::ParseError| {
         Error::Reference(reference.to_string(), e.to_string())
     })?;
 
-    // Select the node platform when the reference points at a multi-arch index.
-    // Build the list of insecure (HTTP) registries: always includes localhost,
-    // plus any registries named in the CONTAINERD_RS_INSECURE_REGISTRIES env
-    // var (comma-separated, e.g. "10.88.0.1:5000,my-registry:5000").
-    let mut insecure: Vec<String> = vec![
-        "localhost".to_string(),
-        // mikronetes M2a: local registry mirror on the host bridge (10.88.0.1:5000)
-        // used when the VM has no internet access (no NAT masquerade).
-        "10.88.0.1:5000".to_string(),
-    ];
+    let mut insecure = insecure_registries_for(reference, options);
     if let Ok(extra) = std::env::var("CONTAINERD_RS_INSECURE_REGISTRIES") {
         for r in extra.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            insecure.push(r.to_string());
+            if !insecure.iter().any(|existing| existing == r) {
+                insecure.push(r.to_string());
+            }
         }
     }
     let config = ClientConfig {
         platform_resolver: Some(Box::new(oci_client::client::linux_amd64_resolver)),
         protocol: oci_client::client::ClientProtocol::HttpsExcept(insecure),
-        // Musl Alpine has no system CA bundle; accept_invalid_certificates skips
-        // rustls-platform-verifier (which panics on "No CA certificates were loaded
-        // from the system") and uses NoVerifier instead — safe for the local HTTP
-        // registry used in M2a. HTTPS pulls from public registries also bypass CA
-        // verification, which is acceptable for a dev-only build.
-        accept_invalid_certificates: true,
         ..Default::default()
     };
     let client = Client::new(config);
@@ -289,6 +301,88 @@ pub async fn pull(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct HostsToml {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    host: std::collections::BTreeMap<String, HostToml>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostToml {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+fn insecure_registries_for(reference: &str, options: &PullOptions) -> Vec<String> {
+    let Some(registry) = registry_from_reference(reference) else {
+        return Vec::new();
+    };
+    if hosts_toml_uses_http(&registry, options) {
+        vec![registry]
+    } else {
+        Vec::new()
+    }
+}
+
+fn registry_from_reference(reference: &str) -> Option<String> {
+    let first = reference.split('/').next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    if first == "localhost" || first.contains('.') || first.contains(':') {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
+fn hosts_toml_uses_http(registry: &str, options: &PullOptions) -> bool {
+    let Some(root) = &options.registry_config_path else {
+        return false;
+    };
+    for namespace in registry_namespaces(registry) {
+        let path = root.join(namespace).join("hosts.toml");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(hosts) = toml::from_str::<HostsToml>(&text) else {
+            continue;
+        };
+        if hosts
+            .server
+            .as_deref()
+            .is_some_and(|server| server.starts_with("http://"))
+        {
+            return true;
+        }
+        if hosts.host.iter().any(|(url, host)| {
+            url.starts_with("http://")
+                && (host.capabilities.is_empty()
+                    || host
+                        .capabilities
+                        .iter()
+                        .any(|cap| cap == "pull" || cap == "resolve"))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn registry_namespaces(registry: &str) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    if let Some((host, port)) = registry.rsplit_once(':') {
+        if !host.is_empty() && !port.is_empty() {
+            namespaces.push(format!("{host}_{port}_"));
+        }
+    }
+    namespaces.push(registry.to_string());
+    namespaces.push("_default".to_string());
+    namespaces
+}
+
 /// Compute the diffID (digest of the *uncompressed* tar) of a compressed layer,
 /// streaming from `compressed` so the layer is never materialized in memory.
 fn compute_diff_id_reader(compressed: Box<dyn Read>, compression: Compression) -> Result<Digest> {
@@ -370,6 +464,79 @@ mod tests {
             std::fs::read_to_string(target.join("usr/bin/hello")).unwrap(),
             "hi there"
         );
+    }
+
+    #[test]
+    fn registry_namespaces_match_containerd_port_lookup_order() {
+        assert_eq!(
+            registry_namespaces("10.88.0.1:5001"),
+            vec!["10.88.0.1_5001_", "10.88.0.1:5001", "_default"]
+        );
+    }
+
+    #[test]
+    fn hosts_toml_http_server_marks_registry_insecure() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_dir = dir.path().join("10.88.0.1:5001");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("hosts.toml"),
+            r#"server = "http://10.88.0.1:5001""#,
+        )
+        .unwrap();
+
+        let options = PullOptions {
+            registry_config_path: Some(dir.path().to_path_buf()),
+        };
+
+        assert_eq!(
+            insecure_registries_for("10.88.0.1:5001/flannel-rs:v0.1.3", &options),
+            vec!["10.88.0.1:5001"]
+        );
+    }
+
+    #[test]
+    fn hosts_toml_http_host_marks_registry_insecure() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_dir = dir.path().join("10.88.0.1_5001_");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("hosts.toml"),
+            r#"
+                server = "https://10.88.0.1:5001"
+
+                [host."http://10.88.0.1:5001"]
+                capabilities = ["pull", "resolve"]
+            "#,
+        )
+        .unwrap();
+
+        let options = PullOptions {
+            registry_config_path: Some(dir.path().to_path_buf()),
+        };
+
+        assert_eq!(
+            insecure_registries_for("10.88.0.1:5001/flannel-rs:v0.1.3", &options),
+            vec!["10.88.0.1:5001"]
+        );
+    }
+
+    #[test]
+    fn hosts_toml_https_server_keeps_registry_secure() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_dir = dir.path().join("10.88.0.1:5001");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("hosts.toml"),
+            r#"server = "https://10.88.0.1:5001""#,
+        )
+        .unwrap();
+
+        let options = PullOptions {
+            registry_config_path: Some(dir.path().to_path_buf()),
+        };
+
+        assert!(insecure_registries_for("10.88.0.1:5001/flannel-rs:v0.1.3", &options).is_empty());
     }
 
     // Requires network access to registry.k8s.io. Run with:
