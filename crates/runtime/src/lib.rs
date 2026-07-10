@@ -10,6 +10,7 @@
 pub mod bundle;
 pub mod cgroup;
 pub mod crun;
+pub mod seccomp;
 pub mod shim;
 
 /// Default OCI runtime handler containerd-rs targets.
