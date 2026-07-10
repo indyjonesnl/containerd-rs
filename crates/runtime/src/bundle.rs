@@ -166,10 +166,9 @@ pub enum SeccompProfile {
     /// No seccomp filter (CRI `Unconfined`). Nothing is emitted.
     #[default]
     Unconfined,
-    /// The runtime's default profile (CRI `RuntimeDefault`). Enforcement of the
-    /// profile *content* is gated on provisioning the real containerd default
-    /// profile (feature 002 T002) — until then this variant is recorded but not
-    /// emitted (emitting a wrong allowlist would break workloads).
+    /// The runtime's default profile (CRI `RuntimeDefault`). Emits the real
+    /// upstream (moby/containerd) default seccomp profile, resolved for the
+    /// container's effective capabilities + host arch (see [`crate::seccomp`]).
     RuntimeDefault,
     /// A profile loaded from a node-local JSON file (CRI `Localhost`). The path is
     /// resolved and its OCI seccomp JSON emitted verbatim.
@@ -473,6 +472,28 @@ fn parse_user(user: &Option<String>) -> (u32, u32) {
 /// Emits OCI-spec fields and lets crun enforce them (matching containerd). Returns
 /// an error (fail-closed, feature 002 FR-016) when a requested Localhost seccomp
 /// profile cannot be read/parsed — never silently runs the container unconfined.
+/// The container's effective capability set as `CAP_*` strings, read from the
+/// (already-built) process capabilities' bounding set. Used to resolve the
+/// RuntimeDefault seccomp profile's capability-gated syscalls, mirroring
+/// containerd (which keys its default profile on the container's cap set).
+fn effective_capabilities(spec: &Spec) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Some(caps) = spec
+        .process()
+        .as_ref()
+        .and_then(|p| p.capabilities().as_ref())
+    {
+        if let Some(list) = caps.bounding().as_ref() {
+            for c in list {
+                if let Ok(serde_json::Value::String(s)) = serde_json::to_value(c) {
+                    set.insert(s);
+                }
+            }
+        }
+    }
+    set
+}
+
 fn apply_security(spec: &mut Spec, req: &ContainerRequest) -> Result<()> {
     if let Some(mut process) = spec.process().clone() {
         if req.no_new_privileges {
@@ -496,15 +517,21 @@ fn apply_security(spec: &mut Spec, req: &ContainerRequest) -> Result<()> {
         match &req.seccomp {
             SeccompProfile::Unconfined => {}
             SeccompProfile::RuntimeDefault => {
-                // Deferred (feature 002 T002): a hand-rolled default allowlist
-                // would risk blocking syscalls real workloads need and breaking
-                // conformance. Recorded, not emitted, until the real containerd
-                // default profile is provisioned.
-                tracing::warn!(
-                    container_seccomp = "RuntimeDefault",
-                    "seccomp RuntimeDefault requested but the default profile is not \
-                     provisioned; running without a seccomp filter (feature 002 T002)"
-                );
+                // The real upstream (moby/containerd) default profile, resolved
+                // for this container's effective capabilities + host arch (see
+                // `crate::seccomp`). Emitting the real profile — not a hand-rolled
+                // allowlist — is what keeps RuntimeDefault from breaking workloads.
+                let effective = effective_capabilities(spec);
+                match crate::seccomp::runtime_default(&effective) {
+                    Ok(seccomp) => {
+                        linux.set_seccomp(Some(seccomp));
+                    }
+                    Err(e) => {
+                        return Err(Error::Builder(format!(
+                            "build RuntimeDefault seccomp profile: {e}"
+                        )))
+                    }
+                }
             }
             SeccompProfile::Localhost(path) => {
                 let bytes = std::fs::read(path)

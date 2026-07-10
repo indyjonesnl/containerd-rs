@@ -2298,8 +2298,9 @@ fn record_to_cri_resources(rec: &ResourcesRecord) -> v1::ContainerResources {
 /// Map CRI `LinuxContainerResources` to the runtime's `Resources` (used by both
 /// CreateContainer's initial limits and UpdateContainerResources' live resize).
 /// Map a CRI seccomp `SecurityProfile` to the bundle's `SeccompProfile`
-/// (feature 002 US2). RuntimeDefault is carried through but its profile content
-/// is not yet emitted (T002); Localhost carries the node-local profile path.
+/// (feature 002 US2). RuntimeDefault emits the real upstream default profile
+/// (resolved per-container in the bundle); Localhost carries the node-local
+/// profile path.
 fn map_seccomp(sp: Option<&v1::SecurityProfile>) -> runtime::bundle::SeccompProfile {
     use runtime::bundle::SeccompProfile;
     use v1::security_profile::ProfileType;
