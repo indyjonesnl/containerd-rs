@@ -171,6 +171,13 @@ pub struct ContainerRecord {
     /// that `Attach` forwards. Without it the process reads EOF and exits.
     #[serde(default)]
     pub stdin: bool,
+    /// CRI `ContainerConfig.stdin_once` — when set (and not a TTY), closing the
+    /// attaching client's stdin closes the container's stdin (EOF to the
+    /// process), mirroring containerd's `ContainerIO.Attach` (StdinOnce && !Tty).
+    /// Keeping stdin open past the attach otherwise hangs a client that waits for
+    /// the streams to close (e.g. critest `should support attach`).
+    #[serde(default)]
+    pub stdin_once: bool,
 }
 
 /// A container mount echoed in `ContainerStatus.mounts`.

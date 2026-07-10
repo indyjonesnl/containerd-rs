@@ -1250,6 +1250,7 @@ impl RuntimeService for RuntimeSvc {
             pid: None,
             restart_count: 0,
             stdin: config.stdin,
+            stdin_once: config.stdin_once,
         };
 
         // Touch the CRI LogPath synchronously so the kubelet / crictl can
@@ -1846,7 +1847,7 @@ impl RuntimeService for RuntimeSvc {
         request: Request<v1::AttachRequest>,
     ) -> Result<Response<v1::AttachResponse>, Status> {
         let req = request.into_inner();
-        self.get_container(&req.container_id)?.ok_or_else(|| {
+        let rec = self.get_container(&req.container_id)?.ok_or_else(|| {
             Status::not_found(format!("container {} not found", req.container_id))
         })?;
         let token = self
@@ -1858,6 +1859,7 @@ impl RuntimeService for RuntimeSvc {
                 stdout: req.stdout,
                 stderr: req.stderr,
                 tty: req.tty,
+                stdin_once: rec.stdin_once,
             });
         Ok(Response::new(v1::AttachResponse {
             url: format!("{}/attach/{}", self.ctx.stream_base_url, token),
@@ -3137,6 +3139,7 @@ mod tests {
                 pid: None,
                 restart_count: 0,
                 stdin: false,
+                stdin_once: false,
             }
         }
 
@@ -3752,6 +3755,7 @@ mod tests {
                     pid: None,
                     restart_count: 0,
                     stdin: false,
+                    stdin_once: false,
                 },
             )
             .unwrap();
@@ -3966,6 +3970,7 @@ mod tests {
                 stdout: true,
                 stderr: true,
                 tty: false,
+                stdin_once: false,
             });
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/attach/{token}"))

@@ -27,18 +27,9 @@ FOCUS="${FOCUS:-}"
 #   seccomp default     — our seccomp RuntimeDefault profile is deferred (T002).
 #   OOMKilled reason    — deferred (T025): crun run deletes the cgroup on exit.
 #   RunAsUserName       — Windows-style username, N/A on Linux.
-#   should support attach — WIP: the daemon side works (interactive containers
-#                         keep stdin open; Attach forwards client stdin to the
-#                         container and streams its stdout back — verified in the
-#                         logs). The client's remotecommand executor does not yet
-#                         surface our stdout on a long-lived (never-FIN'd) SPDY
-#                         stream, so the test hangs; skipped until that SPDY
-#                         delivery detail is resolved (exec, which FINs on exit,
-#                         works). Skipped (not left failing) so it can't stall the
-#                         whole 1-hour ginkgo suite timeout.
 # Override SKIP to change. Real gaps (stats/images/streaming/mounts/namespaces)
 # are intentionally NOT skipped — they are being fixed.
-DEFAULT_SKIP='AppArmor|should support seccomp default on the container|should output OOMKilled reason|should support RunAsUserName|runtime should support attach'
+DEFAULT_SKIP='AppArmor|should support seccomp default on the container|should output OOMKilled reason|should support RunAsUserName'
 # Colon-dash: an unset OR empty SKIP (the workflow input defaults to empty) uses
 # the default. To run the full suite with no skips, pass a non-matching regex.
 SKIP="${SKIP:-$DEFAULT_SKIP}"
