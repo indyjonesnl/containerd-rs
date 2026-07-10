@@ -149,6 +149,34 @@ each can be validated locally first with the docker harness, e.g.
 `make conformance-docker FOCUS='\[sig-apps\].*\[Conformance\]'`. The status
 badges at the top of this README reflect each workflow's latest run.
 
+## CRI conformance (critest)
+
+Alongside the Kubernetes suite, containerd-rs is gated on **[critest](https://github.com/kubernetes-sigs/cri-tools)**
+— the CRI-conformance suite that upstream containerd and CRI-O themselves gate
+on. It exercises the CRI contract directly (no kubelet), so it catches
+runtime-surface regressions the end-to-end suite would only find indirectly.
+
+**Equivalence with containerd is defined as: critest green minus a ratified,
+documented skip list.** The current local result is **85 Passed / 0 Failed /
+28 Skipped** — every runnable spec passes. The skips are by-design or
+environmental, not runtime gaps (containerd maintains its own skips likewise):
+
+| Skipped spec | Why |
+|--------------|-----|
+| `AppArmor` (profile tests) | Environmental: the profile can't be loaded on the harness (in-container → `apparmor_parser`/`/sys/kernel/security/apparmor` unavailable, matching containerd's `HostSupports()` guard). RuntimeDefault AppArmor is a no-op where AppArmor is unsupported. |
+| `should output OOMKilled reason` | By-design: `crun run` deletes the container cgroup on exit, so the post-mortem OOM flag isn't readable. |
+| `should support RunAsUserName` | Windows-style username; N/A on Linux. |
+
+Run it locally with no CI minutes / host sudo (self-contained privileged
+container — installs `critest`, brings up the daemon, runs the suite):
+
+```sh
+make critest-docker                              # full suite (green-minus-skips)
+make critest-docker FOCUS='seccomp default'      # one focused spec
+```
+
+The `critest.yml` workflow runs the same gate in CI (`workflow_dispatch`).
+
 ## Testing
 
 - Unit + contract + integration tests: `make test` (or `cargo test --workspace`).
