@@ -46,6 +46,8 @@ pub struct Context {
     pub cni: sandbox::cni::Cni,
     /// Per-image-reference locks serializing concurrent duplicate pulls.
     pub pull_locks: crate::locks::KeyedLocks,
+    /// Image pull behavior supplied by daemon configuration.
+    pub pull_options: images::pull::PullOptions,
     /// Pass `--no-pivot` to crun (MS_MOVE + chroot instead of pivot_root).
     /// Default false (pivot_root, like containerd) — required for mount
     /// propagation (rshared/rslave). Set true ONLY on a ramdisk/initramfs root
@@ -69,6 +71,7 @@ impl Context {
         stream_addr: &str,
         cni_conf_dir: PathBuf,
         cni_bin_dir: PathBuf,
+        pull_options: images::pull::PullOptions,
         no_pivot_root: bool,
     ) -> Self {
         let streaming = Arc::new(crate::streaming::Sessions::new(state_dir.join("crun")));
@@ -83,6 +86,7 @@ impl Context {
             stream_base_url: format!("http://{stream_addr}"),
             cni: sandbox::cni::Cni::new(cni_conf_dir, cni_bin_dir),
             pull_locks: crate::locks::KeyedLocks::default(),
+            pull_options,
             no_pivot_root,
             container_events,
         }
@@ -2089,11 +2093,12 @@ impl ImageService for ImageSvc {
         // the kubelet provided no credential (feature 002 US4).
         let auth = images::pull::resolve_auth(&reference, auth);
 
-        let pulled = images::pull::pull(
+        let pulled = images::pull::pull_with_options(
             &reference,
             &self.ctx.content,
             &self.ctx.snapshots_root,
             &auth,
+            &self.ctx.pull_options,
         )
         .await
         .map_err(|e| {
@@ -2914,6 +2919,7 @@ mod tests {
             "127.0.0.1:10010",
             dir.join("cni/net.d"),
             dir.join("cni/bin"),
+            images::pull::PullOptions::default(),
             false,
         ))
     }

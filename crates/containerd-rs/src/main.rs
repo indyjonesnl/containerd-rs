@@ -106,6 +106,9 @@ async fn daemon_main() -> anyhow::Result<()> {
         &cfg.stream_server_address,
         cfg.cri.cni_conf_dir.clone(),
         cfg.cri.cni_bin_dir.clone(),
+        images::pull::PullOptions {
+            registry_config_path: Some(cfg.cri.registry_config_path.clone()),
+        },
         cfg.cri.no_pivot_root,
     ));
 
