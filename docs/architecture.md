@@ -106,3 +106,31 @@ gone are marked appropriately) so a restart doesn't leave orphans or duplicates.
 5. `Exec`/`Attach`/`PortForward` → mint a streaming URL; the kubelet connects over
    SPDY and is wired to a live `crun exec` / the container's output bus / a
    localhost TCP proxy.
+
+## Conformance & equivalence
+
+Two independent gates:
+
+- **Kubernetes `[Conformance]`** (via hydrophone) — the end-to-end acceptance
+  gate (SC-001), split into nine per-sig CI workflows (see the README).
+- **critest** (`kubernetes-sigs/cri-tools`) — the CRI-conformance suite upstream
+  containerd/CRI-O gate on. It drives the CRI contract directly (no kubelet), so
+  it pins the runtime surface. **Equivalence with containerd is defined as
+  critest green minus a ratified, documented skip list** — currently 85 Passed /
+  0 Failed / 28 Skipped, i.e. every runnable spec passes. `ci/critest.sh` owns
+  the skip regex with an inline rationale for each entry; `make critest-docker`
+  runs the whole thing in a self-contained privileged container (no CI minutes).
+
+Notable runtime-surface behaviours the critest burn-down pinned down:
+
+- **Seccomp `RuntimeDefault`** — emits the real upstream (moby/containerd)
+  default profile, resolved per-container against its effective capabilities and
+  host arch (mirrors Docker/containerd `setupSeccomp`); see `crates/runtime/src/seccomp.rs`.
+  Never a hand-rolled allowlist.
+- **Attach over SPDY** — `StdinOnce` closes the container's stdin on stdin-stream
+  close (EOF to the process), matching containerd's `ContainerIO.Attach`, so a
+  client that waits for the streams to close doesn't hang.
+- **AppArmor `RuntimeDefault`** — host-guarded like containerd (`HostSupports()`):
+  a no-op where AppArmor is unsupported (e.g. in-container, or a kernel without
+  the LSM). The critest AppArmor specs are therefore an environmental skip, not a
+  runtime gap.
