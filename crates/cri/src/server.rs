@@ -596,10 +596,26 @@ impl RuntimeService for RuntimeSvc {
                 .to_string(),
             );
         }
+        // Advertise per-handler features so the kubelet/critest know what the
+        // runtime supports. `user_namespaces` (feature 004 US1) is set on the
+        // default handler (empty name) and the named `crun` handler; critest keys
+        // its UserNamespaces suite on the handler matching its configured name
+        // (default ""). See `RunPodSandbox` for the userns validation this implies.
+        let features = v1::RuntimeHandlerFeatures {
+            recursive_read_only_mounts: true,
+            user_namespaces: true,
+        };
+        let runtime_handlers = ["", "crun"]
+            .iter()
+            .map(|name| v1::RuntimeHandler {
+                name: name.to_string(),
+                features: Some(features),
+            })
+            .collect();
         Ok(Response::new(v1::StatusResponse {
             status: Some(status),
             info,
-            runtime_handlers: Vec::new(),
+            runtime_handlers,
             features: None,
         }))
     }
@@ -725,6 +741,49 @@ impl RuntimeService for RuntimeSvc {
         let shared_pid = !host_pid && ns_opts.map(|ns| ns.pid == pod).unwrap_or(false);
         let shared_ipc = !host_ipc && ns_opts.map(|ns| ns.ipc == pod).unwrap_or(false);
 
+        // Pod user namespace (feature 004 US1): POD mode remaps the pod's
+        // containers via the supplied uid/gid mappings; NODE/absent = host userns.
+        // We advertise userns support in Status, so validate exactly as containerd
+        // does (and as critest's UserNamespaces suite asserts): support only NODE
+        // and POD modes, and in POD mode require exactly one mapping starting at
+        // container ID 0 (fail-closed, FR-004).
+        let userns_opts = ns_opts.and_then(|ns| ns.userns_options.as_ref());
+        let container_mode = v1::NamespaceMode::Container as i32;
+        let target_mode = v1::NamespaceMode::Target as i32;
+        let validate_userns_map = |m: &[v1::IdMapping]| -> Result<Vec<(u32, u32, u32)>, Status> {
+            if m.len() != 1 {
+                return Err(Status::invalid_argument(
+                    "user namespace requires exactly one uid/gid mapping",
+                ));
+            }
+            if m[0].container_id != 0 {
+                return Err(Status::invalid_argument(
+                    "user namespace mapping must start at container ID 0",
+                ));
+            }
+            Ok(m.iter()
+                .map(|x| (x.container_id, x.host_id, x.length))
+                .collect())
+        };
+        let (userns_mode_pod, userns_uid_mappings, userns_gid_mappings) =
+            match userns_opts.map(|u| u.mode) {
+                Some(m) if m == pod => {
+                    let u = userns_opts.expect("userns_opts present when mode is set");
+                    (
+                        true,
+                        validate_userns_map(&u.uids)?,
+                        validate_userns_map(&u.gids)?,
+                    )
+                }
+                Some(m) if m == container_mode || m == target_mode => {
+                    return Err(Status::invalid_argument(
+                        "unsupported user namespace mode: only NODE and POD are supported",
+                    ));
+                }
+                // NODE (host userns) or unset: no remapping (today's behaviour).
+                _ => (false, Vec::new(), Vec::new()),
+            };
+
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
         // plugin chain; if CNI is unavailable/fails we tear down best-effort and
         // return Status::unavailable so the kubelet retries once CNI is ready.
@@ -820,6 +879,9 @@ impl RuntimeService for RuntimeSvc {
             shared_pid,
             shared_ipc,
             pid_holder_pid,
+            userns_mode_pod,
+            userns_uid_mappings,
+            userns_gid_mappings,
             resolv_conf_path,
             sysctls: config
                 .linux
@@ -905,7 +967,22 @@ impl RuntimeService for RuntimeSvc {
                             v1::NamespaceMode::Pod as i32
                         },
                         target_id: String::new(),
-                        userns_options: None,
+                        // Echo the pod's user-namespace back (feature 004 US1) so
+                        // the kubelet's `podSandboxChanged` comparison matches.
+                        userns_options: if rec.userns_mode_pod {
+                            let to_id = |t: &(u32, u32, u32)| v1::IdMapping {
+                                container_id: t.0,
+                                host_id: t.1,
+                                length: t.2,
+                            };
+                            Some(v1::UserNamespace {
+                                mode: v1::NamespaceMode::Pod as i32,
+                                uids: rec.userns_uid_mappings.iter().map(to_id).collect(),
+                                gids: rec.userns_gid_mappings.iter().map(to_id).collect(),
+                            })
+                        } else {
+                            None
+                        },
                     }),
                 }),
             }),
@@ -1073,6 +1150,28 @@ impl RuntimeService for RuntimeSvc {
                 "RunAsGroup is specified without RunAsUser",
             ));
         }
+
+        // Recursive-readonly mount validation (feature 004): we advertise
+        // `recursive_read_only_mounts`, so — like containerd — reject an `rro`
+        // mount that is not also readonly, or whose propagation is not private
+        // (a non-private rro mount is contradictory). critest asserts these.
+        let private = v1::MountPropagation::PropagationPrivate as i32;
+        for m in &config.mounts {
+            if m.recursive_read_only {
+                if !m.readonly {
+                    return Err(Status::invalid_argument(format!(
+                        "recursive read-only mount {} requires readonly=true",
+                        m.container_path
+                    )));
+                }
+                if m.propagation != private {
+                    return Err(Status::invalid_argument(format!(
+                        "recursive read-only mount {} requires private propagation",
+                        m.container_path
+                    )));
+                }
+            }
+        }
         let container_req = runtime::bundle::ContainerRequest {
             command: config.command.clone(),
             args: config.args.clone(),
@@ -1184,6 +1283,45 @@ impl RuntimeService for RuntimeSvc {
             // HostPID/HostIPC come from the pod sandbox's namespace options.
             host_pid: sandbox.host_pid,
             host_ipc: sandbox.host_ipc,
+            // Pod user namespace (feature 004 US1): the mappings are pod-scoped and
+            // shared by every container in the sandbox.
+            userns_uid_mappings: sandbox
+                .userns_uid_mappings
+                .iter()
+                .map(
+                    |&(container_id, host_id, size)| runtime::bundle::IdMapping {
+                        container_id,
+                        host_id,
+                        size,
+                    },
+                )
+                .collect(),
+            userns_gid_mappings: sandbox
+                .userns_gid_mappings
+                .iter()
+                .map(
+                    |&(container_id, host_id, size)| runtime::bundle::IdMapping {
+                        container_id,
+                        host_id,
+                        size,
+                    },
+                )
+                .collect(),
+            // Per-device access (feature 004 US2): ignored for privileged (all
+            // devices already allowed), so only map for non-privileged containers.
+            devices: if privileged {
+                Vec::new()
+            } else {
+                config
+                    .devices
+                    .iter()
+                    .map(|d| runtime::bundle::DeviceRequest {
+                        host_path: d.host_path.clone(),
+                        container_path: d.container_path.clone(),
+                        permissions: d.permissions.clone(),
+                    })
+                    .collect()
+            },
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -1193,6 +1331,22 @@ impl RuntimeService for RuntimeSvc {
             .create()
             .map_err(|e| Status::internal(e.to_string()))?;
         self.unpack_rootfs(&layers, &bundle.rootfs())?;
+        // User namespace (feature 004 US1, T007): the container init runs as the
+        // mapped host base uid/gid, so it must own its rootfs to create mountpoints
+        // (/proc, /sys, ...) — otherwise `crun` fails with "mkdirat `proc`:
+        // Permission denied". Recursively chown the unpacked rootfs to the mapped
+        // base. (containerd uses idmapped mounts to avoid the walk; a recursive
+        // chown is simpler and correct — the cost is bounded by image size and
+        // only paid for userns pods.)
+        if let Some(base) = container_req.userns_uid_mappings.first() {
+            let gid_base = container_req
+                .userns_gid_mappings
+                .first()
+                .map(|m| m.host_id)
+                .unwrap_or(base.host_id);
+            chown_tree(&bundle.rootfs(), base.host_id, gid_base)
+                .map_err(|e| Status::internal(format!("chown rootfs for userns: {e}")))?;
+        }
         let spec = runtime::bundle::generate_spec(&image_cfg, &container_req, &bundle.rootfs())
             .map_err(|e| Status::internal(e.to_string()))?;
         runtime::bundle::write_bundle(bundle.dir(), &spec)
@@ -1255,6 +1409,21 @@ impl RuntimeService for RuntimeSvc {
             restart_count: 0,
             stdin: config.stdin,
             stdin_once: config.stdin_once,
+            devices: if privileged {
+                Vec::new()
+            } else {
+                config
+                    .devices
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.host_path.clone(),
+                            d.container_path.clone(),
+                            d.permissions.clone(),
+                        )
+                    })
+                    .collect()
+            },
         };
 
         // Touch the CRI LogPath synchronously so the kubelet / crictl can
@@ -2481,6 +2650,20 @@ fn ensure_pod_cgroup_at(root: &Path, cgroup_parent: &str) -> std::io::Result<()>
 /// Derive a container's cgroup path from the pod's `cgroup_parent`, mirroring
 /// containerd's `getCgroupsPath`: a systemd slice parent (`*.slice`) →
 /// `slice:cri-containerd:id`; otherwise the cgroupfs path `parent/id`.
+/// Recursively `lchown` `path` and everything beneath it to `uid:gid` (symlinks
+/// are chowned, not followed). Gives a user-namespaced container's mapped-root
+/// init ownership of its rootfs so it can create mountpoints (feature 004 T007).
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::lchown;
+    lchown(path, Some(uid), Some(gid))?;
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
 fn cgroups_path(cgroup_parent: &str, id: &str) -> String {
     let base = std::path::Path::new(cgroup_parent)
         .file_name()
@@ -3147,6 +3330,7 @@ mod tests {
                 restart_count: 0,
                 stdin: false,
                 stdin_once: false,
+                devices: Vec::new(),
             }
         }
 
@@ -3181,6 +3365,9 @@ mod tests {
                         shared_pid: false,
                         shared_ipc: false,
                         pid_holder_pid: None,
+                        userns_mode_pod: false,
+                        userns_uid_mappings: Vec::new(),
+                        userns_gid_mappings: Vec::new(),
                         resolv_conf_path: None,
                         sysctls: Default::default(),
                         cgroup_parent: String::new(),
@@ -3763,6 +3950,7 @@ mod tests {
                     restart_count: 0,
                     stdin: false,
                     stdin_once: false,
+                    devices: Vec::new(),
                 },
             )
             .unwrap();

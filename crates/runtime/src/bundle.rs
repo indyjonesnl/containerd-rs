@@ -158,6 +158,37 @@ pub struct ContainerRequest {
     pub host_pid: bool,
     /// CRI `NamespaceOption.ipc == NODE` — share the host IPC namespace (HostIPC).
     pub host_ipc: bool,
+    /// Pod-scoped user-namespace UID mappings (CRI `UsernsOptions` mode POD).
+    /// Empty = host user namespace (today's behaviour). When non-empty, emit
+    /// `linux.uidMappings` + a `User` namespace so the container is remapped
+    /// (feature 004 US1). Mirrors containerd `oci.WithUserNamespace`.
+    pub userns_uid_mappings: Vec<IdMapping>,
+    /// Pod-scoped user-namespace GID mappings; see `userns_uid_mappings`.
+    pub userns_gid_mappings: Vec<IdMapping>,
+    /// Host devices to expose to a non-privileged container (CRI
+    /// `ContainerConfig.devices`). Each becomes an OCI `linux.devices` node plus a
+    /// `linux.resources.devices` allow rule (feature 004 US2). Ignored for
+    /// privileged containers (all devices already allowed).
+    pub devices: Vec<DeviceRequest>,
+}
+
+/// A user-namespace ID remap range (CRI `IDMapping` / OCI `LinuxIdMapping`):
+/// maps `size` consecutive IDs starting at `container_id` inside the namespace to
+/// host IDs starting at `host_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdMapping {
+    pub container_id: u32,
+    pub host_id: u32,
+    pub size: u32,
+}
+
+/// A host device exposed to a container (CRI `Device`): the host node, its path
+/// inside the container, and the requested access (subset of `rwm`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRequest {
+    pub host_path: String,
+    pub container_path: String,
+    pub permissions: String,
 }
 
 /// Requested seccomp confinement, mapped from the CRI `SecurityProfile`.
@@ -613,6 +644,14 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     spec.set_hostname(req.hostname.clone());
     set_network_namespace(&mut spec, req.netns_path.as_deref());
     apply_host_namespaces(&mut spec, req.host_pid, req.host_ipc);
+    // Pod-scoped user namespace (feature 004 US1): emit uid/gid mappings + a User
+    // namespace when the pod requested one. Overrides any single-pair rootless
+    // base so CRI-supplied mappings win.
+    apply_user_namespace(
+        &mut spec,
+        &req.userns_uid_mappings,
+        &req.userns_gid_mappings,
+    );
     // Pod-shared PID/IPC namespaces (shareProcessNamespace): join the sandbox
     // holder's namespace so the container is not PID 1 and sees its pod peers.
     join_namespace(
@@ -642,9 +681,151 @@ pub fn generate_spec(image: &ImageConfig, req: &ContainerRequest, rootfs: &Path)
     } else {
         apply_capabilities(&mut spec, &req.add_capabilities, &req.drop_capabilities);
         apply_security(&mut spec, req)?;
+        // Per-device access (feature 004 US2): expose declared host devices + a
+        // matching device-cgroup allow rule. Privileged already allows all.
+        apply_devices(&mut spec, &req.devices)?;
     }
     apply_sysctls(&mut spec, &req.sysctls);
     Ok(spec)
+}
+
+/// Emit a pod-scoped user namespace (feature 004 US1). When `uid`/`gid` mappings
+/// are present, set `linux.uidMappings`/`gidMappings` to exactly those ranges and
+/// ensure `linux.namespaces` contains a `User` entry (mirrors containerd
+/// `oci.WithUserNamespace`). Empty mappings leave the spec unchanged (host user
+/// namespace — today's behaviour, and the regression guard). Any single-pair
+/// rootless base mapping is overwritten so CRI-supplied mappings win.
+fn apply_user_namespace(spec: &mut Spec, uid: &[IdMapping], gid: &[IdMapping]) {
+    if uid.is_empty() && gid.is_empty() {
+        return;
+    }
+    let to_oci = |m: &[IdMapping]| -> Vec<oci_spec::runtime::LinuxIdMapping> {
+        m.iter()
+            .map(|r| {
+                oci_spec::runtime::LinuxIdMappingBuilder::default()
+                    .container_id(r.container_id)
+                    .host_id(r.host_id)
+                    .size(r.size)
+                    .build()
+                    .expect("LinuxIdMapping has all fields set")
+            })
+            .collect()
+    };
+    if let Some(mut linux) = spec.linux().clone() {
+        linux.set_uid_mappings(Some(to_oci(uid)));
+        linux.set_gid_mappings(Some(to_oci(gid)));
+        let mut namespaces = linux.namespaces().clone().unwrap_or_default();
+        if !namespaces
+            .iter()
+            .any(|n| n.typ() == LinuxNamespaceType::User)
+        {
+            if let Ok(ns) = LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::User)
+                .build()
+            {
+                namespaces.push(ns);
+            }
+        }
+        linux.set_namespaces(Some(namespaces));
+        spec.set_linux(Some(linux));
+    }
+}
+
+/// Expose declared host devices to a non-privileged container (feature 004 US2).
+/// For each device, stat the host node for its type + major/minor, emit a
+/// `linux.devices` entry and a `linux.resources.devices` allow rule with the
+/// requested `rwm` access (mirrors containerd `customopts.WithDevices`). A
+/// declared device missing on the host is a hard error (never start a container
+/// that cannot use it).
+fn apply_devices(spec: &mut Spec, devices: &[DeviceRequest]) -> Result<()> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    use oci_spec::runtime::{LinuxDeviceBuilder, LinuxDeviceCgroupBuilder};
+
+    let Some(mut linux) = spec.linux().clone() else {
+        return Ok(());
+    };
+    let mut dev_nodes = linux.devices().clone().unwrap_or_default();
+    let mut resources = linux.resources().clone().unwrap_or_default();
+    let mut allow = resources.devices().clone().unwrap_or_default();
+
+    for d in devices {
+        let dev = stat_device(&d.host_path)?;
+        let access = sanitize_device_access(&d.permissions);
+        let node = LinuxDeviceBuilder::default()
+            .path(PathBuf::from(&d.container_path))
+            .typ(dev.typ)
+            .major(dev.major)
+            .minor(dev.minor)
+            .file_mode(dev.file_mode)
+            .uid(0u32)
+            .gid(0u32)
+            .build()
+            .map_err(|e| Error::Builder(format!("device {}: {e}", d.host_path)))?;
+        dev_nodes.push(node);
+        let rule = LinuxDeviceCgroupBuilder::default()
+            .allow(true)
+            .typ(dev.typ)
+            .major(dev.major)
+            .minor(dev.minor)
+            .access(access)
+            .build()
+            .map_err(|e| Error::Builder(format!("device cgroup {}: {e}", d.host_path)))?;
+        allow.push(rule);
+    }
+    linux.set_devices(Some(dev_nodes));
+    resources.set_devices(Some(allow));
+    linux.set_resources(Some(resources));
+    spec.set_linux(Some(linux));
+    Ok(())
+}
+
+/// A host device node's OCI-relevant attributes.
+struct StatedDevice {
+    typ: oci_spec::runtime::LinuxDeviceType,
+    major: i64,
+    minor: i64,
+    file_mode: u32,
+}
+
+/// `stat(2)` a host device node → its OCI type + major/minor + file mode. Errors
+/// if the path is missing (device not present on the node) or is not a
+/// character/block device.
+fn stat_device(host_path: &str) -> Result<StatedDevice> {
+    use oci_spec::runtime::LinuxDeviceType;
+    let st = rustix::fs::stat(host_path)
+        .map_err(|e| Error::Builder(format!("device not found on node: {host_path}: {e}")))?;
+    let typ = match rustix::fs::FileType::from_raw_mode(st.st_mode as u32) {
+        rustix::fs::FileType::CharacterDevice => LinuxDeviceType::C,
+        rustix::fs::FileType::BlockDevice => LinuxDeviceType::B,
+        _ => {
+            return Err(Error::Builder(format!(
+                "{host_path} is not a character or block device"
+            )))
+        }
+    };
+    let rdev = st.st_rdev as u64;
+    Ok(StatedDevice {
+        typ,
+        major: i64::from(rustix::fs::major(rdev)),
+        minor: i64::from(rustix::fs::minor(rdev)),
+        file_mode: (st.st_mode as u32) & 0o7777,
+    })
+}
+
+/// Keep only valid device-cgroup access chars (`r`, `w`, `m`); default to `rwm`
+/// when the CRI permission string is empty.
+fn sanitize_device_access(perms: &str) -> String {
+    let s: String = perms
+        .chars()
+        .filter(|c| matches!(c, 'r' | 'w' | 'm'))
+        .collect();
+    if s.is_empty() {
+        "rwm".to_string()
+    } else {
+        s
+    }
 }
 
 /// Map CRI resource limits/requests onto the OCI `linux.resources` so crun
@@ -1596,5 +1777,146 @@ mod tests {
         let spec = generate_spec(&img(), &req, &dir.path().join("r")).unwrap();
         let v = serde_json::to_value(&spec).unwrap();
         assert!(v["linux"]["seccomp"].is_null());
+    }
+
+    // ---- feature 004 US1: user namespaces ----
+
+    // POD-mode userns mappings -> linux.uidMappings/gidMappings + a User namespace.
+    #[test]
+    fn userns_pod_maps_emit_uid_gid_and_user_ns() {
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            userns_uid_mappings: vec![IdMapping {
+                container_id: 0,
+                host_id: 100000,
+                size: 65536,
+            }],
+            userns_gid_mappings: vec![IdMapping {
+                container_id: 0,
+                host_id: 100000,
+                size: 65536,
+            }],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
+        let linux = spec.linux().clone().unwrap();
+        let uids = linux.uid_mappings().clone().expect("uid mappings set");
+        assert_eq!(uids.len(), 1);
+        assert_eq!(uids[0].host_id(), 100000);
+        assert_eq!(uids[0].container_id(), 0);
+        assert_eq!(uids[0].size(), 65536);
+        assert!(linux.gid_mappings().is_some(), "gid mappings set");
+        assert!(
+            linux
+                .namespaces()
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .any(|n| n.typ() == LinuxNamespaceType::User),
+            "a User namespace must be present"
+        );
+    }
+
+    // No mappings -> unchanged (host user namespace). Regression guard.
+    #[test]
+    fn no_userns_is_unchanged() {
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
+        let linux = spec.linux().clone().unwrap();
+        assert!(linux.uid_mappings().is_none(), "no uid mappings");
+        assert!(linux.gid_mappings().is_none(), "no gid mappings");
+        assert!(
+            !linux
+                .namespaces()
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .any(|n| n.typ() == LinuxNamespaceType::User),
+            "no User namespace without mappings"
+        );
+    }
+
+    // ---- feature 004 US2: per-device access ----
+
+    // A declared device -> linux.devices node + a matching device-cgroup allow.
+    #[test]
+    fn declared_device_emits_node_and_cgroup_allow() {
+        // /dev/null is a character device 1:3 on every Linux host/CI.
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            devices: vec![DeviceRequest {
+                host_path: "/dev/null".into(),
+                container_path: "/dev/null".into(),
+                permissions: "rw".into(),
+            }],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
+        let linux = spec.linux().clone().unwrap();
+        let dev = linux
+            .devices()
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|d| d.path() == std::path::Path::new("/dev/null"))
+            .expect("/dev/null device node emitted");
+        assert_eq!(dev.major(), 1);
+        assert_eq!(dev.minor(), 3);
+        let allowed = linux
+            .resources()
+            .clone()
+            .and_then(|r| r.devices().clone())
+            .unwrap_or_default()
+            .into_iter()
+            .any(|c| c.allow() && c.major() == Some(1) && c.minor() == Some(3));
+        assert!(allowed, "device cgroup must allow 1:3");
+    }
+
+    // A device that does not exist on the host -> hard error at build.
+    #[test]
+    fn missing_host_device_errors() {
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            devices: vec![DeviceRequest {
+                host_path: "/dev/does-not-exist-42".into(),
+                container_path: "/dev/x".into(),
+                permissions: "rw".into(),
+            }],
+            ..Default::default()
+        };
+        let err = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs"));
+        assert!(err.is_err(), "missing host device must fail the build");
+    }
+
+    // Privileged containers keep the all-devices-allowed rule and do NOT gain
+    // per-device nodes from the request (they already have all host devices).
+    #[test]
+    fn privileged_device_access_unchanged() {
+        let req = ContainerRequest {
+            command: vec!["/bin/true".into()],
+            privileged: true,
+            devices: vec![DeviceRequest {
+                host_path: "/dev/null".into(),
+                container_path: "/dev/null".into(),
+                permissions: "rw".into(),
+            }],
+            ..Default::default()
+        };
+        let spec = generate_spec(&img(), &req, std::path::Path::new("/tmp/rootfs")).unwrap();
+        let linux = spec.linux().clone().unwrap();
+        let rules = linux
+            .resources()
+            .clone()
+            .and_then(|r| r.devices().clone())
+            .unwrap_or_default();
+        assert!(
+            rules
+                .iter()
+                .any(|c| c.allow() && c.major().is_none() && c.minor().is_none()),
+            "privileged keeps the all-devices `a *:* rwm` rule"
+        );
     }
 }
