@@ -596,10 +596,26 @@ impl RuntimeService for RuntimeSvc {
                 .to_string(),
             );
         }
+        // Advertise per-handler features so the kubelet/critest know what the
+        // runtime supports. `user_namespaces` (feature 004 US1) is set on the
+        // default handler (empty name) and the named `crun` handler; critest keys
+        // its UserNamespaces suite on the handler matching its configured name
+        // (default ""). See `RunPodSandbox` for the userns validation this implies.
+        let features = v1::RuntimeHandlerFeatures {
+            recursive_read_only_mounts: false,
+            user_namespaces: true,
+        };
+        let runtime_handlers = ["", "crun"]
+            .iter()
+            .map(|name| v1::RuntimeHandler {
+                name: name.to_string(),
+                features: Some(features),
+            })
+            .collect();
         Ok(Response::new(v1::StatusResponse {
             status: Some(status),
             info,
-            runtime_handlers: Vec::new(),
+            runtime_handlers,
             features: None,
         }))
     }
@@ -727,25 +743,46 @@ impl RuntimeService for RuntimeSvc {
 
         // Pod user namespace (feature 004 US1): POD mode remaps the pod's
         // containers via the supplied uid/gid mappings; NODE/absent = host userns.
+        // We advertise userns support in Status, so validate exactly as containerd
+        // does (and as critest's UserNamespaces suite asserts): support only NODE
+        // and POD modes, and in POD mode require exactly one mapping starting at
+        // container ID 0 (fail-closed, FR-004).
         let userns_opts = ns_opts.and_then(|ns| ns.userns_options.as_ref());
-        let userns_mode_pod = userns_opts.map(|u| u.mode == pod).unwrap_or(false);
-        let to_triples = |m: &[v1::IdMapping]| -> Vec<(u32, u32, u32)> {
-            m.iter()
+        let container_mode = v1::NamespaceMode::Container as i32;
+        let target_mode = v1::NamespaceMode::Target as i32;
+        let validate_userns_map = |m: &[v1::IdMapping]| -> Result<Vec<(u32, u32, u32)>, Status> {
+            if m.len() != 1 {
+                return Err(Status::invalid_argument(
+                    "user namespace requires exactly one uid/gid mapping",
+                ));
+            }
+            if m[0].container_id != 0 {
+                return Err(Status::invalid_argument(
+                    "user namespace mapping must start at container ID 0",
+                ));
+            }
+            Ok(m.iter()
                 .map(|x| (x.container_id, x.host_id, x.length))
-                .collect()
+                .collect())
         };
-        let (userns_uid_mappings, userns_gid_mappings) = match userns_opts {
-            Some(u) if userns_mode_pod => {
-                // Fail-closed (FR-004): POD mode with no mappings cannot be satisfied.
-                if u.uids.is_empty() || u.gids.is_empty() {
+        let (userns_mode_pod, userns_uid_mappings, userns_gid_mappings) =
+            match userns_opts.map(|u| u.mode) {
+                Some(m) if m == pod => {
+                    let u = userns_opts.expect("userns_opts present when mode is set");
+                    (
+                        true,
+                        validate_userns_map(&u.uids)?,
+                        validate_userns_map(&u.gids)?,
+                    )
+                }
+                Some(m) if m == container_mode || m == target_mode => {
                     return Err(Status::invalid_argument(
-                        "userns POD mode requires non-empty uid and gid mappings",
+                        "unsupported user namespace mode: only NODE and POD are supported",
                     ));
                 }
-                (to_triples(&u.uids), to_triples(&u.gids))
-            }
-            _ => (Vec::new(), Vec::new()),
-        };
+                // NODE (host userns) or unset: no remapping (today's behaviour).
+                _ => (false, Vec::new(), Vec::new()),
+            };
 
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
         // plugin chain; if CNI is unavailable/fails we tear down best-effort and
@@ -1272,6 +1309,22 @@ impl RuntimeService for RuntimeSvc {
             .create()
             .map_err(|e| Status::internal(e.to_string()))?;
         self.unpack_rootfs(&layers, &bundle.rootfs())?;
+        // User namespace (feature 004 US1, T007): the container init runs as the
+        // mapped host base uid/gid, so it must own its rootfs to create mountpoints
+        // (/proc, /sys, ...) — otherwise `crun` fails with "mkdirat `proc`:
+        // Permission denied". Recursively chown the unpacked rootfs to the mapped
+        // base. (containerd uses idmapped mounts to avoid the walk; a recursive
+        // chown is simpler and correct — the cost is bounded by image size and
+        // only paid for userns pods.)
+        if let Some(base) = container_req.userns_uid_mappings.first() {
+            let gid_base = container_req
+                .userns_gid_mappings
+                .first()
+                .map(|m| m.host_id)
+                .unwrap_or(base.host_id);
+            chown_tree(&bundle.rootfs(), base.host_id, gid_base)
+                .map_err(|e| Status::internal(format!("chown rootfs for userns: {e}")))?;
+        }
         let spec = runtime::bundle::generate_spec(&image_cfg, &container_req, &bundle.rootfs())
             .map_err(|e| Status::internal(e.to_string()))?;
         runtime::bundle::write_bundle(bundle.dir(), &spec)
@@ -2575,6 +2628,20 @@ fn ensure_pod_cgroup_at(root: &Path, cgroup_parent: &str) -> std::io::Result<()>
 /// Derive a container's cgroup path from the pod's `cgroup_parent`, mirroring
 /// containerd's `getCgroupsPath`: a systemd slice parent (`*.slice`) →
 /// `slice:cri-containerd:id`; otherwise the cgroupfs path `parent/id`.
+/// Recursively `lchown` `path` and everything beneath it to `uid:gid` (symlinks
+/// are chowned, not followed). Gives a user-namespaced container's mapped-root
+/// init ownership of its rootfs so it can create mountpoints (feature 004 T007).
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::lchown;
+    lchown(path, Some(uid), Some(gid))?;
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
 fn cgroups_path(cgroup_parent: &str, id: &str) -> String {
     let base = std::path::Path::new(cgroup_parent)
         .file_name()
