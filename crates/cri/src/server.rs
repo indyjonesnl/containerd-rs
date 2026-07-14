@@ -725,6 +725,28 @@ impl RuntimeService for RuntimeSvc {
         let shared_pid = !host_pid && ns_opts.map(|ns| ns.pid == pod).unwrap_or(false);
         let shared_ipc = !host_ipc && ns_opts.map(|ns| ns.ipc == pod).unwrap_or(false);
 
+        // Pod user namespace (feature 004 US1): POD mode remaps the pod's
+        // containers via the supplied uid/gid mappings; NODE/absent = host userns.
+        let userns_opts = ns_opts.and_then(|ns| ns.userns_options.as_ref());
+        let userns_mode_pod = userns_opts.map(|u| u.mode == pod).unwrap_or(false);
+        let to_triples = |m: &[v1::IdMapping]| -> Vec<(u32, u32, u32)> {
+            m.iter()
+                .map(|x| (x.container_id, x.host_id, x.length))
+                .collect()
+        };
+        let (userns_uid_mappings, userns_gid_mappings) = match userns_opts {
+            Some(u) if userns_mode_pod => {
+                // Fail-closed (FR-004): POD mode with no mappings cannot be satisfied.
+                if u.uids.is_empty() || u.gids.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "userns POD mode requires non-empty uid and gid mappings",
+                    ));
+                }
+                (to_triples(&u.uids), to_triples(&u.gids))
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+
         // Returns (netns_path, pod_ip). For a CNI pod we create a netns + run the
         // plugin chain; if CNI is unavailable/fails we tear down best-effort and
         // return Status::unavailable so the kubelet retries once CNI is ready.
@@ -820,6 +842,9 @@ impl RuntimeService for RuntimeSvc {
             shared_pid,
             shared_ipc,
             pid_holder_pid,
+            userns_mode_pod,
+            userns_uid_mappings,
+            userns_gid_mappings,
             resolv_conf_path,
             sysctls: config
                 .linux
@@ -905,7 +930,22 @@ impl RuntimeService for RuntimeSvc {
                             v1::NamespaceMode::Pod as i32
                         },
                         target_id: String::new(),
-                        userns_options: None,
+                        // Echo the pod's user-namespace back (feature 004 US1) so
+                        // the kubelet's `podSandboxChanged` comparison matches.
+                        userns_options: if rec.userns_mode_pod {
+                            let to_id = |t: &(u32, u32, u32)| v1::IdMapping {
+                                container_id: t.0,
+                                host_id: t.1,
+                                length: t.2,
+                            };
+                            Some(v1::UserNamespace {
+                                mode: v1::NamespaceMode::Pod as i32,
+                                uids: rec.userns_uid_mappings.iter().map(to_id).collect(),
+                                gids: rec.userns_gid_mappings.iter().map(to_id).collect(),
+                            })
+                        } else {
+                            None
+                        },
                     }),
                 }),
             }),
@@ -1184,6 +1224,45 @@ impl RuntimeService for RuntimeSvc {
             // HostPID/HostIPC come from the pod sandbox's namespace options.
             host_pid: sandbox.host_pid,
             host_ipc: sandbox.host_ipc,
+            // Pod user namespace (feature 004 US1): the mappings are pod-scoped and
+            // shared by every container in the sandbox.
+            userns_uid_mappings: sandbox
+                .userns_uid_mappings
+                .iter()
+                .map(
+                    |&(container_id, host_id, size)| runtime::bundle::IdMapping {
+                        container_id,
+                        host_id,
+                        size,
+                    },
+                )
+                .collect(),
+            userns_gid_mappings: sandbox
+                .userns_gid_mappings
+                .iter()
+                .map(
+                    |&(container_id, host_id, size)| runtime::bundle::IdMapping {
+                        container_id,
+                        host_id,
+                        size,
+                    },
+                )
+                .collect(),
+            // Per-device access (feature 004 US2): ignored for privileged (all
+            // devices already allowed), so only map for non-privileged containers.
+            devices: if privileged {
+                Vec::new()
+            } else {
+                config
+                    .devices
+                    .iter()
+                    .map(|d| runtime::bundle::DeviceRequest {
+                        host_path: d.host_path.clone(),
+                        container_path: d.container_path.clone(),
+                        permissions: d.permissions.clone(),
+                    })
+                    .collect()
+            },
         };
 
         // Build the bundle: merge image layers into a single rootfs, then write
@@ -1255,6 +1334,21 @@ impl RuntimeService for RuntimeSvc {
             restart_count: 0,
             stdin: config.stdin,
             stdin_once: config.stdin_once,
+            devices: if privileged {
+                Vec::new()
+            } else {
+                config
+                    .devices
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.host_path.clone(),
+                            d.container_path.clone(),
+                            d.permissions.clone(),
+                        )
+                    })
+                    .collect()
+            },
         };
 
         // Touch the CRI LogPath synchronously so the kubelet / crictl can
@@ -3147,6 +3241,7 @@ mod tests {
                 restart_count: 0,
                 stdin: false,
                 stdin_once: false,
+                devices: Vec::new(),
             }
         }
 
@@ -3181,6 +3276,9 @@ mod tests {
                         shared_pid: false,
                         shared_ipc: false,
                         pid_holder_pid: None,
+                        userns_mode_pod: false,
+                        userns_uid_mappings: Vec::new(),
+                        userns_gid_mappings: Vec::new(),
                         resolv_conf_path: None,
                         sysctls: Default::default(),
                         cgroup_parent: String::new(),
@@ -3763,6 +3861,7 @@ mod tests {
                     restart_count: 0,
                     stdin: false,
                     stdin_once: false,
+                    devices: Vec::new(),
                 },
             )
             .unwrap();

@@ -90,6 +90,18 @@ pub struct SandboxRecord {
     /// teardown. `None` when the sandbox shares no pod-level PID/IPC namespace.
     #[serde(default)]
     pub pid_holder_pid: Option<i32>,
+    /// Whether the pod requested a POD-mode user namespace (CRI
+    /// `UsernsOptions.mode == POD`). When true, containers are remapped via
+    /// `userns_uid_mappings`/`userns_gid_mappings` (feature 004 US1).
+    #[serde(default)]
+    pub userns_mode_pod: bool,
+    /// Pod user-namespace UID mappings as `(container_id, host_id, size)` triples
+    /// (from CRI `UsernsOptions.uids`). Shared by all containers in the pod.
+    #[serde(default)]
+    pub userns_uid_mappings: Vec<(u32, u32, u32)>,
+    /// Pod user-namespace GID mappings; see `userns_uid_mappings`.
+    #[serde(default)]
+    pub userns_gid_mappings: Vec<(u32, u32, u32)>,
     /// Path to the generated `resolv.conf` for this sandbox (from the CRI
     /// `DNSConfig`), bind-mounted at `/etc/resolv.conf` in each container so DNS
     /// works (e.g. CoreDNS's `forward . /etc/resolv.conf`). `None` when no DNS
@@ -178,6 +190,11 @@ pub struct ContainerRecord {
     /// the streams to close (e.g. critest `should support attach`).
     #[serde(default)]
     pub stdin_once: bool,
+    /// Host devices exposed to this container (CRI `ContainerConfig.devices`) as
+    /// `(host_path, container_path, permissions)` — echoed for status and
+    /// re-emitted on `reconcile()` (feature 004 US2).
+    #[serde(default)]
+    pub devices: Vec<(String, String, String)>,
 }
 
 /// A container mount echoed in `ContainerStatus.mounts`.
