@@ -602,7 +602,7 @@ impl RuntimeService for RuntimeSvc {
         // its UserNamespaces suite on the handler matching its configured name
         // (default ""). See `RunPodSandbox` for the userns validation this implies.
         let features = v1::RuntimeHandlerFeatures {
-            recursive_read_only_mounts: false,
+            recursive_read_only_mounts: true,
             user_namespaces: true,
         };
         let runtime_handlers = ["", "crun"]
@@ -1149,6 +1149,28 @@ impl RuntimeService for RuntimeSvc {
             return Err(Status::invalid_argument(
                 "RunAsGroup is specified without RunAsUser",
             ));
+        }
+
+        // Recursive-readonly mount validation (feature 004): we advertise
+        // `recursive_read_only_mounts`, so — like containerd — reject an `rro`
+        // mount that is not also readonly, or whose propagation is not private
+        // (a non-private rro mount is contradictory). critest asserts these.
+        let private = v1::MountPropagation::PropagationPrivate as i32;
+        for m in &config.mounts {
+            if m.recursive_read_only {
+                if !m.readonly {
+                    return Err(Status::invalid_argument(format!(
+                        "recursive read-only mount {} requires readonly=true",
+                        m.container_path
+                    )));
+                }
+                if m.propagation != private {
+                    return Err(Status::invalid_argument(format!(
+                        "recursive read-only mount {} requires private propagation",
+                        m.container_path
+                    )));
+                }
+            }
         }
         let container_req = runtime::bundle::ContainerRequest {
             command: config.command.clone(),
