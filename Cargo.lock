@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "containerd-rs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "content"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "core-types",
  "hex",
@@ -413,7 +413,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-types"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "cri"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "images"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "content",
@@ -1399,7 +1399,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "metadata"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "core-types",
  "redb",
@@ -2037,11 +2037,12 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "core-types",
  "oci-spec 0.8.4",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -2175,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "core-types",
  "rustix",
@@ -2396,7 +2397,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "snapshots"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "core-types",
  "flate2",
