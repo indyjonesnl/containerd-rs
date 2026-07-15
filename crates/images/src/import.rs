@@ -165,15 +165,136 @@ fn import_docker_save(
     })
 }
 
-// ---- OCI layout (implemented in Task 3) -----------------------------------
+// ---- OCI layout -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct OciIndex {
+    manifests: Vec<OciDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct OciDescriptor {
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+    digest: String,
+    #[serde(default)]
+    platform: Option<OciPlatform>,
+    #[serde(default)]
+    annotations: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct OciPlatform {
+    #[serde(default)]
+    os: String,
+    #[serde(default)]
+    architecture: String,
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OciManifest {
+    config: OciLayerDescriptor,
+    layers: Vec<OciLayerDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct OciLayerDescriptor {
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+    digest: String,
+}
 
 fn import_oci_layout(
-    _root: &Path,
-    _content: &content::Store,
-    _snapshots_root: &Path,
-    _opts: &ImportOptions,
+    root: &Path,
+    content: &content::Store,
+    snapshots_root: &Path,
+    opts: &ImportOptions,
 ) -> Result<ImportedImage> {
-    Err(Error::UnknownFormat) // replaced in Task 3
+    let index: OciIndex = read_json(&root.join("index.json"))?;
+
+    // Consider only image manifests (skip nested indexes).
+    let manifest_descs: Vec<&OciDescriptor> = index
+        .manifests
+        .iter()
+        .filter(|d| d.media_type.contains("manifest"))
+        .collect();
+    if manifest_descs.is_empty() {
+        return Err(Error::Malformed("index.json has no image manifest".into()));
+    }
+
+    // Single manifest → take it; multiple → select by node platform.
+    let selected: &OciDescriptor = if manifest_descs.len() == 1 {
+        manifest_descs[0]
+    } else {
+        let entries: Vec<(Platform, usize)> = manifest_descs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let p = d
+                    .platform
+                    .as_ref()
+                    .map(|p| Platform {
+                        os: p.os.clone(),
+                        architecture: p.architecture.clone(),
+                        variant: p.variant.clone(),
+                    })
+                    .unwrap_or_else(|| opts.platform.clone());
+                (p, i)
+            })
+            .collect();
+        let idx = identity::select_manifest(&opts.platform, &entries).ok_or_else(|| {
+            Error::NoPlatformMatch(format!(
+                "{}/{}",
+                opts.platform.os, opts.platform.architecture
+            ))
+        })?;
+        manifest_descs[*idx]
+    };
+
+    let manifest_digest: Digest = selected.digest.parse()?;
+    let manifest_bytes = fs::read(oci_blob_path(root, &manifest_digest))?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
+
+    let config_digest: Digest = manifest.config.digest.parse()?;
+    let config_bytes = fs::read(oci_blob_path(root, &config_digest))?;
+    let mut total = config_bytes.len() as u64;
+
+    let mut layers = Vec::with_capacity(manifest.layers.len());
+    for layer in &manifest.layers {
+        let digest: Digest = layer.digest.parse()?;
+        let path = oci_blob_path(root, &digest);
+        let size = fs::metadata(&path)?.len();
+        let mut f = fs::File::open(&path)?;
+        let mut w = content.writer(&format!("import:ocilayer:{digest}"))?;
+        std::io::copy(&mut f, &mut w)?;
+        let committed = w.commit(size, &digest)?;
+        total += size;
+        layers.push(LayerInput {
+            digest: committed,
+            media_type: layer.media_type.clone(),
+        });
+    }
+
+    let unpacked = unpack::finalize_image(content, snapshots_root, &config_bytes, &layers)?;
+    let ref_name = selected
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+        .map(String::as_str);
+    let repo_tags = resolve_tags(opts, ref_name)?;
+
+    Ok(ImportedImage {
+        image_id: unpacked.image_id,
+        manifest_digest: Some(manifest_digest),
+        repo_tags,
+        size: total,
+        diff_ids: unpacked.diff_ids,
+        chain_ids: unpacked.chain_ids,
+        layer_digests: unpacked.layer_digests,
+        user: unpacked.user,
+    })
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -228,29 +349,10 @@ fn resolve_tags(opts: &ImportOptions, archive_tag: Option<&str>) -> Result<Vec<S
     }
 }
 
-// Kept here so both format paths and Task 3 can use it.
-#[allow(dead_code)]
-fn platform_of(os: &str, arch: &str, variant: Option<String>) -> Platform {
-    Platform {
-        os: os.to_string(),
-        architecture: arch.to_string(),
-        variant,
-    }
-}
-
-#[allow(dead_code)]
-fn select<'a>(target: &Platform, entries: &'a [(Platform, usize)]) -> Option<&'a usize> {
-    identity::select_manifest(target, entries)
-}
-
 // blob path inside an extracted OCI layout: blobs/sha256/<hex>
-#[allow(dead_code)]
 fn oci_blob_path(root: &Path, digest: &Digest) -> std::path::PathBuf {
     root.join("blobs").join(digest.blob_path())
 }
-
-#[allow(dead_code)]
-fn hashmap_marker(_: &HashMap<String, String>) {}
 
 #[cfg(test)]
 mod tests {
@@ -354,5 +456,98 @@ mod tests {
         let err = import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
         assert!(matches!(err, Error::UnknownFormat));
         let _ = Write::flush(&mut std::io::sink());
+    }
+
+    /// Build a minimal single-manifest OCI image-layout archive (gzip layer).
+    fn write_oci_layout(path: &Path, ref_name: Option<&str>) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        let arch = if std::env::consts::ARCH == "aarch64" { "arm64" } else { "amd64" };
+        let layer = tar_bytes(&[("etc/app.conf", b"k=v")]);
+        let layer_diff = sha(&layer);
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&layer).unwrap();
+        let layer_gz = enc.finish().unwrap();
+        let layer_blob_digest = sha(&layer_gz);
+
+        let config = format!(
+            r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer_diff}"]}},"config":{{"User":"65532"}}}}"#
+        );
+        let config_digest = sha(config.as_bytes());
+
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{cs}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_blob_digest}","size":{ls}}}]}}"#,
+            cs = config.len(),
+            ls = layer_gz.len()
+        );
+        let manifest_digest = sha(manifest.as_bytes());
+
+        let ann = match ref_name {
+            Some(n) => format!(r#","annotations":{{"org.opencontainers.image.ref.name":"{n}"}}"#),
+            None => String::new(),
+        };
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{ms},"platform":{{"os":"linux","architecture":"{arch}"}}{ann}}}]}}"#,
+            ms = manifest.len()
+        );
+
+        // blobs/sha256/<hex> layout.
+        let hexof = |d: &str| d.strip_prefix("sha256:").unwrap().to_string();
+        let archive = tar_bytes(&[
+            ("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#),
+            ("index.json", index.as_bytes()),
+            (
+                &format!("blobs/sha256/{}", hexof(&manifest_digest)),
+                manifest.as_bytes(),
+            ),
+            (
+                &format!("blobs/sha256/{}", hexof(&config_digest)),
+                config.as_bytes(),
+            ),
+            (
+                &format!("blobs/sha256/{}", hexof(&layer_blob_digest)),
+                &layer_gz,
+            ),
+        ]);
+        fs::write(path, &archive).unwrap();
+        layer
+    }
+
+    #[test]
+    fn imports_oci_layout_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = content::Store::open(dir.path().join("content")).unwrap();
+        let snaps = dir.path().join("snapshots");
+        let tar_path = dir.path().join("oci.tar");
+        write_oci_layout(&tar_path, Some("ociapp:1.0"));
+
+        let out = import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap();
+        assert_eq!(out.repo_tags, vec!["ociapp:1.0".to_string()]);
+        assert!(out.manifest_digest.is_some());
+        assert_eq!(out.user, "65532");
+        assert_eq!(out.layer_digests.len(), 1);
+        let (fs_dir, _) = snapshots::snapshot_dirs(&snaps, out.chain_ids[0].hex());
+        assert_eq!(
+            std::fs::read_to_string(fs_dir.join("etc/app.conf")).unwrap(),
+            "k=v"
+        );
+    }
+
+    #[test]
+    fn oci_ref_from_annotation_or_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = content::Store::open(dir.path().join("content")).unwrap();
+        let snaps = dir.path().join("snapshots");
+        let tar_path = dir.path().join("oci.tar");
+        write_oci_layout(&tar_path, None); // no ref.name annotation
+        // No annotation + no override → NoName.
+        let err = import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::NoName));
+        // Override supplies the name.
+        let opts = ImportOptions {
+            ref_override: Some("forced:tag".into()),
+            ..Default::default()
+        };
+        let out = import_archive(&tar_path, &content, &snaps, &opts).unwrap();
+        assert_eq!(out.repo_tags, vec!["forced:tag".to_string()]);
     }
 }
