@@ -108,10 +108,13 @@ part. No behavior change to pull.
 
 - A tonic service bound to a unix socket at the state dir (default
   `/run/containerd-rs/admin.sock`; derived like the existing CRI/streaming sockets).
-- One RPC: `Import(stream ImportChunk) -> ImportReply`. Client streams raw tar bytes
-  (chunked). Server buffers them to a temp file under the content store's `ingest/`
-  staging area, calls `images::import::import_archive`, deletes the temp file, and
-  returns `{ image_id, repo_tags }` or a `Status` error.
+- One **unary** RPC: `Import(ImportRequest{archive_path, ref_override}) -> ImportReply{image_id, repo_tags}`.
+  The daemon opens `archive_path` **directly** — on a single node the CLI and daemon
+  share the node filesystem, so passing the path is simpler than streaming tar bytes
+  (same trust model; no server-side buffering). `images::import::import_archive`
+  extracts the archive to a scratch dir on the store filesystem and returns the
+  imported-image data; the handler then writes the `ImageRecord`. Streaming would only
+  be needed for a remote CLI, which is out of scope (multi-node = registry).
 - Proto: a minimal `.proto` (or hand-written tonic types) for the admin service,
   compiled in the same build step as the existing CRI protos.
 - Started alongside the CRI and streaming servers in `crates/containerd-rs/src/main.rs`.
