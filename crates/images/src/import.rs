@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use core_types::Digest;
 use serde::Deserialize;
@@ -135,7 +135,7 @@ fn import_docker_save(
         .next()
         .ok_or_else(|| Error::Malformed("manifest.json is empty".into()))?;
 
-    let config_bytes = fs::read(root.join(&m.config))?;
+    let config_bytes = fs::read(safe_member(root, &m.config)?)?;
     let mut total = config_bytes.len() as u64;
 
     let mut layers = Vec::with_capacity(m.layers.len());
@@ -143,7 +143,7 @@ fn import_docker_save(
         // docker-save layers are uncompressed tars, so the layer's content digest
         // equals its diffID. Hash the file, then stream it into the store under
         // that digest.
-        let path = root.join(rel);
+        let path = safe_member(root, rel)?;
         let (digest, size) =
             commit_file_by_hash(content, &path, &format!("import:dockerlayer:{i}"))?;
         total += size;
@@ -258,10 +258,20 @@ fn import_oci_layout(
 
     let manifest_digest: Digest = selected.digest.parse()?;
     let manifest_bytes = fs::read(oci_blob_path(root, &manifest_digest))?;
+    if Digest::sha256(&manifest_bytes) != manifest_digest {
+        return Err(Error::Malformed(format!(
+            "manifest digest mismatch: expected {manifest_digest}, blob does not match"
+        )));
+    }
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
 
     let config_digest: Digest = manifest.config.digest.parse()?;
     let config_bytes = fs::read(oci_blob_path(root, &config_digest))?;
+    if Digest::sha256(&config_bytes) != config_digest {
+        return Err(Error::Malformed(format!(
+            "config digest mismatch: expected {config_digest}, blob does not match"
+        )));
+    }
     let mut total = config_bytes.len() as u64;
 
     let mut layers = Vec::with_capacity(manifest.layers.len());
@@ -355,6 +365,27 @@ fn resolve_tags(opts: &ImportOptions, archive_tag: Option<&str>) -> Result<Vec<S
 // blob path inside an extracted OCI layout: blobs/sha256/<hex>
 fn oci_blob_path(root: &Path, digest: &Digest) -> std::path::PathBuf {
     root.join("blobs").join(digest.blob_path())
+}
+
+/// Join an archive-controlled relative path (docker-save `Config`/`Layers`
+/// entries) under `root`, rejecting anything that could escape it. Mirrors
+/// `snapshots::diff::safe_join`: only `Normal`/`CurDir` components are
+/// allowed, so an absolute path or a `..` component is rejected outright
+/// rather than silently resolved.
+fn safe_member(root: &Path, rel: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let rel_path = Path::new(rel);
+    for c in rel_path.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => {
+                return Err(Error::Malformed(format!(
+                    "archive member path escapes archive root: {rel}"
+                )));
+            }
+        }
+    }
+    Ok(root.join(rel_path))
 }
 
 #[cfg(test)]
@@ -454,6 +485,55 @@ mod tests {
     }
 
     #[test]
+    fn docker_save_rejects_path_traversal_in_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = content::Store::open(dir.path().join("content")).unwrap();
+        let snaps = dir.path().join("snapshots");
+        let tar_path = dir.path().join("evil.tar");
+
+        let layer = tar_bytes(&[("usr/bin/app", b"#!/bin/true")]);
+        // Config points outside the extracted archive root.
+        let manifest =
+            r#"[{"Config":"../escape.json","RepoTags":["evil:1"],"Layers":["layer0/layer.tar"]}]"#;
+        let archive = tar_bytes(&[
+            ("layer0/layer.tar", &layer),
+            ("manifest.json", manifest.as_bytes()),
+        ]);
+        fs::write(&tar_path, &archive).unwrap();
+
+        let err =
+            import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+        match err {
+            Error::Malformed(msg) => assert!(msg.contains("escapes archive root")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn docker_save_rejects_path_traversal_in_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = content::Store::open(dir.path().join("content")).unwrap();
+        let snaps = dir.path().join("snapshots");
+        let tar_path = dir.path().join("evil2.tar");
+
+        // Layers entry points outside the extracted archive root.
+        let manifest =
+            r#"[{"Config":"config.json","RepoTags":["evil:2"],"Layers":["../../etc/passwd"]}]"#;
+        let archive = tar_bytes(&[
+            ("config.json", b"{}"),
+            ("manifest.json", manifest.as_bytes()),
+        ]);
+        fs::write(&tar_path, &archive).unwrap();
+
+        let err =
+            import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+        match err {
+            Error::Malformed(msg) => assert!(msg.contains("escapes archive root")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn errors_on_unknown_format() {
         let dir = tempfile::tempdir().unwrap();
         let content = content::Store::open(dir.path().join("content")).unwrap();
@@ -543,6 +623,47 @@ mod tests {
             std::fs::read_to_string(fs_dir.join("etc/app.conf")).unwrap(),
             "k=v"
         );
+    }
+
+    #[test]
+    fn oci_layout_rejects_corrupted_manifest_blob() {
+        // Build an OCI layout where index.json declares the correct manifest
+        // digest, but the blob stored at that path has been tampered with
+        // (bytes no longer hash to the declared digest).
+        let dir = tempfile::tempdir().unwrap();
+        let content = content::Store::open(dir.path().join("content")).unwrap();
+        let snaps = dir.path().join("snapshots");
+        let tar_path = dir.path().join("corrupt.tar");
+
+        let manifest = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000000000000000","size":2},"layers":[]}"#;
+        let manifest_digest = sha(manifest.as_bytes()); // digest of the *original* bytes
+        let hexof = |d: &str| d.strip_prefix("sha256:").unwrap().to_string();
+
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{ms},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            ms = manifest.len()
+        );
+
+        // Store corrupted (mutated) bytes at the blob path the digest maps to.
+        let corrupted_manifest = manifest.replacen("schemaVersion", "SchemaVersion", 1);
+        assert_ne!(corrupted_manifest, manifest);
+
+        let archive = tar_bytes(&[
+            ("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#),
+            ("index.json", index.as_bytes()),
+            (
+                &format!("blobs/sha256/{}", hexof(&manifest_digest)),
+                corrupted_manifest.as_bytes(),
+            ),
+        ]);
+        fs::write(&tar_path, &archive).unwrap();
+
+        let err =
+            import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+        match err {
+            Error::Malformed(msg) => assert!(msg.contains("manifest digest mismatch")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
     }
 
     #[test]

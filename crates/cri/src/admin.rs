@@ -41,6 +41,11 @@ impl Admin for AdminSvc {
         let content = self.ctx.content.clone();
         let snapshots_root = self.ctx.snapshots_root.clone();
 
+        // Serialize concurrent imports of the same archive path so they don't
+        // race unpacking into the same chainID snapshot dir, mirroring the
+        // pull path's per-reference guard (see ImageSvc::pull_image).
+        let _guard = self.ctx.pull_locks.guard(&req.archive_path).await;
+
         // import_archive is blocking (tar extraction + fs IO); keep it off the
         // async reactor.
         let imported = tokio::task::spawn_blocking(move || {
