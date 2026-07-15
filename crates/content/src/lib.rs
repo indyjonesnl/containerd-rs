@@ -47,6 +47,12 @@ impl Store {
         Ok(Self { root })
     }
 
+    /// The store's root directory (`io.containerd.content.v1.content`). Used by
+    /// the import path to place its extraction scratch dir on the same filesystem.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn blob_path(&self, digest: &Digest) -> PathBuf {
         self.root.join("blobs").join(digest.blob_path())
     }

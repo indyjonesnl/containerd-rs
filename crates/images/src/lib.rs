@@ -6,5 +6,6 @@
 pub mod dockercfg;
 pub mod gc;
 pub mod identity;
+pub mod import;
 pub mod pull;
 pub mod unpack;
