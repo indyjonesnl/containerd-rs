@@ -88,7 +88,9 @@ pub fn import_archive(
     // Extract into scratch on the store's own filesystem (auto-removed on drop).
     let ingest = content.root().join("ingest");
     fs::create_dir_all(&ingest)?;
-    let scratch = tempfile::Builder::new().prefix("import-").tempdir_in(&ingest)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("import-")
+        .tempdir_in(&ingest)?;
     {
         let file = fs::File::open(archive_path)?;
         let mut ar = tar::Archive::new(file);
@@ -142,7 +144,8 @@ fn import_docker_save(
         // equals its diffID. Hash the file, then stream it into the store under
         // that digest.
         let path = root.join(rel);
-        let (digest, size) = commit_file_by_hash(content, &path, &format!("import:dockerlayer:{i}"))?;
+        let (digest, size) =
+            commit_file_by_hash(content, &path, &format!("import:dockerlayer:{i}"))?;
         total += size;
         layers.push(LayerInput {
             digest,
@@ -384,7 +387,11 @@ mod tests {
         let layer_diff = sha(&layer);
         let config = format!(
             r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer_diff}"]}},"config":{{"User":"0"}}}}"#,
-            arch = if std::env::consts::ARCH == "aarch64" { "arm64" } else { "amd64" }
+            arch = if std::env::consts::ARCH == "aarch64" {
+                "arm64"
+            } else {
+                "amd64"
+            }
         );
         let repo_tags = match repo_tag {
             Some(t) => format!(r#"["{t}"]"#),
@@ -441,7 +448,8 @@ mod tests {
         let snaps = dir.path().join("snapshots");
         let tar_path = dir.path().join("app.tar");
         write_docker_save(&tar_path, None); // no RepoTags, no --ref
-        let err = import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+        let err =
+            import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
         assert!(matches!(err, Error::NoName));
     }
 
@@ -453,7 +461,8 @@ mod tests {
         let tar_path = dir.path().join("junk.tar");
         // A tar with neither index.json nor manifest.json.
         fs::write(&tar_path, tar_bytes(&[("random.txt", b"hi")])).unwrap();
-        let err = import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+        let err =
+            import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
         assert!(matches!(err, Error::UnknownFormat));
         let _ = Write::flush(&mut std::io::sink());
     }
@@ -461,7 +470,11 @@ mod tests {
     /// Build a minimal single-manifest OCI image-layout archive (gzip layer).
     fn write_oci_layout(path: &Path, ref_name: Option<&str>) -> Vec<u8> {
         use flate2::write::GzEncoder;
-        let arch = if std::env::consts::ARCH == "aarch64" { "arm64" } else { "amd64" };
+        let arch = if std::env::consts::ARCH == "aarch64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
         let layer = tar_bytes(&[("etc/app.conf", b"k=v")]);
         let layer_diff = sha(&layer);
         let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -539,8 +552,9 @@ mod tests {
         let snaps = dir.path().join("snapshots");
         let tar_path = dir.path().join("oci.tar");
         write_oci_layout(&tar_path, None); // no ref.name annotation
-        // No annotation + no override → NoName.
-        let err = import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
+                                           // No annotation + no override → NoName.
+        let err =
+            import_archive(&tar_path, &content, &snaps, &ImportOptions::default()).unwrap_err();
         assert!(matches!(err, Error::NoName));
         // Override supplies the name.
         let opts = ImportOptions {
