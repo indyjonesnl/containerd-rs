@@ -10,7 +10,7 @@ mod logging;
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 
@@ -19,12 +19,31 @@ use crate::config::Config;
 #[command(name = "containerd-rs", version, about)]
 struct Args {
     /// Path to the TOML config file.
-    #[arg(long, default_value = "/etc/containerd-rs/config.toml")]
+    #[arg(long, default_value = "/etc/containerd-rs/config.toml", global = true)]
     config: PathBuf,
 
     /// Initialize stores and exit (used by tests / CI smoke).
-    #[arg(long)]
+    #[arg(long, global = true)]
     check: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Import a local image archive (OCI image-layout or docker-save tar) into
+    /// the content store, with no registry. Requires the daemon to be running.
+    Import {
+        /// Path to the image archive (.tar) on this node.
+        archive: PathBuf,
+        /// Override the image name/tag (else taken from the archive).
+        #[arg(long = "ref")]
+        reference: Option<String>,
+        /// Admin socket path.
+        #[arg(long, default_value = "/run/containerd-rs/admin.sock")]
+        socket: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -49,16 +68,37 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("__pid-holder is Linux-only");
         }
     }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(daemon_main())
+    let args = Args::parse();
+    match args.command {
+        Some(Command::Import {
+            archive,
+            reference,
+            socket,
+        }) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                let reply = cri::admin::run_import(&socket, &archive, reference.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("imported image {}", reply.image_id);
+                for t in &reply.repo_tags {
+                    println!("  {t}");
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+        }
+        None => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(daemon_main(args.config, args.check)),
+    }
 }
 
-async fn daemon_main() -> anyhow::Result<()> {
+async fn daemon_main(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
     logging::init();
-    let args = Args::parse();
-    let cfg = Config::load(&args.config)?;
+    let cfg = Config::load(&config_path)?;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -93,7 +133,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     std::fs::create_dir_all(cfg.snapshots_dir())?;
     tracing::info!("subsystem stores initialized");
 
-    if args.check {
+    if check {
         tracing::info!("--check requested; exiting after initialization");
         return Ok(());
     }
@@ -144,6 +184,13 @@ async fn daemon_main() -> anyhow::Result<()> {
         ctx.streaming.clone(),
         std::future::pending::<()>(),
     );
+    let admin_socket = cfg.state.join("admin.sock");
+    let admin = cri::admin::serve(
+        admin_socket.clone(),
+        ctx.clone(),
+        std::future::pending::<()>(),
+    );
+    tracing::info!(socket = ?admin_socket, "admin API enabled");
 
     // Notify systemd (Type=notify) that we are up (feature 002 US6 / T034).
     // No-op when not run under systemd (NOTIFY_SOCKET unset).
@@ -153,6 +200,7 @@ async fn daemon_main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received"),
         r = grpc => r.map_err(|e| anyhow::anyhow!("CRI server error: {e}"))?,
         r = streaming => r.map_err(|e| anyhow::anyhow!("streaming server error: {e}"))?,
+        r = admin => r.map_err(|e| anyhow::anyhow!("admin server error: {e}"))?,
     }
     Ok(())
 }
