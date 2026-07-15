@@ -47,7 +47,7 @@ kubelet ──CRI v1 gRPC (unix socket)──▶ containerd-rs daemon
 | `content` | Content-addressable blob store (digest/size verified on commit, dedup) |
 | `metadata` | Persistent metadata store backed by [redb](https://www.redb.org) |
 | `snapshots` | Overlayfs snapshotter: layer diff apply, OCI whiteouts, chainIDs |
-| `images` | Image pull pipeline (oci-client), registry auth, chainID identity, GC |
+| `images` | Image pull pipeline (oci-client), registry auth, chainID identity, GC; also imports local OCI/docker-save archives (no registry) |
 | `runtime` | OCI bundle generation + `crun` supervision (run/exec/kill/stats) |
 | `sandbox` | Pod sandbox model: network namespace + CNI plugin chain |
 | `cri` | CRI v1 gRPC server + the exec/attach/port-forward streaming server |
@@ -96,6 +96,20 @@ Smoke-test with `crictl`:
 crictl --runtime-endpoint unix:///run/containerd-rs.sock version
 crictl --runtime-endpoint unix:///run/containerd-rs.sock images
 ```
+
+### Importing a local image (no registry)
+
+Load an image built on this node straight into the store:
+
+```sh
+containerd-rs import ./myapp.tar --ref myapp:dev
+```
+
+Accepts OCI image-layout and `docker save` archives (auto-detected). The daemon
+must be running; the CLI talks to it over the root-only admin unix socket
+(`/run/containerd-rs/admin.sock` by default, `--socket` to override), and the
+daemon reads the archive path directly (single-node). For multi-node clusters,
+use a registry — that is how image distribution works in containerd too.
 
 ## Bring up a single-node cluster
 

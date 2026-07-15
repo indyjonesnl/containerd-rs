@@ -78,6 +78,14 @@ username/password, or base64 `auth`); oci-client performs the docker bearer-toke
 handshake. Concurrent duplicate pulls of the same reference are serialized.
 `RemoveImage` reclaims unreferenced blobs and snapshots (`gc.rs`).
 
+- **Import** (`containerd-rs import`): a second content-store ingest entrypoint
+  besides CRI pull. The CLI sends the archive path to the daemon's admin unix
+  socket, which runs `images::import` in-process — parse an OCI-layout /
+  docker-save archive (auto-detected), commit its blobs, and reuse the pull
+  pipeline's finalize step (`images::unpack::finalize_image`: diffID verify →
+  chainID → unpack). A single-node convenience for images never pushed to a
+  registry; multi-node distribution is still a registry's job, as in containerd.
+
 ## Pod networking (`crates/sandbox`)
 
 `RunPodSandbox` either shares the host network namespace (NODE network mode) or
