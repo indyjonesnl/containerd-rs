@@ -52,3 +52,6 @@ metadata.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 hyper-util.workspace = true
+tar = { workspace = true }
+sha2.workspace = true
+hex.workspace = true

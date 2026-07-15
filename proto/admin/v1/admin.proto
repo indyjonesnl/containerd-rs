@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package containerdrs.admin.v1;
+
+// Node-local administrative API (not part of CRI). Served on a root-only unix
+// socket. Used by the `containerd-rs` CLI to drive operations that must run
+// inside the daemon because it owns the metadata (redb) writer.
+service Admin {
+  // Import a local image archive (OCI image-layout or docker-save tar) that the
+  // daemon reads from `archive_path` on the node filesystem.
+  rpc Import(ImportRequest) returns (ImportReply);
+}
+
+message ImportRequest {
+  // Absolute path to the archive on the node, readable by the daemon.
+  string archive_path = 1;
+  // Optional image name/tag override (else taken from the archive).
+  string ref_override = 2;
+}
+
+message ImportReply {
+  string image_id = 1;
+  repeated string repo_tags = 2;
+}

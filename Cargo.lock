@@ -460,6 +460,7 @@ dependencies = [
  "flate2",
  "futures-core",
  "futures-util",
+ "hex",
  "humantime",
  "hyper",
  "hyper-util",
@@ -473,7 +474,9 @@ dependencies = [
  "sandbox",
  "serde",
  "serde_json",
+ "sha2",
  "snapshots",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1463,8 +1466,6 @@ dependencies = [
 [[package]]
 name = "oci-client"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5261a7fb43d9c53b8e63e6d5e86860719dad253d015d022066c72d585125aed8"
 dependencies = [
  "bytes",
  "chrono",

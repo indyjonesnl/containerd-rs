@@ -12,6 +12,7 @@ pub mod v1 {
     tonic::include_proto!("runtime.v1");
 }
 
+pub mod admin;
 pub mod locks;
 pub mod server;
 pub mod spdy;

@@ -187,6 +187,58 @@ fn record_to_image(rec: &ImageRecord) -> v1::Image {
     }
 }
 
+/// Persist (or merge into) the metadata `ImageRecord` for a freshly imported
+/// image, aggregating by image_id exactly like `pull_image` (multiple tags of
+/// the same image collapse into one record). Names come from the archive's
+/// RepoTags / `--ref`. repoDigests are derived only when the archive carried a
+/// manifest digest (OCI layout).
+pub(crate) fn upsert_imported_image(
+    ctx: &Context,
+    img: &images::import::ImportedImage,
+) -> Result<(), metadata::Error> {
+    let image_id = img.image_id.to_string();
+    let ns = ctx.namespace.as_str();
+    let tags: Vec<String> = img
+        .repo_tags
+        .iter()
+        .map(|t| normalize_image_ref(t))
+        .collect();
+
+    let mut record = ctx
+        .metadata
+        .get::<ImageRecord>(Kind::Image, ns, &image_id)?
+        .unwrap_or_else(|| ImageRecord {
+            name: tags.first().cloned().unwrap_or_else(|| image_id.clone()),
+            target_digest: img
+                .manifest_digest
+                .as_ref()
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
+            image_id: image_id.clone(),
+            repo_tags: Vec::new(),
+            repo_digests: Vec::new(),
+            size: img.size,
+            layer_digests: img.layer_digests.iter().map(|d| d.to_string()).collect(),
+            chain_ids: img.chain_ids.iter().map(|d| d.to_string()).collect(),
+            user: img.user.clone(),
+        });
+
+    for t in &tags {
+        if !record.repo_tags.contains(t) {
+            record.repo_tags.push(t.clone());
+        }
+    }
+    if let Some(md) = &img.manifest_digest {
+        for t in &tags {
+            let rd = format!("{}@{}", repo_name(t), md);
+            if !record.repo_digests.contains(&rd) {
+                record.repo_digests.push(rd);
+            }
+        }
+    }
+    ctx.metadata.put(Kind::Image, ns, &image_id, &record)
+}
+
 /// Emit unary RPC methods that return `unimplemented`.
 ///
 /// `#[async_trait]` on the impl runs before this declarative macro expands, so
@@ -2862,6 +2914,22 @@ pub async fn serve(
 }
 
 #[cfg(test)]
+pub(crate) fn test_context(dir: &std::path::Path) -> Arc<Context> {
+    let content = content::Store::open(dir.join("content")).unwrap();
+    let metadata = metadata::Store::open(dir.join("meta.db")).unwrap();
+    Arc::new(Context::new(
+        content,
+        metadata,
+        dir.join("snapshots"),
+        dir.join("state"),
+        "127.0.0.1:10010",
+        dir.join("cni/net.d"),
+        dir.join("cni/bin"),
+        false,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2902,21 +2970,6 @@ mod tests {
     use crate::v1::runtime_service_client::RuntimeServiceClient;
     use tokio::net::UnixStream;
     use tonic::transport::{Endpoint, Uri};
-
-    fn test_context(dir: &std::path::Path) -> Arc<Context> {
-        let content = content::Store::open(dir.join("content")).unwrap();
-        let metadata = metadata::Store::open(dir.join("meta.db")).unwrap();
-        Arc::new(Context::new(
-            content,
-            metadata,
-            dir.join("snapshots"),
-            dir.join("state"),
-            "127.0.0.1:10010",
-            dir.join("cni/net.d"),
-            dir.join("cni/bin"),
-            false,
-        ))
-    }
 
     // Feature 002 US3 / T024: the exported metric descriptors are stable and the
     // per-metric builder tags type/value correctly.

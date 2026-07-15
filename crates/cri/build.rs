@@ -3,6 +3,7 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../../proto/runtime/v1/api.proto");
+    println!("cargo:rerun-if-changed=../../proto/admin/v1/admin.proto");
     // Point prost/tonic at a vendored protoc unless the environment already
     // provides one, so the build works without a system protobuf-compiler
     // (CI runners don't ship one; keeps local == CI).
@@ -12,6 +13,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["../../proto/runtime/v1/api.proto"], &["../../proto"])?;
+        .compile_protos(
+            &[
+                "../../proto/runtime/v1/api.proto",
+                "../../proto/admin/v1/admin.proto",
+            ],
+            &["../../proto"],
+        )?;
     Ok(())
 }
