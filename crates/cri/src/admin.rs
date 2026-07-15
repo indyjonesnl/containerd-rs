@@ -2,6 +2,8 @@
 //! root-only unix socket. Currently one method — Import — which loads a local
 //! image archive into the store inside the daemon (which owns the redb writer).
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -58,6 +60,67 @@ impl Admin for AdminSvc {
     }
 }
 
+/// Serve the Admin service on a root-only unix socket until `shutdown` resolves.
+pub async fn serve(
+    socket_path: impl AsRef<Path>,
+    ctx: Arc<Context>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let socket_path = socket_path.as_ref();
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(socket_path)?;
+    // Admin surface: owner-only (root), like the CRI socket's trust model.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+    tracing::info!(?socket_path, "serving admin API over unix socket");
+    tonic::transport::Server::builder()
+        .add_service(AdminServer::new(AdminSvc { ctx }))
+        .serve_with_incoming_shutdown(incoming, shutdown)
+        .await?;
+    Ok(())
+}
+
+/// Connect to the daemon's admin socket and import `archive_path` (which the
+/// daemon opens directly — CLI and daemon share the node filesystem). Returns
+/// the daemon's reply. Uses the tonic 0.14 UDS-client idiom (dummy authority +
+/// a unix-connecting tower service).
+pub async fn run_import(
+    socket: &Path,
+    archive_path: &Path,
+    ref_override: Option<&str>,
+) -> Result<ImportReply, Box<dyn std::error::Error + Send + Sync>> {
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Endpoint;
+
+    let socket = socket.to_path_buf();
+    let channel = Endpoint::try_from("http://127.0.0.1:0")?
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(&socket).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await?;
+
+    let mut client = pb::admin_client::AdminClient::new(channel);
+    // Absolute path so the daemon (any cwd) resolves the same file.
+    let abs = std::fs::canonicalize(archive_path)?;
+    let reply = client
+        .import(ImportRequest {
+            archive_path: abs.to_string_lossy().into_owned(),
+            ref_override: ref_override.unwrap_or_default().to_string(),
+        })
+        .await?
+        .into_inner();
+    Ok(reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +153,43 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].repo_tags.contains(&"svc:test".to_string()));
+    }
+
+    // Full round-trip over a real unix socket: serve, connect, import.
+    #[tokio::test]
+    async fn import_round_trip_over_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::server::test_context(dir.path());
+        let socket = dir.path().join("admin.sock");
+        let tar_path = dir.path().join("rt.tar");
+        crate::admin::testfix::write_docker_save(&tar_path, "rt:1");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = {
+            let socket = socket.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                super::serve(socket, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+            })
+        };
+        // Wait for the socket to appear.
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let reply = super::run_import(&socket, &tar_path, None).await.unwrap();
+        assert_eq!(reply.repo_tags, vec!["rt:1".to_string()]);
+        assert!(reply.image_id.starts_with("sha256:"));
+
+        let _ = tx.send(());
+        let _ = srv.await;
     }
 }
 

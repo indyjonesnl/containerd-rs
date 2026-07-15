@@ -32,6 +32,7 @@ bytes.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 base64.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 tonic-prost-build.workspace = true
@@ -41,7 +42,6 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 oci-spec.workspace = true
 tokio-tungstenite = "0.24"
 # Integration (contract) tests in tests/ are a separate crate, so the crates
